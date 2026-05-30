@@ -62,6 +62,8 @@ D:\Projects\Iravi\IaC\terraform\environments\production\
 
 Deploy via the GitHub Actions pipeline (merge to main → apply runs automatically).
 
+**Dependencies are packaged automatically** — Terraform uses a `null_resource` + `local-exec` to `pip install` into a Lambda Layer during `terraform apply`. No local `pip install` step needed; it runs in the GitHub Actions runner.
+
 ---
 
 ## Runtime & Dependencies
@@ -149,7 +151,7 @@ Source file pattern: `Current Stock Balances*.xlsx`
 
 ## What Is Next (build in this order)
 
-- [ ] **Add Terraform for etl_stocks** — `lambda_etl_stocks.tf` in IaC: S3 trigger, `DATA_BUCKET`/`RAW_PREFIX`/`PROCESSED_PREFIX` env vars, IAM perms for s3:GetObject/PutObject/DeleteObject/ListBucket
+- [x] **Add Terraform for etl_stocks** — `lambda_etl_stocks.tf` in IaC: S3 trigger fan-out from etl_sales notification, `DATA_BUCKET` env var, IAM for S3 read/write/list/delete
 - [ ] **Implement etl_sales** — full handler: S3 download → xlsx parse → DB upsert → EventBridge event → move to processed/
 - [ ] **Test etl_sales** — upload a real sales xlsx to `raw/` in S3, verify `fact_sales` rows in RDS
 - [ ] **Add ElastiCache Terraform** (`elasticache.tf` in IaC) — prerequisite for redis_updater and api

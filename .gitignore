@@ -13,6 +13,13 @@ venv/
 dist/
 build/
 *.egg-info/
+*.dist-info/
+
+# Lambda vendored dependencies (installed via pip install -r requirements.txt -t .)
+lambda/etl_stocks/*.dist-info/
+lambda/etl_stocks/bin/
+lambda/etl_sales/*.dist-info/
+lambda/etl_sales/bin/
 
 # sample local data
 lambda/etl_sales/sample_data/

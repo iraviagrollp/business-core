@@ -57,7 +57,7 @@ def _process(bucket: str, key: str, filename: str):
             logger.warning('No rates file found under s3://%s/%s%s* — proceeding without rates',
                            bucket, _RAW_PREFIX, _RATES_PREFIX)
 
-        entry_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        entry_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
         rows = process_stock_file(src_path, dst_path, entry_date=entry_date, rates_path=rates_path)
         logger.info('Processed %d rows', rows)
 
