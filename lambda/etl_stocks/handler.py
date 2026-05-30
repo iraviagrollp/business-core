@@ -2,6 +2,7 @@ import logging
 import os
 import tempfile
 from datetime import datetime, timezone
+from urllib.parse import unquote_plus
 
 import boto3
 
@@ -22,7 +23,7 @@ _RATES_PREFIX = 'Product Masters With Rates'
 def lambda_handler(event, context):
     for record in event.get('Records', []):
         bucket = record['s3']['bucket']['name']
-        key = record['s3']['object']['key']
+        key = unquote_plus(record['s3']['object']['key'])
         logger.info('S3 event: s3://%s/%s', bucket, key)
 
         filename = key.split('/')[-1]
