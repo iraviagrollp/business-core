@@ -62,7 +62,7 @@ D:\Projects\Iravi\IaC\terraform\environments\production\
 
 Deploy via the GitHub Actions pipeline (merge to main → apply runs automatically).
 
-**Dependencies are packaged automatically** — Terraform uses a `null_resource` + `local-exec` to `pip install` into a Lambda Layer during `terraform apply`. No local `pip install` step needed; it runs in the GitHub Actions runner.
+**Dependencies are packaged automatically** — The GitHub Actions workflow runs `pip install` into `.lambda_layers/<lambda>/python/` before `terraform plan/apply`. Terraform then zips that directory into a Lambda Layer. No local `pip install` step needed.
 
 ---
 
