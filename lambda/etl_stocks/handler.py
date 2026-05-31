@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import tempfile
@@ -5,6 +6,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 
 import boto3
+import psycopg2
 
 from process import process_stock_file
 
@@ -12,12 +14,26 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client('s3')
+secrets = boto3.client('secretsmanager')
 
 _BUCKET = os.environ['DATA_BUCKET']
 _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _STOCK_PREFIX = 'Current Stock Balances'
 _RATES_PREFIX = 'Product Masters With Rates'
+
+
+def _get_db_conn():
+    secret = json.loads(
+        secrets.get_secret_value(SecretId=os.environ['DB_SECRET_ARN'])['SecretString']
+    )
+    return psycopg2.connect(
+        host=secret['host'],
+        port=secret.get('port', 5432),
+        dbname=secret['dbname'],
+        user=secret['username'],
+        password=secret['password'],
+    )
 
 
 def lambda_handler(event, context):
@@ -35,7 +51,6 @@ def lambda_handler(event, context):
 
 
 def _process(bucket: str, key: str, filename: str):
-    # "Current Stock Balances12-5-2026(21.42.18).xlsx" → "Stock - Processed 12-5-2026(21.42.18).xlsx"
     suffix = filename[len(_STOCK_PREFIX):]
     out_filename = f'Stock - Processed {suffix}'
     out_key = _PROCESSED_PREFIX + out_filename
@@ -60,19 +75,64 @@ def _process(bucket: str, key: str, filename: str):
 
         entry_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
         rows = process_stock_file(src_path, dst_path, entry_date=entry_date, rates_path=rates_path)
-        logger.info('Processed %d rows', rows)
+        logger.info('Processed %d rows', len(rows))
 
         s3.upload_file(dst_path, bucket, out_key)
         logger.info('Uploaded to s3://%s/%s', bucket, out_key)
 
-    # Archive source outside the tempdir context (file already closed)
+    conn = _get_db_conn()
+    try:
+        _upsert_snapshot_stock(conn, rows)
+        conn.commit()
+        logger.info('Upserted %d rows into snapshot_stock', len(rows))
+    finally:
+        conn.close()
+
     s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': key}, Key=archive_key)
     s3.delete_object(Bucket=bucket, Key=key)
     logger.info('Archived source to s3://%s/%s', bucket, archive_key)
 
 
+def _upsert_snapshot_stock(conn, rows: list[dict]):
+    """Close the current active record then insert a fresh one for each row."""
+    with conn.cursor() as cur:
+        for row in rows:
+            nk = (
+                row['brand'], row['technical'], row['packing_size'],
+                row['packing_configuration'], row['branch'],
+                row['special_packing_mention'], row['entry_date'],
+            )
+            cur.execute(
+                """
+                UPDATE snapshot_stock
+                   SET out_z = NOW()
+                 WHERE brand = %s AND technical = %s AND packing_size = %s
+                   AND packing_configuration = %s AND branch = %s
+                   AND special_packing_mention = %s AND entry_date = %s
+                   AND out_z IS NULL
+                """,
+                nk,
+            )
+            cur.execute(
+                """
+                INSERT INTO snapshot_stock (
+                    brand, technical, packing_size, packing_configuration,
+                    available_nos, conversion_factor, available_cases, available_qty,
+                    branch, special_packing_mention, entry_date, rate, stock_valuation
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    row['brand'], row['technical'], row['packing_size'],
+                    row['packing_configuration'], row['available_nos'],
+                    row['conversion_factor'], row['available_cases'],
+                    row['available_qty'], row['branch'],
+                    row['special_packing_mention'], row['entry_date'],
+                    row['rate'], row['stock_valuation'],
+                ),
+            )
+
+
 def _find_latest(bucket: str, filename_prefix: str) -> str | None:
-    """Return the key of the most recently modified .xlsx matching RAW_PREFIX+filename_prefix."""
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=_RAW_PREFIX + filename_prefix)
     objects = [o for o in resp.get('Contents', []) if o['Key'].endswith('.xlsx')]
     if not objects:

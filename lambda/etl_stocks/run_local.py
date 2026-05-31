@@ -25,5 +25,5 @@ if __name__ == '__main__':
     rates = _find_rates_file()
     if rates:
         print(f"Using rates file: {rates}")
-    n = process_stock_file(src, dst, rates_path=rates)
-    print(f"Done. {n} rows written to {dst}")
+    rows = process_stock_file(src, dst, rates_path=rates)
+    print(f"Done. {len(rows)} rows written to {dst}")

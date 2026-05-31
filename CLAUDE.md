@@ -107,7 +107,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 ## etl_stocks — Stock Balance Processing
 
-**Status: core processing logic + S3/Lambda handler complete**
+**Status: core processing logic + S3/Lambda handler + DB write complete**
 
 Source file pattern: `Current Stock Balances*.xlsx`
 
@@ -147,7 +147,7 @@ Source file pattern: `Current Stock Balances*.xlsx`
 - [x] api scaffold
 - [x] Terraform resources in IaC (`lambda_etl_sales.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`)
 - [x] etl_stocks core logic (`process.py`, `run_local.py`) — transforms `Current Stock Balances*.xlsx` → `Stock - Processed.xlsx`
-- [x] etl_stocks Lambda handler (`handler.py`) — S3 trigger, rates lookup, processed upload, source archive
+- [x] etl_stocks Lambda handler (`handler.py`) — S3 trigger, rates lookup, processed upload, source archive, DB upsert into `snapshot_stock` (unitemporal milestoning)
 
 ## What Is Next (build in this order)
 

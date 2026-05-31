@@ -152,6 +152,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
     dst_ws.title = 'Sheet1'
     dst_ws.append(_OUTPUT_HEADERS)
 
+    rows = []
     for key, agg in merged.items():
         brand, technical, packing_size, packing_config, branch_str, packing_spec = key
         total_nos = agg['nos']
@@ -160,6 +161,22 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
         available_qty = packing_size * total_nos
         rate = rates.get(agg['product'])
         stock_valuation = _to_int_if_whole(total_nos * rate) if rate is not None else None
+
+        rows.append({
+            'brand': brand,
+            'technical': technical,
+            'packing_size': packing_size,
+            'packing_configuration': packing_config,
+            'available_nos': total_nos,
+            'conversion_factor': cf,
+            'available_cases': available_cases,
+            'available_qty': available_qty,
+            'branch': branch_str,
+            'special_packing_mention': packing_spec,
+            'entry_date': entry_date,
+            'rate': rate,
+            'stock_valuation': stock_valuation,
+        })
 
         dst_ws.append([
             brand,
@@ -177,7 +194,6 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             stock_valuation,
         ])
 
-    rows_written = len(merged)
     dst_wb.save(dst_path)
-    logger.info("Wrote %d rows to %s (merged from source)", rows_written, dst_path)
-    return rows_written
+    logger.info("Wrote %d rows to %s (merged from source)", len(rows), dst_path)
+    return rows
