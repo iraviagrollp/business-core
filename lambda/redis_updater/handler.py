@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 
 import boto3
@@ -14,9 +13,6 @@ logger.setLevel(logging.INFO)
 secrets = boto3.client('secretsmanager')
 
 _TTL = 86400  # 24 hours — refreshed nightly by ETL
-
-_WEIGHT_RE = re.compile(r'\b(KG|GMS|GM)\b', re.IGNORECASE)
-_VOLUME_RE = re.compile(r'\b(LTR|LT|ML|L)\b', re.IGNORECASE)
 
 
 def _get_db_conn():
@@ -48,6 +44,11 @@ def lambda_handler(event, context):
         logger.warning('Unknown detail-type: %s — no-op', detail_type)
 
 
+def _packing_display(packing_size_num: float, packing_config: str) -> str:
+    ps = int(packing_size_num) if packing_size_num % 1 == 0 else packing_size_num
+    return f"{ps} {packing_config}"
+
+
 def _update_stocks_cache():
     conn = _get_db_conn()
     try:
@@ -75,16 +76,19 @@ def _update_stocks_cache():
 
     for raw in raw_rows:
         row = dict(zip(col_names, raw))
-        packing_size = row['packing_size'] or ''
+
+        # packing_configuration is 'gms' or 'ml' (from process.py)
+        packing_config = row['packing_configuration'] or ''
+        packing_size_num = float(row['packing_size'] or 0)
         available_qty = float(row['available_qty'] or 0)
 
-        if _WEIGHT_RE.search(packing_size):
+        if packing_config == 'gms':
             total_kgs += available_qty / 1000.0
-        elif _VOLUME_RE.search(packing_size):
+        elif packing_config == 'ml':
             total_vols += available_qty / 1000.0
 
         total_valuation += float(row['stock_valuation'] or 0)
-        product_set.add((row['brand'], row['technical'], packing_size))
+        product_set.add((row['brand'], row['technical'], packing_size_num, packing_config))
 
         entry_date = row['entry_date']
         if entry_date and (latest_date is None or entry_date > latest_date):
@@ -93,11 +97,12 @@ def _update_stocks_cache():
         current.append({
             'brand': row['brand'],
             'technical': row['technical'],
-            'packing_size': packing_size,
-            'packing_configuration': row['packing_configuration'],
-            'available_nos': int(row['available_nos'] or 0),
-            'conversion_factor': int(row['conversion_factor'] or 0),
-            'available_cases': int(row['available_cases'] or 0),
+            'packing_size': packing_size_num,
+            'packing_configuration': packing_config,
+            'packing_display': _packing_display(packing_size_num, packing_config),
+            'available_nos': float(row['available_nos'] or 0),
+            'conversion_factor': float(row['conversion_factor'] or 0),
+            'available_cases': float(row['available_cases'] or 0),
             'available_qty': available_qty,
             'branch': row['branch'],
             'special_packing_mention': row['special_packing_mention'],

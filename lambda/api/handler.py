@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 
 import boto3
@@ -14,9 +13,6 @@ logger.setLevel(logging.INFO)
 secrets = boto3.client('secretsmanager')
 
 _REDIS_TTL = 86400  # 24h fallback TTL when populating from RDS on cache miss
-
-_WEIGHT_RE = re.compile(r'\b(KG|GMS|GM)\b', re.IGNORECASE)
-_VOLUME_RE = re.compile(r'\b(LTR|LT|ML|L)\b', re.IGNORECASE)
 
 
 def _get_db_conn():
@@ -34,6 +30,11 @@ def _get_db_conn():
 
 def _get_redis():
     return redis.Redis(host=os.environ['REDIS_HOST'], port=6379, decode_responses=True)
+
+
+def _packing_display(packing_size_num: float, packing_config: str) -> str:
+    ps = int(packing_size_num) if packing_size_num % 1 == 0 else packing_size_num
+    return f"{ps} {packing_config}"
 
 
 def lambda_handler(event, context):
@@ -64,7 +65,8 @@ def _handle_stocks_summary():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT packing_size, available_qty, stock_valuation, brand, technical, entry_date
+                SELECT packing_configuration, available_qty, stock_valuation,
+                       brand, technical, packing_size, entry_date
                 FROM snapshot_stock
                 WHERE out_z IS NULL
             """)
@@ -78,15 +80,15 @@ def _handle_stocks_summary():
     product_set = set()
     latest_date = None
 
-    for packing_size, available_qty, stock_valuation, brand, technical, entry_date in rows:
+    for packing_config, available_qty, stock_valuation, brand, technical, packing_size, entry_date in rows:
         qty = float(available_qty or 0)
-        ps = packing_size or ''
-        if _WEIGHT_RE.search(ps):
+        pc = packing_config or ''
+        if pc == 'gms':
             total_kgs += qty / 1000.0
-        elif _VOLUME_RE.search(ps):
+        elif pc == 'ml':
             total_vols += qty / 1000.0
         total_valuation += float(stock_valuation or 0)
-        product_set.add((brand, technical, ps))
+        product_set.add((brand, technical, float(packing_size or 0), pc))
         if entry_date and (latest_date is None or entry_date > latest_date):
             latest_date = entry_date
 
@@ -129,14 +131,17 @@ def _handle_stocks_current():
     current = []
     for raw in raw_rows:
         row = dict(zip(col_names, raw))
+        packing_size_num = float(row['packing_size'] or 0)
+        packing_config = row['packing_configuration'] or ''
         current.append({
             'brand': row['brand'],
             'technical': row['technical'],
-            'packing_size': row['packing_size'] or '',
-            'packing_configuration': row['packing_configuration'],
-            'available_nos': int(row['available_nos'] or 0),
-            'conversion_factor': int(row['conversion_factor'] or 0),
-            'available_cases': int(row['available_cases'] or 0),
+            'packing_size': packing_size_num,
+            'packing_configuration': packing_config,
+            'packing_display': _packing_display(packing_size_num, packing_config),
+            'available_nos': float(row['available_nos'] or 0),
+            'conversion_factor': float(row['conversion_factor'] or 0),
+            'available_cases': float(row['available_cases'] or 0),
             'available_qty': float(row['available_qty'] or 0),
             'branch': row['branch'],
             'special_packing_mention': row['special_packing_mention'],
