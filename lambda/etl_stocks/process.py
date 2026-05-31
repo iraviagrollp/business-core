@@ -5,6 +5,9 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill
+
+_NO_RATE_FILL = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +196,9 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             rate,
             stock_valuation,
         ])
+        if rate is None:
+            for cell in dst_ws[dst_ws.max_row]:
+                cell.fill = _NO_RATE_FILL
 
     dst_wb.save(dst_path)
     logger.info("Wrote %d rows to %s (merged from source)", len(rows), dst_path)
