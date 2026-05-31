@@ -15,6 +15,7 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client('s3')
 secrets = boto3.client('secretsmanager')
+events = boto3.client('events')
 
 _BUCKET = os.environ['DATA_BUCKET']
 _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
@@ -91,6 +92,17 @@ def _process(bucket: str, key: str, filename: str):
     s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': key}, Key=archive_key)
     s3.delete_object(Bucket=bucket, Key=key)
     logger.info('Archived source to s3://%s/%s', bucket, archive_key)
+
+    events.put_events(Entries=[{
+        'Source': 'iravi.etl',
+        'DetailType': 'ETLStocksSuccess',
+        'Detail': json.dumps({
+            'entry_date': entry_date.isoformat(),
+            'rows_processed': len(rows),
+        }),
+        'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default'),
+    }])
+    logger.info('Emitted ETLStocksSuccess for entry_date=%s rows=%d', entry_date.isoformat(), len(rows))
 
 
 def _upsert_snapshot_stock(conn, rows: list[dict]):

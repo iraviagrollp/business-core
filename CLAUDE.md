@@ -85,8 +85,8 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | `DATA_BUCKET` | Terraform | etl_sales, etl_stocks |
 | `RAW_PREFIX` | Terraform | etl_stocks (default: `raw/`) |
 | `PROCESSED_PREFIX` | Terraform | etl_stocks (default: `processed/`) |
-| `EVENT_BUS_NAME` | Terraform | etl_sales |
-| `REDIS_HOST` | Terraform (after elasticache.tf added) | redis_updater, api |
+| `EVENT_BUS_NAME` | Terraform | etl_sales, etl_stocks |
+| `REDIS_HOST` | Terraform (`elasticache.tf` provisioned) | redis_updater, api |
 
 ---
 
@@ -148,14 +148,19 @@ Source file pattern: `Current Stock Balances*.xlsx`
 - [x] Terraform resources in IaC (`lambda_etl_sales.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`)
 - [x] etl_stocks core logic (`process.py`, `run_local.py`) — transforms `Current Stock Balances*.xlsx` → `Stock - Processed.xlsx`
 - [x] etl_stocks Lambda handler (`handler.py`) — S3 trigger, rates lookup, processed upload, source archive, DB upsert into `snapshot_stock` (unitemporal milestoning)
+- [x] etl_stocks — emits `ETLStocksSuccess` EventBridge event after successful DB upsert (triggers redis_updater)
+- [x] redis_updater — fully implemented: handles `ETLStocksSuccess` → queries current `snapshot_stock` → writes `iravi:stocks:summary` + `iravi:stocks:current` to Redis (24h TTL); `ETLSalesSuccess` handler is a stub pending etl_sales implementation
+- [x] api — fully implemented: `GET /stocks/summary` and `GET /stocks/current` with cache-aside (Redis first → RDS fallback → populate Redis); `GET /sales` stub
 
 ## What Is Next (build in this order)
 
-- [x] **Add Terraform for etl_stocks** — `lambda_etl_stocks.tf` in IaC: S3 trigger fan-out from etl_sales notification, `DATA_BUCKET` env var, IAM for S3 read/write/list/delete
-- [ ] **Implement etl_sales** — full handler: S3 download → xlsx parse → DB upsert → EventBridge event → move to processed/
-- [ ] **Test etl_sales** — upload a real sales xlsx to `raw/` in S3, verify `fact_sales` rows in RDS
-- [ ] **Add ElastiCache Terraform** (`elasticache.tf` in IaC) — prerequisite for redis_updater and api
-- [ ] **Implement redis_updater** — query RDS sales metrics → write to Redis with 7-day TTL
-- [ ] **Implement api** — `/sales` endpoint with cache-aside pattern
+- [x] **Add Terraform for etl_stocks** — complete
+- [x] **Add ElastiCache Terraform** — complete (`elasticache.tf` in IaC)
+- [x] **Implement redis_updater** — complete for stocks; sales cache pending etl_sales
+- [x] **Implement api** — complete for `/stocks/summary` and `/stocks/current`
+
+- [ ] **Test stocks end-to-end** — upload real `Current Stock Balances*.xlsx` to S3, verify RDS rows, verify Redis keys, verify API responses
+- [ ] **Implement etl_sales** — full handler: xlsx parse → DB upsert → emit `ETLSalesSuccess` → move to processed/
+- [ ] **Implement `_update_sales_cache()`** in redis_updater once etl_sales is verified
 - [ ] **Cognito + JWT authoriser** — add to API Gateway once Cognito Terraform is provisioned
 - [ ] **Phase 2: expand to all 8 file types** — after sales flow is verified end-to-end
