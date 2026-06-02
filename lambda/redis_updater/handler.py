@@ -83,9 +83,9 @@ def _update_stocks_cache():
         available_qty = float(row['available_qty'] or 0)
 
         if packing_config == 'gms':
-            total_kgs += available_qty / 1000.0
+            total_kgs += available_qty
         elif packing_config == 'ml':
-            total_vols += available_qty / 1000.0
+            total_vols += available_qty
 
         total_valuation += float(row['stock_valuation'] or 0)
         product_set.add((row['brand'], row['technical'], packing_size_num, packing_config))

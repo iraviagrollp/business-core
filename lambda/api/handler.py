@@ -84,9 +84,9 @@ def _handle_stocks_summary():
         qty = float(available_qty or 0)
         pc = packing_config or ''
         if pc == 'gms':
-            total_kgs += qty / 1000.0
+            total_kgs += qty
         elif pc == 'ml':
-            total_vols += qty / 1000.0
+            total_vols += qty
         total_valuation += float(stock_valuation or 0)
         product_set.add((brand, technical, float(packing_size or 0), pc))
         if entry_date and (latest_date is None or entry_date > latest_date):
