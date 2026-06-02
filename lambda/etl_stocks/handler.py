@@ -137,7 +137,7 @@ def _upsert_snapshot_stock(conn, rows: list[dict]):
                     row['brand'], row['technical'], row['packing_size'],
                     row['packing_configuration'], row['available_nos'],
                     row['conversion_factor'], row['available_cases'],
-                    row['available_qty'], row['branch'],
+                    row['available_qty'] / 1000, row['branch'],
                     row['special_packing_mention'], row['entry_date'],
                     row['rate'], row['stock_valuation'],
                 ),
