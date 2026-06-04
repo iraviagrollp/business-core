@@ -27,6 +27,7 @@ _CONTRA_SUBCATEGORY = {
     'SGST Output A/C': 'SGST',
     'IGST Output A/C': 'IGST',
     'Default Sales Account': 'Sale',
+    'Roundoff A/C': 'Roundoff',
 }
 
 # Contra Account → sub_category for Sales Invoice Returns (category = Sales Return)
@@ -131,7 +132,7 @@ def _parse(src_path: str) -> list[dict]:
             continue
 
         if transaction_name == 'Sales Invoice Returns':
-            category = 'Sales Return'
+            category = 'Cr'
             sub_category = _SALES_RETURN_SUBCATEGORY.get(contra_account, contra_account)
         else:
             category = 'Cr' if credit > 0 else 'Db'
