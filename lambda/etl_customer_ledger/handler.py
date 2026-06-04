@@ -128,6 +128,7 @@ def _parse(src_path: str) -> list[dict]:
 
         rows.append({
             'transaction_date': transaction_date,
+            'voucher_no': voucher_no,
             'account_name': account_name,
             'category': category,
             'sub_category': sub_category,
@@ -165,14 +166,14 @@ def _upsert(conn, rows: list[dict]):
     with conn.cursor() as cur:
         for row in rows:
             biz_key = (
-                row['transaction_date'], row['account_name'],
+                row['transaction_date'], row['voucher_no'], row['account_name'],
                 row['category'], row['sub_category'],
             )
             cur.execute(
                 """
                 UPDATE customer_ledger
                    SET out_z = NOW()
-                 WHERE transaction_date = %s AND account_name = %s
+                 WHERE transaction_date = %s AND voucher_no = %s AND account_name = %s
                    AND category = %s AND sub_category = %s
                    AND out_z IS NULL
                 """,
@@ -180,9 +181,9 @@ def _upsert(conn, rows: list[dict]):
             )
             cur.execute(
                 """
-                INSERT INTO customer_ledger (transaction_date, account_name, category, sub_category, amount)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO customer_ledger (transaction_date, voucher_no, account_name, category, sub_category, amount)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (row['transaction_date'], row['account_name'],
+                (row['transaction_date'], row['voucher_no'], row['account_name'],
                  row['category'], row['sub_category'], row['amount']),
             )
