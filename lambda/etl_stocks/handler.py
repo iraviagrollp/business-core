@@ -109,10 +109,10 @@ def _upsert_snapshot_stock(conn, rows: list[dict]):
     """Close the current active record then insert a fresh one for each row."""
     with conn.cursor() as cur:
         for row in rows:
-            nk = (
+            biz_key = (
                 row['brand'], row['technical'], row['packing_size'],
                 row['packing_configuration'], row['branch'],
-                row['special_packing_mention'], row['entry_date'],
+                row['special_packing_mention'],
             )
             cur.execute(
                 """
@@ -120,10 +120,10 @@ def _upsert_snapshot_stock(conn, rows: list[dict]):
                    SET out_z = NOW()
                  WHERE brand = %s AND technical = %s AND packing_size = %s
                    AND packing_configuration = %s AND branch = %s
-                   AND special_packing_mention = %s AND entry_date = %s
+                   AND special_packing_mention = %s
                    AND out_z IS NULL
                 """,
-                nk,
+                biz_key,
             )
             cur.execute(
                 """
