@@ -21,12 +21,20 @@ _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'Ledger All Accounts'
 
-# Contra Account → sub_category (checked first — more specific)
+# Contra Account → sub_category for Sales Invoice (category = Db)
 _CONTRA_SUBCATEGORY = {
     'CGST Output A/C': 'CGST',
     'SGST Output A/C': 'SGST',
     'IGST Output A/C': 'IGST',
     'Default Sales Account': 'Sale',
+}
+
+# Contra Account → sub_category for Sales Invoice Returns (category = Sales Return)
+_SALES_RETURN_SUBCATEGORY = {
+    'CGST Input A/C': 'CGST',
+    'SGST Input A/C': 'SGST',
+    'IGST Input A/C': 'IGST',
+    'Default SalesReturn Account': 'Sales Return',
 }
 
 # Transaction Name → sub_category (fallback when Contra Account has no mapping)
@@ -122,9 +130,13 @@ def _parse(src_path: str) -> list[dict]:
             logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
             continue
 
-        category = 'Cr' if credit > 0 else 'Db'
+        if transaction_name == 'Sales Invoice Returns':
+            category = 'Sales Return'
+            sub_category = _SALES_RETURN_SUBCATEGORY.get(contra_account, contra_account)
+        else:
+            category = 'Cr' if credit > 0 else 'Db'
+            sub_category = _map_sub_category(transaction_name, contra_account)
         amount = credit if credit > 0 else debit
-        sub_category = _map_sub_category(transaction_name, contra_account)
 
         rows.append({
             'transaction_date': transaction_date,
