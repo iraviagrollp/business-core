@@ -12,7 +12,8 @@ logger.setLevel(logging.INFO)
 
 secrets = boto3.client('secretsmanager')
 
-_REDIS_TTL = 86400  # 24h fallback TTL when populating from RDS on cache miss
+_REDIS_TTL = 86400   # 24h fallback TTL when populating from RDS on cache miss
+_LEDGER_TTL = 3600  # 1h TTL for ledger range-query results
 
 
 def _get_db_conn():
@@ -49,6 +50,11 @@ def lambda_handler(event, context):
         return _handle_stocks_summary()
     if path == '/stocks/current':
         return _handle_stocks_current()
+    if path == '/ledger/range':
+        return _handle_ledger_range()
+    if path == '/ledger':
+        params = event.get('queryStringParameters') or {}
+        return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
     if path == '/sales':
         return _response(200, {'data': []})
 
@@ -152,6 +158,76 @@ def _handle_stocks_current():
 
     r.set('iravi:stocks:current', json.dumps(current), ex=_REDIS_TTL)
     return _response(200, current)
+
+
+def _handle_ledger_range():
+    r = _get_redis()
+    cached = r.get('iravi:ledger:range')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    # Fallback to DB (Redis evicted or before first ETL run)
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MIN(transaction_date), MAX(transaction_date)
+                FROM customer_ledger
+                WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    if min_date:
+        r.set('iravi:ledger:range', json.dumps(payload), ex=_REDIS_TTL)
+    return _response(200, payload)
+
+
+def _handle_ledger_data(from_date: str, to_date: str):
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:ledger:data:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT transaction_date, voucher_no, account_name, category, sub_category, amount
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
+                ORDER BY transaction_date, account_name, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'transaction_date': row['transaction_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'account_name': row['account_name'],
+            'category': row['category'],
+            'sub_category': row['sub_category'],
+            'amount': float(row['amount']),
+        })
+
+    r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
+    logger.info('Ledger data cached: key=%s rows=%d', cache_key, len(rows))
+    return _response(200, rows)
 
 
 def _response(status: int, body) -> dict:
