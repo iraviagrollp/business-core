@@ -40,6 +40,8 @@ def lambda_handler(event, context):
         _update_stocks_cache()
     elif detail_type == 'ETLSalesSuccess':
         _update_sales_cache()
+    elif detail_type == 'ETLCustomerLedgerSuccess':
+        _update_ledger_range_cache()
     else:
         logger.warning('Unknown detail-type: %s — no-op', detail_type)
 
@@ -130,6 +132,28 @@ def _update_stocks_cache():
         'Stocks cache updated: %d SKUs, %d rows, valuation=%.2f',
         summary['total_products'], len(current), total_valuation,
     )
+
+
+def _update_ledger_range_cache():
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MIN(transaction_date), MAX(transaction_date)
+                FROM customer_ledger
+                WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    r = _get_redis()
+    r.set('iravi:ledger:range', json.dumps(payload), ex=_TTL)
+    logger.info('Ledger range cache updated: min=%s max=%s', payload['min_date'], payload['max_date'])
 
 
 def _update_sales_cache():
