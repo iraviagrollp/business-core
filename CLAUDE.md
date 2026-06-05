@@ -30,18 +30,22 @@ business-core/
 ├── README.md
 ├── .gitignore
 └── lambda/
-    ├── etl_sales/          ← ETL: parse sales xlsx → RDS (Phase 1 active)
+    ├── etl_stocks/           ← ETL: parse stock balance xlsx → RDS snapshot_stock [COMPLETE]
+    │   ├── handler.py        ← Lambda entry point (S3 trigger)
+    │   ├── process.py        ← core transform logic (no S3/Lambda deps)
+    │   ├── run_local.py      ← local test runner
+    │   └── requirements.txt
+    ├── etl_sales/            ← ETL: parse sales xlsx → RDS fact_sales [STUB]
     │   ├── handler.py
     │   ├── requirements.txt
-    │   └── sample_data/    ← test xlsx files
-    ├── etl_stocks/         ← ETL: parse stock balance xlsx → processed xlsx (core logic done)
-    │   ├── process.py      ← core transform logic (no S3/Lambda deps)
-    │   ├── run_local.py    ← local test runner
-    │   └── requirements.txt
-    ├── redis_updater/      ← Cache: RDS metrics → ElastiCache Redis
+    │   └── sample_data/      ← test xlsx files
+    ├── etl_customer_ledger/  ← ETL: parse Ledger All Accounts xlsx → RDS customer_ledger [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
-    └── api/                ← API: serves dashboard requests via API Gateway
+    ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
+    │   ├── handler.py
+    │   └── requirements.txt
+    └── api/                  ← API: serves dashboard requests via API Gateway
         ├── handler.py
         └── requirements.txt
 ```
@@ -55,7 +59,9 @@ Lambdas are packaged by Terraform using the `archive_file` data source — no se
 Terraform configs live in:
 ```
 D:\Projects\Iravi\IaC\terraform\environments\production\
+├── lambda_etl_stocks.tf
 ├── lambda_etl_sales.tf
+├── lambda_etl_customer_ledger.tf
 ├── lambda_redis_updater.tf
 └── lambda_api.tf
 ```
@@ -64,14 +70,17 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 **Dependencies are packaged automatically** — The GitHub Actions workflow runs `pip install` into `.lambda_layers/<lambda>/python/` before `terraform plan/apply`. Terraform then zips that directory into a Lambda Layer. No local `pip install` step needed.
 
+**Deployment order:** Commit + push `business-core` first (IaC GitHub Actions checks it out during plan/apply — the source directory must exist in the remote repo before Terraform runs).
+
 ---
 
 ## Runtime & Dependencies
 
 | Lambda | Runtime | Key packages |
 |---|---|---|
+| etl_stocks | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_sales | Python 3.12 | psycopg2-binary, openpyxl, boto3 |
-| etl_stocks | Python 3.12 | openpyxl |
+| etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
@@ -81,35 +90,20 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 | Variable | Set by | Used in |
 |---|---|---|
-| `DB_SECRET_ARN` | Terraform | etl_sales, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_sales, etl_stocks |
-| `RAW_PREFIX` | Terraform | etl_stocks (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks (default: `processed/`) |
-| `EVENT_BUS_NAME` | Terraform | etl_sales, etl_stocks |
-| `REDIS_HOST` | Terraform (`elasticache.tf` provisioned) | redis_updater, api |
-
----
-
-## Phase 1 Scope — Sales First
-
-**Active build target: `etl_sales`**
-
-- Trigger: S3 `ObjectCreated` on `raw/*.xlsx`, filtered to `RGF Sales Book*.xlsx` in handler
-- Parses: rows 6+ only (skip rows 1–5 header, detect/skip total rows)
-- Columns: `Date, Voucher No, Branch, Party, Party GSTN, Qty, Gross, Disc, AV, CGST, SGST, IGST, Net, BillValue`
-- Upserts: `dim_customers` (on `customer_name`), then `fact_sales` (on `voucher_no, transaction_date`)
-- On success: writes `etl_runs` row, emits `ETLSalesSuccess` EventBridge event, moves file to `processed/`
-- On failure: writes `etl_runs` row with `status=failed`, raises exception (CloudWatch alarm fires)
-
-`redis_updater` and `api` are scaffolded but not yet implemented — activate after etl_sales is verified.
+| `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger (default: `processed/`) |
+| `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
+| `REDIS_HOST` | Terraform | redis_updater, api |
 
 ---
 
 ## etl_stocks — Stock Balance Processing
 
-**Status: core processing logic + S3/Lambda handler + DB write complete**
+**Status: complete**
 
-Source file pattern: `Current Stock Balances*.xlsx`
+Source file pattern: `Current Stock Balances*.xlsx` (S3 prefix filter: `raw/Current`)
 
 **Product string parsing** (`Technical - Brand - Packing Size [- Packing Spec]`):
 - Brand column used as anchor to locate split point in product string
@@ -123,44 +117,117 @@ Source file pattern: `Current Stock Balances*.xlsx`
 - `ML` → `ml` (no conversion)
 - `LT`, `LTR`, `L` → `ml` × 1000
 
-**Row merging:** rows sharing the same (Brand, Technical, Packing Size, Packing Configuration, Branch, Special Packing Mention) are collapsed into one — `Available Nos` is summed, `Available Cases` and `Available Qty` are recalculated from the total. Rows with different Branch or Special Packing Mention are always kept separate.
+**`available_qty` in DB:** stored as kg or L (divided by 1000 on INSERT). The in-memory dict and Excel output retain the original gram/ml value. The API and redis_updater accumulate the raw DB value directly — no further division.
 
-**Rate lookup:** `process_stock_file` accepts optional `rates_path` pointing to a `Product Masters With Rates*.xlsx` file. Rates are joined on the raw product string, filtered to `Purchase Price List` only. Products not found in the master get blank Rate/Stock Valuation.
+**Row merging:** rows sharing the same (Brand, Technical, Packing Size, Packing Configuration, Branch, Special Packing Mention) are collapsed into one — `Available Nos` is summed, `Available Cases` and `Available Qty` are recalculated from the total.
+
+**Rate lookup:** `process_stock_file` accepts optional `rates_path` pointing to a `Product Masters With Rates*.xlsx` file. Rates are joined on the raw product string, filtered to `Purchase Price List` only.
 
 **Lambda handler (`handler.py`):**
 - Trigger: S3 `ObjectCreated` on `{RAW_PREFIX}Current Stock Balances*.xlsx`
 - Finds latest `{RAW_PREFIX}Product Masters With Rates*.xlsx` automatically (by LastModified)
 - Downloads both to `/tmp/`, calls `process_stock_file`, uploads output to `{PROCESSED_PREFIX}Stock - Processed <date_suffix>.xlsx`
 - Archives source to `{PROCESSED_PREFIX}raw/<original_filename>`
-- Proceeds without rates if no rates file is found (logs a warning)
+- Upserts into `snapshot_stock` (unitemporal milestoning)
+- Emits `ETLStocksSuccess` EventBridge event on success
 
-**Output columns:** Brand, Technical, Packing Size, Packing Configuration, Available Nos, Conversion Factor, Available Cases, Available Qty, Branch, Special Packing Mention, Entry Date, Rate, Stock Valuation
+**Milestoning natural key:** `(brand, technical, packing_size, packing_configuration, branch, special_packing_mention)` — `entry_date` is NOT in the UPDATE predicate (it's temporal data, not a business key).
+
+---
+
+## etl_customer_ledger — Customer Ledger Processing
+
+**Status: complete**
+
+Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`)
+
+**Parse rules (rows 6+):**
+- Skip if `transaction_date` is None
+- Skip if `account_name` is empty
+- Skip if `voucher_no == 'Brought Forward'`
+- Skip if `debit == 0 and credit == 0`
+
+**Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
+
+**Category & sub-category logic:**
+| Transaction Name | Category | Sub-category (from Contra Account) |
+|---|---|---|
+| Sales Invoice | `Db` | CGST Output A/C → CGST, SGST Output A/C → SGST, IGST Output A/C → IGST, Default Sales Account → Sale, Roundoff A/C → Roundoff |
+| Sales Invoice Returns | `Cr` | CGST Input A/C → CGST, SGST Input A/C → SGST, IGST Input A/C → IGST, Default SalesReturn Account → Sales Return |
+| Bank Receipts | `Cr` | Bank Receipt |
+| Cash Receipts | `Cr` | Cash Receipt |
+| *(any other)* | `Cr`/`Db` from credit/debit col | transaction_name (fallback) |
+
+**Milestoning natural key:** `(transaction_date, voucher_no, account_name, category, sub_category)` — UPDATE closes open record matching all five, then INSERT adds new row.
+
+**On success:** archives source to `processed/raw/`, emits `ETLCustomerLedgerSuccess` EventBridge event → triggers redis_updater to write `iravi:ledger:range`.
+
+---
+
+## etl_sales — Sales Processing
+
+**Status: stub — core logic not yet implemented**
+
+Source file pattern: `RGF Sales Book*.xlsx` (S3 prefix filter: `raw/RGF Sales Book`)
+
+- Parses: rows 6+ only (skip rows 1–5 header, detect/skip total rows)
+- Columns: `Date, Voucher No, Branch, Party, Party GSTN, Qty, Gross, Disc, AV, CGST, SGST, IGST, Net, BillValue`
+- Upserts: `dim_customers` (on `customer_name`), then `fact_sales` (on `voucher_no, transaction_date`)
+- On success: writes `etl_runs` row, emits `ETLSalesSuccess` EventBridge event, moves file to `processed/`
+- On failure: writes `etl_runs` row with `status=failed`, raises exception (CloudWatch alarm fires)
+
+---
+
+## redis_updater — Cache Population
+
+**Status: stocks + ledger range complete; sales stub**
+
+Triggered by EventBridge. Routes on `detail-type`:
+
+| Event | Handler | Redis key written |
+|---|---|---|
+| `ETLStocksSuccess` | `_update_stocks_cache()` | `iravi:stocks:summary`, `iravi:stocks:current` |
+| `ETLCustomerLedgerSuccess` | `_update_ledger_range_cache()` | `iravi:ledger:range` |
+| `ETLSalesSuccess` | `_update_sales_cache()` | *(stub — not yet implemented)* |
+
+**`iravi:ledger:range`:** `{min_date, max_date}` — MIN/MAX of `transaction_date WHERE out_z IS NULL` in `customer_ledger`. 24h TTL.
+
+---
+
+## api — API Layer
+
+**Status: stocks complete; sales stub**
+
+| Endpoint | Redis key | Status |
+|---|---|---|
+| `GET /stocks/summary` | `iravi:stocks:summary` | Complete |
+| `GET /stocks/current` | `iravi:stocks:current` | Complete |
+| `GET /sales` | — | Stub (returns empty array) |
+
+Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ---
 
 ## What Is Built
 
 - [x] Project structure created
-- [x] README.md created
-- [x] etl_sales scaffold (`handler.py`, `requirements.txt`)
-- [x] redis_updater scaffold
-- [x] api scaffold
-- [x] Terraform resources in IaC (`lambda_etl_sales.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`)
-- [x] etl_stocks core logic (`process.py`, `run_local.py`) — transforms `Current Stock Balances*.xlsx` → `Stock - Processed.xlsx`
-- [x] etl_stocks Lambda handler (`handler.py`) — S3 trigger, rates lookup, processed upload, source archive, DB upsert into `snapshot_stock` (unitemporal milestoning)
-- [x] etl_stocks — emits `ETLStocksSuccess` EventBridge event after successful DB upsert (triggers redis_updater)
-- [x] redis_updater — fully implemented: handles `ETLStocksSuccess` → queries current `snapshot_stock` → writes `iravi:stocks:summary` + `iravi:stocks:current` to Redis (24h TTL); `ETLSalesSuccess` handler is a stub pending etl_sales implementation
-- [x] api — fully implemented: `GET /stocks/summary` and `GET /stocks/current` with cache-aside (Redis first → RDS fallback → populate Redis); `GET /sales` stub
+- [x] etl_stocks core logic (`process.py`, `run_local.py`)
+- [x] etl_stocks Lambda handler — S3 trigger, rates lookup, processed upload, source archive, DB upsert (`snapshot_stock`), `ETLStocksSuccess` event
+- [x] etl_stocks `available_qty` fix — stored in DB as kg/L (÷1000 on INSERT only)
+- [x] etl_stocks milestoning fix — `entry_date` removed from UPDATE predicate; only business key used
+- [x] etl_customer_ledger Lambda — full handler: parse `Ledger All Accounts*.xlsx`, category/sub-category mapping, unitemporal upsert into `customer_ledger`, archive source, emit `ETLCustomerLedgerSuccess`
+- [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
+- [x] redis_updater — `ETLStocksSuccess` handler: writes `iravi:stocks:summary` + `iravi:stocks:current`
+- [x] redis_updater — `ETLCustomerLedgerSuccess` handler: writes `iravi:ledger:range`
+- [x] api — `GET /stocks/summary` + `GET /stocks/current` with cache-aside; `GET /sales` stub
+- [x] Terraform resources: `lambda_etl_stocks.tf`, `lambda_etl_sales.tf`, `lambda_etl_customer_ledger.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`
+- [x] GitHub Actions layer build steps for all Lambdas (plan + apply jobs)
 
 ## What Is Next (build in this order)
 
-- [x] **Add Terraform for etl_stocks** — complete
-- [x] **Add ElastiCache Terraform** — complete (`elasticache.tf` in IaC)
-- [x] **Implement redis_updater** — complete for stocks; sales cache pending etl_sales
-- [x] **Implement api** — complete for `/stocks/summary` and `/stocks/current`
-
-- [ ] **Test stocks end-to-end** — upload real `Current Stock Balances*.xlsx` to S3, verify RDS rows, verify Redis keys, verify API responses
-- [ ] **Implement etl_sales** — full handler: xlsx parse → DB upsert → emit `ETLSalesSuccess` → move to processed/
+- [ ] **Run DB migrations** — apply `003_add_voucher_no_to_customer_ledger.sql` via bastion SSM port-forward (migration 004 was deleted — not needed)
+- [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify `customer_ledger` rows, verify `iravi:ledger:range` Redis key
+- [ ] **Test etl_stocks end-to-end** — verify milestoning works across days, verify `snapshot_stock` rows, Redis keys, API responses
+- [ ] **Implement etl_sales** — full handler: xlsx parse → `fact_sales`/`dim_customers` upsert → emit `ETLSalesSuccess` → archive
 - [ ] **Implement `_update_sales_cache()`** in redis_updater once etl_sales is verified
 - [ ] **Cognito + JWT authoriser** — add to API Gateway once Cognito Terraform is provisioned
-- [ ] **Phase 2: expand to all 8 file types** — after sales flow is verified end-to-end
