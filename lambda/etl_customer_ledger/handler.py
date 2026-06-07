@@ -125,6 +125,8 @@ def _parse(src_path: str) -> list[dict]:
             continue
         if debit == 0 and credit == 0:
             continue
+        if contra_account == 'Default Purchase Account':
+            continue
 
         transaction_date = _parse_date(transaction_date_raw)
         if transaction_date is None:
