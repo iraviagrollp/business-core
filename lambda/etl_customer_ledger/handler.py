@@ -72,18 +72,27 @@ def lambda_handler(event, context):
         _process(bucket, key, filename)
 
 
+def _load_known_customers(conn) -> set:
+    with conn.cursor() as cur:
+        cur.execute('SELECT customer_name FROM customer_details')
+        return {row[0] for row in cur.fetchall()}
+
+
 def _process(bucket: str, key: str, filename: str):
     archive_key = _PROCESSED_PREFIX + 'raw/' + filename
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src_path = os.path.join(tmp, filename)
-        logger.info('Downloading s3://%s/%s', bucket, key)
-        s3.download_file(bucket, key, src_path)
-        rows = _parse(src_path)
-        logger.info('Parsed %d ledger rows', len(rows))
-
     conn = _get_db_conn()
     try:
+        known_customers = _load_known_customers(conn)
+        logger.info('Loaded %d known customers from customer_details', len(known_customers))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, filename)
+            logger.info('Downloading s3://%s/%s', bucket, key)
+            s3.download_file(bucket, key, src_path)
+            rows = _parse(src_path, known_customers)
+            logger.info('Parsed %d ledger rows (after customer filter)', len(rows))
+
         _upsert(conn, rows)
         conn.commit()
         logger.info('Upserted %d rows into customer_ledger', len(rows))
@@ -103,7 +112,7 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Emitted ETLCustomerLedgerSuccess rows=%d', len(rows))
 
 
-def _parse(src_path: str) -> list[dict]:
+def _parse(src_path: str, known_customers: set) -> list[dict]:
     wb = openpyxl.load_workbook(src_path, data_only=True)
     ws = wb.active
 
@@ -126,6 +135,8 @@ def _parse(src_path: str) -> list[dict]:
         if debit == 0 and credit == 0:
             continue
         if contra_account == 'Default Purchase Account':
+            continue
+        if account_name not in known_customers:
             continue
 
         transaction_date = _parse_date(transaction_date_raw)
