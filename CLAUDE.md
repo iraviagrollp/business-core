@@ -42,6 +42,9 @@ business-core/
     ├── etl_customer_ledger/  ← ETL: parse Ledger All Accounts xlsx → RDS customer_ledger [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_customer_accounts/ ← ETL: parse Customer Accounts Export xlsx → RDS customer_details [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
@@ -62,6 +65,7 @@ D:\Projects\Iravi\IaC\terraform\environments\production\
 ├── lambda_etl_stocks.tf
 ├── lambda_etl_sales.tf
 ├── lambda_etl_customer_ledger.tf
+├── lambda_etl_customer_accounts.tf
 ├── lambda_redis_updater.tf
 └── lambda_api.tf
 ```
@@ -81,6 +85,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_stocks | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_sales | Python 3.12 | psycopg2-binary, openpyxl, boto3 |
 | etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_customer_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
@@ -91,9 +96,9 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | Variable | Set by | Used in |
 |---|---|---|
 | `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger |
-| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger (default: `processed/`) |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
 
@@ -146,6 +151,7 @@ Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`
 - Skip if `account_name` is empty
 - Skip if `voucher_no == 'Brought Forward'`
 - Skip if `debit == 0 and credit == 0`
+- Skip if `contra_account == 'Default Purchase Account'`
 
 **Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
 
@@ -161,6 +167,27 @@ Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`
 **Milestoning natural key:** `(transaction_date, voucher_no, account_name, category, sub_category)` — UPDATE closes open record matching all five, then INSERT adds new row.
 
 **On success:** archives source to `processed/raw/`, emits `ETLCustomerLedgerSuccess` EventBridge event → triggers redis_updater to write `iravi:ledger:range`.
+
+---
+
+## etl_customer_accounts — Customer Details Processing
+
+**Status: complete**
+
+Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `raw/Customer`)
+
+**Column mapping (0-indexed, header row 1, data from row 2):**
+`[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`
+
+**Transformations:**
+- `customer_name` — uppercased
+- `district`, `city` — title-cased
+- `state` — mapped: `37-Andhra Pradesh` → `AP`, `36-Telangana` → `TG`
+- `mobile_no` — numeric values cast to string; string values stripped of whitespace
+
+**Upsert strategy:** `INSERT ... ON CONFLICT (customer_name) DO UPDATE SET ...` — simple dimension upsert, no milestoning. `updated_at` refreshed on each update.
+
+**Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, updated_at)`
 
 ---
 
@@ -216,16 +243,17 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_stocks `available_qty` fix — stored in DB as kg/L (÷1000 on INSERT only)
 - [x] etl_stocks milestoning fix — `entry_date` removed from UPDATE predicate; only business key used
 - [x] etl_customer_ledger Lambda — full handler: parse `Ledger All Accounts*.xlsx`, category/sub-category mapping, unitemporal upsert into `customer_ledger`, archive source, emit `ETLCustomerLedgerSuccess`
+- [x] etl_customer_accounts Lambda — full handler: parse `Customer Accounts Export File*.xlsx`, normalise case + state codes, upsert into `customer_details`
 - [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
 - [x] redis_updater — `ETLStocksSuccess` handler: writes `iravi:stocks:summary` + `iravi:stocks:current`
 - [x] redis_updater — `ETLCustomerLedgerSuccess` handler: writes `iravi:ledger:range`
 - [x] api — `GET /stocks/summary` + `GET /stocks/current` with cache-aside; `GET /sales` stub
-- [x] Terraform resources: `lambda_etl_stocks.tf`, `lambda_etl_sales.tf`, `lambda_etl_customer_ledger.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`
+- [x] Terraform resources: `lambda_etl_stocks.tf`, `lambda_etl_sales.tf`, `lambda_etl_customer_ledger.tf`, `lambda_etl_customer_accounts.tf`, `lambda_redis_updater.tf`, `lambda_api.tf`
 - [x] GitHub Actions layer build steps for all Lambdas (plan + apply jobs)
 
 ## What Is Next (build in this order)
 
-- [ ] **Run DB migrations** — apply `003_add_voucher_no_to_customer_ledger.sql` via bastion SSM port-forward (migration 004 was deleted — not needed)
+- [ ] **Run DB migrations** — apply `003_add_voucher_no_to_customer_ledger.sql` and `004_create_customer_details.sql` via bastion SSM port-forward
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify `customer_ledger` rows, verify `iravi:ledger:range` Redis key
 - [ ] **Test etl_stocks end-to-end** — verify milestoning works across days, verify `snapshot_stock` rows, Redis keys, API responses
 - [ ] **Implement etl_sales** — full handler: xlsx parse → `fact_sales`/`dim_customers` upsert → emit `ETLSalesSuccess` → archive

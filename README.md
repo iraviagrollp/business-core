@@ -31,6 +31,9 @@ business-core/
     ├── etl_customer_ledger/  ← ETL: parse Ledger All Accounts xlsx → RDS customer_ledger [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_customer_accounts/ ← ETL: parse Customer Accounts Export xlsx → RDS customer_details [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis
     │   ├── handler.py
     │   └── requirements.txt
@@ -48,6 +51,7 @@ business-core/
 | `etl_stocks` | S3 `raw/Current*.xlsx` | Transform stock balances → `snapshot_stock` (unitemporal) | Complete |
 | `etl_sales` | S3 `raw/RGF Sales Book*.xlsx` | Parse sales → `fact_sales` + `dim_customers` | Stub |
 | `etl_customer_ledger` | S3 `raw/Ledger*.xlsx` | Parse ledger entries → `customer_ledger` (unitemporal) | Complete |
+| `etl_customer_accounts` | S3 `raw/Customer*.xlsx` | Parse customer accounts → `customer_details` (upsert) | Complete |
 | `redis_updater` | EventBridge (ETL success events) | Pull RDS → write Redis cache | Stocks + ledger done |
 | `api` | API Gateway HTTP v2 | Cache-aside JSON responses | Stocks done |
 
