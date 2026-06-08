@@ -99,6 +99,8 @@ def _parse(src_path: str) -> list[dict]:
             mobile_no = str(int(mobile_raw))
         else:
             mobile_no = str(mobile_raw).replace(' ', '') or None
+        if mobile_no and len(mobile_no) > 10:
+            mobile_no = mobile_no[-10:]
 
         rows.append({
             'customer_name': name.upper(),
