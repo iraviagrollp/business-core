@@ -54,6 +54,12 @@ business-core/
     ├── etl_appendix_b_x11_purchase_return/ ← ETL: parse AppendixPurReturn xlsx → RDS appendix_b_x11_stock_ledger (in_out=Out) [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_appendix_b_x11_sale/ ← ETL: parse AppendixSale xlsx → RDS appendix_b_x11_stock_ledger (in_out=Out) [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
+    ├── etl_appendix_b_x11_sale_return/ ← ETL: parse AppendixRetSales xlsx → RDS appendix_b_x11_stock_ledger (in_out=In) [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
@@ -98,6 +104,8 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_appendix_b_x11 | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11_purchase | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11_purchase_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_appendix_b_x11_sale | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_appendix_b_x11_sale_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
@@ -304,6 +312,8 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
 - [x] etl_appendix_b_x11_purchase Lambda — full handler: parse `AppendixPurchaseReport*.xlsx`, skip multi-barcode rows, look up mdf_date/exp_date from `appendix_b_x11_stock`, upsert into `appendix_b_x11_stock_ledger` (in_out=In)
 - [x] etl_appendix_b_x11_purchase_return Lambda — same as purchase but `AppendixPurReturn*.xlsx`, different column layout ([3]=Party, [4]=Ref BillNo, [6]=Product, [7]=Qty, [22]=Barcodes), in_out=Out
+- [x] etl_appendix_b_x11_sale Lambda — parse `AppendixSale*.xlsx`, column layout [0]=Date, [1]=VoucherNo, [2]=Branch, [3]=Party, [4]=RefBillNo, [6]=Product, [7]=Qty, [22]=Barcodes; in_out=Out; inserts into appendix_b_x11_stock_ledger
+- [x] etl_appendix_b_x11_sale_return Lambda — same layout, `AppendixRetSales*.xlsx`, in_out=In
 - [x] DB migration `006_create_appendix_b_x11_stock_ledger.sql` — `appendix_b_x11_stock_ledger` table with (purchase_date, iravi_voucher, technical_name, barcode) milestoning
 - [x] Terraform + S3 trigger + GitHub Actions layer build for `etl_appendix_b_x11_purchase`
 - [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
