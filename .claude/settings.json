@@ -2,6 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)"
+    ],
+    "additionalDirectories": [
+      "d:\\Projects\\Iravi\\IaC\\terraform\\environments\\production",
+      "d:\\Projects\\Iravi\\IaC\\.github\\workflows"
     ]
   }
 }
