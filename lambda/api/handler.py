@@ -12,8 +12,9 @@ logger.setLevel(logging.INFO)
 
 secrets = boto3.client('secretsmanager')
 
-_REDIS_TTL = 86400   # 24h fallback TTL when populating from RDS on cache miss
-_LEDGER_TTL = 3600  # 1h TTL for ledger range-query results
+_REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache miss
+_LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
+_APPENDIX_B_TTL = 900    # 15 min TTL for appendix-b meta and report
 
 
 def _get_db_conn():
@@ -57,6 +58,11 @@ def lambda_handler(event, context):
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
     if path == '/sales':
         return _response(200, {'data': []})
+    if path == '/appendix-b/meta':
+        return _handle_appendix_b_meta()
+    if path == '/appendix-b/report':
+        params = event.get('queryStringParameters') or {}
+        return _handle_appendix_b_report(params)
 
     return _response(404, {'error': 'Not found'})
 
@@ -228,6 +234,149 @@ def _handle_ledger_data(from_date: str, to_date: str):
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Ledger data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
+
+
+def _handle_appendix_b_meta():
+    r = _get_redis()
+    cached = r.get('iravi:appendix_b:meta')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT customer_name FROM customer_details ORDER BY customer_name')
+            customers = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT DISTINCT branch FROM appendix_b_x11_stock_ledger
+                WHERE out_z IS NULL AND branch IS NOT NULL ORDER BY branch
+            """)
+            branches = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT DISTINCT technical_name FROM appendix_b_x11_stock_ledger
+                WHERE out_z IS NULL ORDER BY technical_name
+            """)
+            technical_names = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT MIN(purchase_date), MAX(purchase_date)
+                FROM appendix_b_x11_stock_ledger WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'customers': customers,
+        'branches': branches,
+        'technical_names': technical_names,
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    if min_date:
+        r.set('iravi:appendix_b:meta', json.dumps(payload), ex=_APPENDIX_B_TTL)
+    return _response(200, payload)
+
+
+def _handle_appendix_b_report(params: dict):
+    branch = (params.get('branch') or '').strip()
+    technical_name = (params.get('technical_name') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+
+    if not all([branch, technical_name, from_date, to_date]):
+        return _response(400, {'error': 'branch, technical_name, from_date, to_date are required'})
+
+    cache_key = f'iravi:appendix_b:report:{branch}:{technical_name}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT customer_name FROM customer_details')
+            customer_set = {row[0] for row in cur.fetchall()}
+
+            # Balance brought forward: net qty strictly before the window
+            cur.execute("""
+                SELECT COALESCE(
+                    SUM(CASE WHEN in_out = 'In' THEN qty ELSE -qty END), 0
+                )
+                FROM appendix_b_x11_stock_ledger
+                WHERE out_z IS NULL
+                  AND branch = %(branch)s
+                  AND technical_name = %(technical_name)s
+                  AND purchase_date < %(from_date)s
+            """, {'branch': branch, 'technical_name': technical_name, 'from_date': from_date})
+            bf_qty = float(cur.fetchone()[0])
+
+            cur.execute("""
+                SELECT purchase_date, iravi_voucher, supplier_voucher, party,
+                       barcode, mdf_date, exp_date, in_out, qty
+                FROM appendix_b_x11_stock_ledger
+                WHERE out_z IS NULL
+                  AND branch = %(branch)s
+                  AND technical_name = %(technical_name)s
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                ORDER BY purchase_date, id
+            """, {'branch': branch, 'technical_name': technical_name,
+                  'from_date': from_date, 'to_date': to_date})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    running_bal = bf_qty
+    current_mfg_name = None
+    result_rows = []
+
+    for sno, raw in enumerate(raw_rows, start=1):
+        row = dict(zip(col_names, raw))
+        party = row['party'] or ''
+        in_out = row['in_out']
+        qty = float(row['qty'] or 0)
+        is_customer = party in customer_set
+
+        # Track the supplier (last 'In' from a non-customer party)
+        if in_out == 'In' and not is_customer:
+            current_mfg_name = party
+
+        # Purchase → supplier voucher; all other scenarios → iravi voucher
+        inv_no = row['supplier_voucher'] if (in_out == 'In' and not is_customer) else row['iravi_voucher']
+
+        if in_out == 'In':
+            recd, sold = qty, None
+            running_bal += qty
+        else:
+            recd, sold = None, qty
+            running_bal -= qty
+
+        # REMARKS: customer name on outgoing (sales) rows
+        remarks = party if (in_out == 'Out' and is_customer) else None
+
+        result_rows.append({
+            'sno': sno,
+            'recd_date': row['purchase_date'].isoformat(),
+            'mfg_name': current_mfg_name,
+            'inv_no': inv_no,
+            'barcode': row['barcode'],
+            'mfg': row['mdf_date'].isoformat() if row['mdf_date'] else None,
+            'exp': row['exp_date'].isoformat() if row['exp_date'] else None,
+            'recd': recd,
+            'sold': sold,
+            'bal': round(running_bal, 3),
+            'remarks': remarks,
+        })
+
+    payload = {'bf_qty': round(bf_qty, 3), 'rows': result_rows}
+    r.set(cache_key, json.dumps(payload), ex=_APPENDIX_B_TTL)
+    logger.info('Appendix-B report cached: branch=%s tech=%s %s→%s rows=%d',
+                branch, technical_name, from_date, to_date, len(result_rows))
+    return _response(200, payload)
 
 
 def _response(status: int, body) -> dict:
