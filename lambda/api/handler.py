@@ -340,6 +340,7 @@ def _handle_appendix_b_report(params: dict):
         in_out = row['in_out']
         qty = float(row['qty'] or 0)
         is_customer = party in customer_set
+        row_bf = running_bal  # opening balance for this row
 
         # Track the supplier (last 'In' from a non-customer party)
         if in_out == 'In' and not is_customer:
@@ -366,6 +367,7 @@ def _handle_appendix_b_report(params: dict):
             'barcode': row['barcode'],
             'mfg': row['mdf_date'].isoformat() if row['mdf_date'] else None,
             'exp': row['exp_date'].isoformat() if row['exp_date'] else None,
+            'bf': round(row_bf, 3),
             'recd': recd,
             'sold': sold,
             'bal': round(running_bal, 3),
