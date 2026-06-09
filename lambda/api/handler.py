@@ -341,8 +341,8 @@ def _handle_appendix_b_report(params: dict):
         qty = float(row['qty'] or 0)
         is_customer = party in customer_set
 
-        # Track the supplier (last 'In' from a non-customer party that isn't Iravi itself)
-        if in_out == 'In' and not is_customer and 'iravi' not in party.lower():
+        # Track the supplier (last 'In' from a non-customer party)
+        if in_out == 'In' and not is_customer:
             current_mfg_name = party
 
         # Purchase → supplier voucher; all other scenarios → iravi voucher
