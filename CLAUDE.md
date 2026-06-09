@@ -45,6 +45,9 @@ business-core/
     ├── etl_customer_accounts/ ← ETL: parse Customer Accounts Export xlsx → RDS customer_details [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_appendix_b_x11/  ← ETL: parse Barcodes Masters xlsx → RDS appendix_b_x11_stock [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
@@ -86,6 +89,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_sales | Python 3.12 | psycopg2-binary, openpyxl, boto3 |
 | etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_customer_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_appendix_b_x11 | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
@@ -96,9 +100,9 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | Variable | Set by | Used in |
 |---|---|---|
 | `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts |
-| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts (default: `processed/`) |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
 
@@ -191,6 +195,25 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 
 ---
 
+## etl_appendix_b_x11 — Barcodes Master Processing
+
+**Status: complete**
+
+Source file pattern: `Barcodes Masters*.xlsx` (S3 prefix filter: `raw/Barcodes`)
+
+**Column mapping (0-indexed, header row 1, data from row 2):**
+`[0]=Barcodes→barcode, [1]=ProductId→technical_name, [13]=PartNo→mdf_date, [16]=VendorId→vendor, [22]=Expiry Date→exp_date`
+
+**Transformations:**
+- `barcode` — int/float values cast to string (no decimal), string values stripped of whitespace
+- `mdf_date` / `exp_date` — handles `datetime` objects, `'DD-MM-YYYY HH:MM:SS'`, `'DD-MM-YYYY'`, `'YYYY-MM-DD'` formats; ERP sentinel `01-01-1800` stored as NULL
+
+**Milestoning natural key:** `(barcode, technical_name, vendor)` — UPDATE closes open record, then INSERT adds new row.
+
+**Target table:** `appendix_b_x11_stock` (DB migration `005_create_appendix_b_x11_stock.sql`)
+
+---
+
 ## etl_sales — Sales Processing
 
 **Status: stub — core logic not yet implemented**
@@ -244,6 +267,10 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_stocks milestoning fix — `entry_date` removed from UPDATE predicate; only business key used
 - [x] etl_customer_ledger Lambda — full handler: parse `Ledger All Accounts*.xlsx`, category/sub-category mapping, unitemporal upsert into `customer_ledger`, archive source, emit `ETLCustomerLedgerSuccess`
 - [x] etl_customer_accounts Lambda — full handler: parse `Customer Accounts Export File*.xlsx`, normalise case + state codes, upsert into `customer_details`
+- [x] etl_customer_accounts mobile_no normalization — strip spaces, take last 10 digits if > 10
+- [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
+- [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
+- [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
 - [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
 - [x] redis_updater — `ETLStocksSuccess` handler: writes `iravi:stocks:summary` + `iravi:stocks:current`
 - [x] redis_updater — `ETLCustomerLedgerSuccess` handler: writes `iravi:ledger:range`
@@ -253,8 +280,11 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ## What Is Next (build in this order)
 
-- [ ] **Run DB migrations** — apply `003_add_voucher_no_to_customer_ledger.sql` and `004_create_customer_details.sql` via bastion SSM port-forward
-- [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify `customer_ledger` rows, verify `iravi:ledger:range` Redis key
+- [ ] **Run DB migrations** — apply `003`, `004`, `005` migrations via bastion SSM port-forward
+- [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
+- [ ] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` (S3 trigger on `raw/Barcodes`, env vars `DB_SECRET_ARN`, `DATA_BUCKET`)
+- [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
+- [ ] **Test etl_appendix_b_x11 end-to-end** — upload `Barcodes Masters*.xlsx` to S3 `raw/`, verify `appendix_b_x11_stock` rows and milestoning
 - [ ] **Test etl_stocks end-to-end** — verify milestoning works across days, verify `snapshot_stock` rows, Redis keys, API responses
 - [ ] **Implement etl_sales** — full handler: xlsx parse → `fact_sales`/`dim_customers` upsert → emit `ETLSalesSuccess` → archive
 - [ ] **Implement `_update_sales_cache()`** in redis_updater once etl_sales is verified
