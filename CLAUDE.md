@@ -282,7 +282,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 - [ ] **Run DB migrations** — apply `003`, `004`, `005` migrations via bastion SSM port-forward
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
-- [ ] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` (S3 trigger on `raw/Barcodes`, env vars `DB_SECRET_ARN`, `DATA_BUCKET`)
+- [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
 - [ ] **Test etl_appendix_b_x11 end-to-end** — upload `Barcodes Masters*.xlsx` to S3 `raw/`, verify `appendix_b_x11_stock` rows and milestoning
 - [ ] **Test etl_stocks end-to-end** — verify milestoning works across days, verify `snapshot_stock` rows, Redis keys, API responses
