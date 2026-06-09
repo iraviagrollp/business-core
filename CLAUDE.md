@@ -48,6 +48,9 @@ business-core/
     ├── etl_appendix_b_x11/  ← ETL: parse Barcodes Masters xlsx → RDS appendix_b_x11_stock [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_appendix_b_x11_purchase/ ← ETL: parse AppendixPurchaseReport xlsx → RDS appendix_b_x11_stock_ledger [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
@@ -90,6 +93,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_customer_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11 | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_appendix_b_x11_purchase | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
@@ -195,6 +199,29 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 
 ---
 
+## etl_appendix_b_x11_purchase — Purchase Ledger Processing
+
+**Status: complete**
+
+Source file pattern: `AppendixPurchaseReport*.xlsx` (S3 prefix filter: `raw/AppendixPurchase`)
+
+**Header:** row 5. **Data:** row 6+. Skip if `purchase_date` is None or `iravi_voucher` is empty.
+
+**Column mapping (0-indexed):**
+`[0]=Date→purchase_date, [1]=Voucher No→iravi_voucher, [2]=Branch→branch, [5]=Party→party, [6]=Ref BillNo→supplier_voucher, [9]=Product→technical_name, [10]=Qty→qty, [25]=Barcodes→barcode`
+
+**Transformations:**
+- `technical_name` — strip all commas from the product string
+- `barcode` — strip trailing comma, split by `,`; rows with multiple barcodes are skipped
+- `in_out` — hardcoded `'In'` (purchase report)
+- `mdf_date` / `exp_date` — looked up from `appendix_b_x11_stock WHERE (technical_name, barcode) AND out_z IS NULL`; NULL if no match
+
+**Milestoning natural key:** `(purchase_date, iravi_voucher, technical_name, barcode)`
+
+**Target table:** `appendix_b_x11_stock_ledger` (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
+
+---
+
 ## etl_appendix_b_x11 — Barcodes Master Processing
 
 **Status: complete**
@@ -271,6 +298,9 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
 - [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
 - [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
+- [x] etl_appendix_b_x11_purchase Lambda — full handler: parse `AppendixPurchaseReport*.xlsx`, skip multi-barcode rows, look up mdf_date/exp_date from `appendix_b_x11_stock`, upsert into `appendix_b_x11_stock_ledger`
+- [x] DB migration `006_create_appendix_b_x11_stock_ledger.sql` — `appendix_b_x11_stock_ledger` table with (purchase_date, iravi_voucher, technical_name, barcode) milestoning
+- [x] Terraform + S3 trigger + GitHub Actions layer build for `etl_appendix_b_x11_purchase`
 - [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
 - [x] redis_updater — `ETLStocksSuccess` handler: writes `iravi:stocks:summary` + `iravi:stocks:current`
 - [x] redis_updater — `ETLCustomerLedgerSuccess` handler: writes `iravi:ledger:range`
@@ -280,7 +310,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ## What Is Next (build in this order)
 
-- [ ] **Run DB migrations** — apply `003`, `004`, `005` migrations via bastion SSM port-forward
+- [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006` migrations via bastion SSM port-forward
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
