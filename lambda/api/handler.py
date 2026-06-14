@@ -500,7 +500,8 @@ def _handle_purchases_monthly(params: dict):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT to_char(purchase_date, 'YYYY-MM') AS month,
-                       COALESCE(SUM(av) FILTER (WHERE purchase_return = 'N'), 0) AS total_purchases
+                       COALESCE(SUM(av) FILTER (WHERE purchase_return = 'N'), 0) AS total_purchases,
+                       COALESCE(SUM(av) FILTER (WHERE purchase_return = 'Y'), 0) AS total_returns
                 FROM purchases
                 WHERE out_z IS NULL
                   AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
@@ -508,7 +509,10 @@ def _handle_purchases_monthly(params: dict):
                 GROUP BY month
                 ORDER BY month
             """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
-            rows = [{'month': month, 'total_purchases': float(total)} for month, total in cur.fetchall()]
+            rows = [
+                {'month': month, 'total_purchases': float(purchases), 'total_returns': float(returns)}
+                for month, purchases, returns in cur.fetchall()
+            ]
     finally:
         conn.close()
 
