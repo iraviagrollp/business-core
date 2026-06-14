@@ -21,8 +21,8 @@ _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'AppendixPurReturn'
 
 # Column indices (0-based), header in row 5, data from row 6:
-# [0]=Date, [1]=Voucher No, [2]=Branch, [3]=Party, [4]=Ref BillNo,
-# [6]=Product, [7]=Qty, [22]=Barcodes
+# [0]=Date, [1]=Voucher No, [2]=Branch, [3]=Party, [4]=Ref BillNo, [5]=Ref BillDate,
+# [6]=Product, [7]=Qty, [8]=Rate, [9]=Gross, [14]=AV, [22]=Barcodes, [23]=Narration
 # Note: return file has no Location/Storage Bin columns — layout differs from purchase file
 
 
@@ -65,11 +65,13 @@ def _process(bucket: str, key: str, filename: str):
         try:
             barcode_dates = _load_barcode_dates(conn)
             logger.info('Loaded %d entries from appendix_b_x11_stock', len(barcode_dates))
-            rows = _parse(src_path, barcode_dates)
-            logger.info('Parsed %d purchase return rows', len(rows))
-            _upsert(conn, rows)
+            ledger_rows, purchase_rows = _parse(src_path, barcode_dates)
+            logger.info('Parsed %d purchase return ledger rows, %d purchase rows', len(ledger_rows), len(purchase_rows))
+            _upsert(conn, ledger_rows)
+            _upsert_purchases(conn, purchase_rows)
             conn.commit()
-            logger.info('Upserted %d rows into appendix_b_x11_stock_ledger', len(rows))
+            logger.info('Upserted %d rows into appendix_b_x11_stock_ledger, %d rows into purchases',
+                         len(ledger_rows), len(purchase_rows))
         finally:
             conn.close()
 
@@ -89,11 +91,12 @@ def _load_barcode_dates(conn) -> dict:
         return {(row[0], row[1]): (row[2], row[3]) for row in cur.fetchall()}
 
 
-def _parse(src_path: str, barcode_dates: dict) -> list[dict]:
+def _parse(src_path: str, barcode_dates: dict) -> tuple[list[dict], list[dict]]:
     wb = openpyxl.load_workbook(src_path, data_only=True)
     ws = wb.active
 
-    rows = []
+    ledger_rows = []
+    purchase_rows = []
     skipped_multi = 0
     for row in ws.iter_rows(min_row=6, values_only=True):
         purchase_date_raw = row[0]
@@ -104,15 +107,9 @@ def _parse(src_path: str, barcode_dates: dict) -> list[dict]:
         if not iravi_voucher:
             continue
 
-        barcode_raw = str(row[22] or '').strip()
-        barcodes = [b.strip() for b in barcode_raw.split(',') if b.strip()]
-        if len(barcodes) != 1:
-            skipped_multi += 1
-            continue
-        barcode = barcodes[0]
-
-        technical_name = str(row[6] or '').replace(',', '').strip()
-        if not technical_name:
+        # Product: the field is a CSV — strip all commas
+        product = str(row[6] or '').replace(',', '').strip()
+        if not product:
             continue
 
         purchase_date = _parse_date(purchase_date_raw)
@@ -120,15 +117,44 @@ def _parse(src_path: str, barcode_dates: dict) -> list[dict]:
             logger.warning('Unparseable date %r — skipping row', purchase_date_raw)
             continue
 
-        mdf_date, exp_date = barcode_dates.get((technical_name, barcode), (None, None))
+        branch = str(row[2] or '').strip()
+        party = str(row[3] or '').strip()
+        ref_bill_no = str(row[4] or '').strip() or None
+        ref_bill_date = _parse_date(row[5])
+        barcode_raw = str(row[22] or '').strip()
 
-        rows.append({
+        purchase_rows.append({
+            'purchase_date': purchase_date,
+            'voucher_no': iravi_voucher,
+            'branch': branch,
+            'party': party,
+            'ref_bill_no': ref_bill_no,
+            'ref_bill_date': ref_bill_date,
+            'product': product,
+            'qty': float(row[7]) if row[7] is not None else None,
+            'rate': float(row[8]) if row[8] is not None else None,
+            'gross': float(row[9]) if row[9] is not None else None,
+            'av': float(row[14]) if row[14] is not None else None,
+            'barcodes': barcode_raw or None,
+            'narration': str(row[23] or '').strip() or None,
+            'purchase_return': 'Y',
+        })
+
+        barcodes = [b.strip() for b in barcode_raw.split(',') if b.strip()]
+        if len(barcodes) != 1:
+            skipped_multi += 1
+            continue
+        barcode = barcodes[0]
+
+        mdf_date, exp_date = barcode_dates.get((product, barcode), (None, None))
+
+        ledger_rows.append({
             'purchase_date': purchase_date,
             'iravi_voucher': iravi_voucher,
-            'supplier_voucher': str(row[4] or '').strip() or None,
-            'branch': str(row[2] or '').strip() or None,
-            'party': str(row[3] or '').strip() or None,
-            'technical_name': technical_name,
+            'supplier_voucher': ref_bill_no,
+            'branch': branch or None,
+            'party': party or None,
+            'technical_name': product,
             'barcode': barcode,
             'mdf_date': mdf_date,
             'exp_date': exp_date,
@@ -137,8 +163,8 @@ def _parse(src_path: str, barcode_dates: dict) -> list[dict]:
         })
 
     if skipped_multi:
-        logger.info('Skipped %d rows with multiple barcodes', skipped_multi)
-    return rows
+        logger.info('Skipped %d rows for ledger (multiple barcodes)', skipped_multi)
+    return ledger_rows, purchase_rows
 
 
 def _parse_date(val) -> date | None:
@@ -182,4 +208,32 @@ def _upsert(conn, rows: list[dict]):
                 (row['purchase_date'], row['iravi_voucher'], row['supplier_voucher'],
                  row['branch'], row['party'], row['technical_name'], row['barcode'],
                  row['mdf_date'], row['exp_date'], row['in_out'], row['qty']),
+            )
+
+
+def _upsert_purchases(conn, rows: list[dict]):
+    with conn.cursor() as cur:
+        for row in rows:
+            cur.execute(
+                """
+                UPDATE purchases
+                   SET out_z = NOW()
+                 WHERE purchase_date = %s AND voucher_no = %s AND branch = %s
+                   AND party = %s AND product = %s
+                   AND out_z IS NULL
+                """,
+                (row['purchase_date'], row['voucher_no'], row['branch'],
+                 row['party'], row['product']),
+            )
+            cur.execute(
+                """
+                INSERT INTO purchases
+                    (purchase_date, voucher_no, branch, party, ref_bill_no, ref_bill_date,
+                     product, qty, rate, gross, av, barcodes, narration, purchase_return)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (row['purchase_date'], row['voucher_no'], row['branch'], row['party'],
+                 row['ref_bill_no'], row['ref_bill_date'], row['product'], row['qty'],
+                 row['rate'], row['gross'], row['av'], row['barcodes'], row['narration'],
+                 row['purchase_return']),
             )

@@ -217,20 +217,35 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 
 Source file pattern: `AppendixPurchaseReport*.xlsx` (S3 prefix filter: `raw/AppendixPurchase`)
 
-**Header:** row 5. **Data:** row 6+. Skip if `purchase_date` is None or `iravi_voucher` is empty.
+**Header:** row 5. **Data:** row 6+. Skip if `purchase_date` is None, `iravi_voucher` is empty, or `product`/`technical_name` is empty.
 
 **Column mapping (0-indexed):**
-`[0]=Date→purchase_date, [1]=Voucher No→iravi_voucher, [2]=Branch→branch, [5]=Party→party, [6]=Ref BillNo→supplier_voucher, [9]=Product→technical_name, [10]=Qty→qty, [25]=Barcodes→barcode`
+`[0]=Date→purchase_date, [1]=Voucher No→iravi_voucher/voucher_no, [2]=Branch→branch, [5]=Party→party, [6]=Ref BillNo→supplier_voucher/ref_bill_no, [7]=Ref BillDate→ref_bill_date, [9]=Product→technical_name/product, [10]=Qty→qty, [11]=Rate→rate, [12]=Gross→gross, [17]=AV→av, [25]=Barcodes→barcode/barcodes, [26]=Narration→narration`
 
 **Transformations:**
-- `technical_name` — strip all commas from the product string
-- `barcode` — strip trailing comma, split by `,`; rows with multiple barcodes are skipped
+- `product`/`technical_name` — strip all commas from the product string
+- `barcode` — strip trailing comma, split by `,`; rows with multiple barcodes are skipped **for the ledger table only** (the `purchases` table gets every parsed row regardless of barcode count)
 - `in_out` — hardcoded `'In'` (purchase report)
 - `mdf_date` / `exp_date` — looked up from `appendix_b_x11_stock WHERE (technical_name, barcode) AND out_z IS NULL`; NULL if no match
+- `purchase_return` — hardcoded `'N'`
 
-**Milestoning natural key:** `(purchase_date, iravi_voucher, technical_name, barcode)`
+**Writes to two tables per row:**
+1. `appendix_b_x11_stock_ledger` — milestoning natural key `(purchase_date, iravi_voucher, technical_name, barcode)`; only rows with exactly 1 barcode (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
+2. `purchases` — milestoning natural key/PK `(purchase_date, voucher_no, branch, party, product)`; every parsed row (DB migration `007_create_purchases.sql`)
 
-**Target table:** `appendix_b_x11_stock_ledger` (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
+---
+
+## purchases — Purchase Line-Item Table
+
+**Status: complete**
+
+Line-item purchase ledger populated by both `etl_appendix_b_x11_purchase` (`AppendixPurchaseReport*.xlsx`, `purchase_return='N'`) and `etl_appendix_b_x11_purchase_return` (`AppendixPurReturn*.xlsx`, `purchase_return='Y'`).
+
+**Columns:** `purchase_date, voucher_no, branch, party, ref_bill_no, ref_bill_date, product, qty, rate, gross, av, barcodes, narration, purchase_return, in_z, out_z`
+
+**Milestoning natural key / PK:** `(purchase_date, voucher_no, branch, party, product)` — UPDATE closes any open record matching all five, then INSERT adds the new row. `purchase_return` is not part of the key.
+
+**Target table:** `purchases` (DB migration `007_create_purchases.sql`)
 
 ---
 
@@ -310,8 +325,9 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
 - [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
 - [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
-- [x] etl_appendix_b_x11_purchase Lambda — full handler: parse `AppendixPurchaseReport*.xlsx`, skip multi-barcode rows, look up mdf_date/exp_date from `appendix_b_x11_stock`, upsert into `appendix_b_x11_stock_ledger` (in_out=In)
-- [x] etl_appendix_b_x11_purchase_return Lambda — same as purchase but `AppendixPurReturn*.xlsx`, different column layout ([3]=Party, [4]=Ref BillNo, [6]=Product, [7]=Qty, [22]=Barcodes), in_out=Out
+- [x] etl_appendix_b_x11_purchase Lambda — full handler: parse `AppendixPurchaseReport*.xlsx`, skip multi-barcode rows, look up mdf_date/exp_date from `appendix_b_x11_stock`, upsert into `appendix_b_x11_stock_ledger` (in_out=In); also upserts every parsed row into `purchases` (purchase_return=N)
+- [x] etl_appendix_b_x11_purchase_return Lambda — same as purchase but `AppendixPurReturn*.xlsx`, different column layout ([3]=Party, [4]=Ref BillNo, [5]=Ref BillDate, [6]=Product, [7]=Qty, [8]=Rate, [9]=Gross, [14]=AV, [22]=Barcodes, [23]=Narration), in_out=Out; also upserts every parsed row into `purchases` (purchase_return=Y)
+- [x] DB migration `007_create_purchases.sql` — `purchases` table with (purchase_date, voucher_no, branch, party, product) milestoning; populated by both etl_appendix_b_x11_purchase and etl_appendix_b_x11_purchase_return
 - [x] etl_appendix_b_x11_sale Lambda — parse `AppendixSale*.xlsx`, column layout [0]=Date, [1]=VoucherNo, [2]=Branch, [3]=Party, [4]=RefBillNo, [6]=Product, [7]=Qty, [22]=Barcodes; in_out=Out; inserts into appendix_b_x11_stock_ledger
 - [x] etl_appendix_b_x11_sale_return Lambda — same layout, `AppendixRetSales*.xlsx`, in_out=In
 - [x] DB migration `006_create_appendix_b_x11_stock_ledger.sql` — `appendix_b_x11_stock_ledger` table with (purchase_date, iravi_voucher, technical_name, barcode) milestoning
@@ -325,7 +341,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ## What Is Next (build in this order)
 
-- [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006` migrations via bastion SSM port-forward
+- [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007` migrations via bastion SSM port-forward
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
