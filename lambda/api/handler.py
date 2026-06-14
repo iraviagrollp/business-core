@@ -69,6 +69,12 @@ def lambda_handler(event, context):
     if path == '/purchases/summary':
         params = event.get('queryStringParameters') or {}
         return _handle_purchases_summary(params)
+    if path == '/purchases/monthly':
+        params = event.get('queryStringParameters') or {}
+        return _handle_purchases_monthly(params)
+    if path == '/purchases/list':
+        params = event.get('queryStringParameters') or {}
+        return _handle_purchases_list(params)
 
     return _response(404, {'error': 'Not found'})
 
@@ -473,6 +479,93 @@ def _handle_purchases_summary(params: dict):
     r.set(cache_key, json.dumps(payload), ex=_PURCHASES_TTL)
     logger.info('Purchases summary cached: branch=%s %s→%s', branch or 'all', from_date, to_date)
     return _response(200, payload)
+
+
+def _handle_purchases_monthly(params: dict):
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:purchases:monthly:{branch or "all"}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT to_char(purchase_date, 'YYYY-MM') AS month,
+                       COALESCE(SUM(av) FILTER (WHERE purchase_return = 'N'), 0) AS total_purchases
+                FROM purchases
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+                GROUP BY month
+                ORDER BY month
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            rows = [{'month': month, 'total_purchases': float(total)} for month, total in cur.fetchall()]
+    finally:
+        conn.close()
+
+    payload = {'rows': rows}
+    r.set(cache_key, json.dumps(payload), ex=_PURCHASES_TTL)
+    logger.info('Purchases monthly cached: branch=%s %s→%s', branch or 'all', from_date, to_date)
+    return _response(200, payload)
+
+
+def _handle_purchases_list(params: dict):
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:purchases:list:{branch or "all"}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT purchase_date, voucher_no, branch, party, product, qty, rate, av, purchase_return
+                FROM purchases
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+                ORDER BY purchase_date DESC, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'purchase_date': row['purchase_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'branch': row['branch'],
+            'party': row['party'],
+            'product': row['product'],
+            'qty': float(row['qty']) if row['qty'] is not None else None,
+            'rate': float(row['rate']) if row['rate'] is not None else None,
+            'av': float(row['av']) if row['av'] is not None else None,
+            'purchase_return': row['purchase_return'],
+        })
+
+    r.set(cache_key, json.dumps(rows), ex=_PURCHASES_TTL)
+    logger.info('Purchases list cached: branch=%s %s→%s rows=%d', branch or 'all', from_date, to_date, len(rows))
+    return _response(200, rows)
 
 
 def _response(status: int, body) -> dict:
