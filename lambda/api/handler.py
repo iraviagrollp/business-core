@@ -15,6 +15,7 @@ secrets = boto3.client('secretsmanager')
 _REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache miss
 _LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
 _APPENDIX_B_TTL = 900    # 15 min TTL for appendix-b meta and report
+_PURCHASES_TTL = 900     # 15 min TTL for purchases meta and summary
 
 
 def _get_db_conn():
@@ -63,6 +64,11 @@ def lambda_handler(event, context):
     if path == '/appendix-b/report':
         params = event.get('queryStringParameters') or {}
         return _handle_appendix_b_report(params)
+    if path == '/purchases/meta':
+        return _handle_purchases_meta()
+    if path == '/purchases/summary':
+        params = event.get('queryStringParameters') or {}
+        return _handle_purchases_summary(params)
 
     return _response(404, {'error': 'Not found'})
 
@@ -378,6 +384,94 @@ def _handle_appendix_b_report(params: dict):
     r.set(cache_key, json.dumps(payload), ex=_APPENDIX_B_TTL)
     logger.info('Appendix-B report cached: branch=%s tech=%s %s→%s rows=%d',
                 branch, technical_name, from_date, to_date, len(result_rows))
+    return _response(200, payload)
+
+
+def _handle_purchases_meta():
+    r = _get_redis()
+    cached = r.get('iravi:purchases:meta')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT branch FROM purchases
+                WHERE out_z IS NULL ORDER BY branch
+            """)
+            branches = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT MIN(purchase_date), MAX(purchase_date)
+                FROM purchases WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'branches': branches,
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    if min_date:
+        r.set('iravi:purchases:meta', json.dumps(payload), ex=_PURCHASES_TTL)
+    return _response(200, payload)
+
+
+def _handle_purchases_summary(params: dict):
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:purchases:summary:{branch or "all"}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(DISTINCT (purchase_date, voucher_no, branch, party))
+                        FILTER (WHERE purchase_return = 'N') AS total_purchase_invoices,
+                    COUNT(DISTINCT (purchase_date, voucher_no, branch, party))
+                        FILTER (WHERE purchase_return = 'Y') AS total_return_invoices,
+                    COALESCE(SUM(av) FILTER (WHERE purchase_return = 'N' AND strpos(product, '%%') > 0), 0)
+                        AS total_technical_purchase,
+                    COALESCE(SUM(av) FILTER (WHERE purchase_return = 'N' AND strpos(product, '%%') = 0), 0)
+                        AS total_non_technical_purchase,
+                    COALESCE(SUM(av) FILTER (WHERE purchase_return = 'Y' AND strpos(product, '%%') > 0), 0)
+                        AS total_technical_returns,
+                    COALESCE(SUM(av) FILTER (WHERE purchase_return = 'Y' AND strpos(product, '%%') = 0), 0)
+                        AS total_non_technical_returns
+                FROM purchases
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            (total_purchase_invoices, total_return_invoices,
+             total_technical_purchase, total_non_technical_purchase,
+             total_technical_returns, total_non_technical_returns) = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'total_purchase_invoices': int(total_purchase_invoices),
+        'total_return_invoices': int(total_return_invoices),
+        'total_technical_purchase': float(total_technical_purchase),
+        'total_non_technical_purchase': float(total_non_technical_purchase),
+        'total_technical_returns': float(total_technical_returns),
+        'total_non_technical_returns': float(total_non_technical_returns),
+    }
+    r.set(cache_key, json.dumps(payload), ex=_PURCHASES_TTL)
+    logger.info('Purchases summary cached: branch=%s %s→%s', branch or 'all', from_date, to_date)
     return _response(200, payload)
 
 
