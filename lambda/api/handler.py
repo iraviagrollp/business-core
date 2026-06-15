@@ -16,7 +16,7 @@ _REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache mi
 _LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
 _APPENDIX_B_TTL = 900    # 15 min TTL for appendix-b meta and report
 _PURCHASES_TTL = 900     # 15 min TTL for purchases meta and summary
-_SALES_TTL = 900         # 15 min TTL for sales meta/list and customer names
+_SALES_TTL = 900         # 15 min TTL for sales meta/list and customer names/details
 
 
 def _get_db_conn():
@@ -83,6 +83,8 @@ def lambda_handler(event, context):
         return _handle_sales_list(params)
     if path == '/customers/names':
         return _handle_customer_names()
+    if path == '/customers/details':
+        return _handle_customer_details()
 
     return _response(404, {'error': 'Not found'})
 
@@ -679,6 +681,24 @@ def _handle_customer_names():
 
     r.set('iravi:customers:names', json.dumps(names), ex=_SALES_TTL)
     return _response(200, names)
+
+
+def _handle_customer_details():
+    r = _get_redis()
+    cached = r.get('iravi:customers:details')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT customer_name, city FROM customer_details ORDER BY customer_name')
+            details = [{'customer_name': row[0], 'city': row[1]} for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    r.set('iravi:customers:details', json.dumps(details), ex=_SALES_TTL)
+    return _response(200, details)
 
 
 def _response(status: int, body) -> dict:
