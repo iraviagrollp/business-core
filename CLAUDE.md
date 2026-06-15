@@ -156,7 +156,7 @@ Source file pattern: `Current Stock Balances*.xlsx` (S3 prefix filter: `raw/Curr
 - Upserts into `snapshot_stock` (unitemporal milestoning)
 - Emits `ETLStocksSuccess` EventBridge event on success
 
-**Milestoning natural key:** `(brand, technical, packing_size, packing_configuration, branch, special_packing_mention)` — `entry_date` is NOT in the UPDATE predicate (it's temporal data, not a business key).
+**Snapshot replace:** `Current Stock Balances*.xlsx` is a full snapshot, not an incremental feed. Each run closes **every** currently active row (`UPDATE snapshot_stock SET out_z = NOW() WHERE out_z IS NULL`) before inserting the new rows — not just rows matching a natural key in the new file. This ensures products/packings that drop out of stock (absent from the new file) are correctly marked superseded instead of remaining `out_z IS NULL` forever, which would otherwise inflate `iravi:stocks:current` and the summary tiles.
 
 ---
 
@@ -356,6 +356,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_stocks Lambda handler — S3 trigger, rates lookup, processed upload, source archive, DB upsert (`snapshot_stock`), `ETLStocksSuccess` event
 - [x] etl_stocks `available_qty` fix — stored in DB as kg/L (÷1000 on INSERT only)
 - [x] etl_stocks milestoning fix — `entry_date` removed from UPDATE predicate; only business key used
+- [x] etl_stocks snapshot-replace fix — `_upsert_snapshot_stock` now closes ALL active `snapshot_stock` rows (`WHERE out_z IS NULL`) before inserting the new snapshot, so products/packings absent from the new file are correctly superseded instead of staying active forever
 - [x] etl_customer_ledger Lambda — full handler: parse `Ledger All Accounts*.xlsx`, category/sub-category mapping, unitemporal upsert into `customer_ledger`, archive source, emit `ETLCustomerLedgerSuccess`
 - [x] etl_customer_accounts Lambda — full handler: parse `Customer Accounts Export File*.xlsx`, normalise case + state codes, upsert into `customer_details`
 - [x] etl_customer_accounts mobile_no normalization — strip spaces, take last 10 digits if > 10

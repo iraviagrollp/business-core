@@ -106,25 +106,10 @@ def _process(bucket: str, key: str, filename: str):
 
 
 def _upsert_snapshot_stock(conn, rows: list[dict]):
-    """Close the current active record then insert a fresh one for each row."""
+    """Snapshot replace: close every active record, then insert the new snapshot."""
     with conn.cursor() as cur:
+        cur.execute("UPDATE snapshot_stock SET out_z = NOW() WHERE out_z IS NULL")
         for row in rows:
-            biz_key = (
-                row['brand'], row['technical'], row['packing_size'],
-                row['packing_configuration'], row['branch'],
-                row['special_packing_mention'],
-            )
-            cur.execute(
-                """
-                UPDATE snapshot_stock
-                   SET out_z = NOW()
-                 WHERE brand = %s AND technical = %s AND packing_size = %s
-                   AND packing_configuration = %s AND branch = %s
-                   AND special_packing_mention = %s
-                   AND out_z IS NULL
-                """,
-                biz_key,
-            )
             cur.execute(
                 """
                 INSERT INTO snapshot_stock (
