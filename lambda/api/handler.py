@@ -16,6 +16,7 @@ _REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache mi
 _LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
 _APPENDIX_B_TTL = 900    # 15 min TTL for appendix-b meta and report
 _PURCHASES_TTL = 900     # 15 min TTL for purchases meta and summary
+_SALES_TTL = 900         # 15 min TTL for sales meta/list and customer names
 
 
 def _get_db_conn():
@@ -75,6 +76,13 @@ def lambda_handler(event, context):
     if path == '/purchases/list':
         params = event.get('queryStringParameters') or {}
         return _handle_purchases_list(params)
+    if path == '/sales/meta':
+        return _handle_sales_meta()
+    if path == '/sales/list':
+        params = event.get('queryStringParameters') or {}
+        return _handle_sales_list(params)
+    if path == '/customers/names':
+        return _handle_customer_names()
 
     return _response(404, {'error': 'Not found'})
 
@@ -570,6 +578,107 @@ def _handle_purchases_list(params: dict):
     r.set(cache_key, json.dumps(rows), ex=_PURCHASES_TTL)
     logger.info('Purchases list cached: branch=%s %s→%s rows=%d', branch or 'all', from_date, to_date, len(rows))
     return _response(200, rows)
+
+
+def _handle_sales_meta():
+    r = _get_redis()
+    cached = r.get('iravi:sales:meta')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT branch FROM sales
+                WHERE out_z IS NULL ORDER BY branch
+            """)
+            branches = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT MIN(purchase_date), MAX(purchase_date)
+                FROM sales WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'branches': branches,
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    if min_date:
+        r.set('iravi:sales:meta', json.dumps(payload), ex=_SALES_TTL)
+    return _response(200, payload)
+
+
+def _handle_sales_list(params: dict):
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:sales:list:{branch or "all"}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT purchase_date, voucher_no, branch, party, product, qty, rate, av, sales_return
+                FROM sales
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+                ORDER BY purchase_date DESC, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'purchase_date': row['purchase_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'branch': row['branch'],
+            'party': row['party'],
+            'product': row['product'],
+            'qty': float(row['qty']) if row['qty'] is not None else None,
+            'rate': float(row['rate']) if row['rate'] is not None else None,
+            'av': float(row['av']) if row['av'] is not None else None,
+            'sales_return': row['sales_return'],
+        })
+
+    r.set(cache_key, json.dumps(rows), ex=_SALES_TTL)
+    logger.info('Sales list cached: branch=%s %s→%s rows=%d', branch or 'all', from_date, to_date, len(rows))
+    return _response(200, rows)
+
+
+def _handle_customer_names():
+    r = _get_redis()
+    cached = r.get('iravi:customers:names')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT DISTINCT customer_name FROM customer_details ORDER BY customer_name')
+            names = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    r.set('iravi:customers:names', json.dumps(names), ex=_SALES_TTL)
+    return _response(200, names)
 
 
 def _response(status: int, body) -> dict:
