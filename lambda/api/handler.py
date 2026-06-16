@@ -55,6 +55,9 @@ def lambda_handler(event, context):
         return _handle_stocks_current()
     if path == '/ledger/range':
         return _handle_ledger_range()
+    if path == '/ledger/outstanding':
+        params = event.get('queryStringParameters') or {}
+        return _handle_ledger_outstanding(params.get('to_date', ''))
     if path == '/ledger':
         params = event.get('queryStringParameters') or {}
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
@@ -256,6 +259,38 @@ def _handle_ledger_data(from_date: str, to_date: str):
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Ledger data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
+
+
+def _handle_ledger_outstanding(to_date: str):
+    """Cumulative outstanding as of to_date: sum(all Db) - sum(all Cr) from beginning of time."""
+    if not to_date:
+        return _response(400, {'error': 'to_date is required'})
+
+    cache_key = f'iravi:ledger:outstanding:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COALESCE(SUM(CASE WHEN category = 'Db' THEN amount ELSE 0 END), 0) -
+                    COALESCE(SUM(CASE WHEN category = 'Cr' THEN amount ELSE 0 END), 0)
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND transaction_date <= %(to_date)s
+                  AND LOWER(account_name) NOT LIKE '%%iravi%%'
+            """, {'to_date': to_date})
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {'outstanding': float(row[0] or 0)}
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    return _response(200, payload)
 
 
 def _handle_appendix_b_meta():
