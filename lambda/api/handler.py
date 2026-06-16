@@ -64,6 +64,13 @@ def lambda_handler(event, context):
     if path == '/ledger/outstanding':
         params = event.get('queryStringParameters') or {}
         return _handle_ledger_outstanding(params.get('to_date', ''))
+    if path == '/ledger/statement':
+        params = event.get('queryStringParameters') or {}
+        return _handle_ledger_statement(
+            params.get('account_name', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
     if path == '/ledger':
         params = event.get('queryStringParameters') or {}
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
@@ -296,6 +303,87 @@ def _handle_ledger_outstanding(to_date: str):
 
     payload = {'outstanding': float(row[0] or 0)}
     r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    return _response(200, payload)
+
+
+def _handle_ledger_statement(account_name: str, from_date: str, to_date: str):
+    if not account_name or not from_date or not to_date:
+        return _response(400, {'error': 'account_name, from_date, and to_date are required'})
+
+    cache_key = f'iravi:ledger:statement:{account_name}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Opening balance: all transactions strictly before from_date
+            cur.execute("""
+                SELECT COALESCE(
+                    SUM(CASE WHEN category = 'Db' THEN amount ELSE -amount END), 0
+                )
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND account_name = %(account_name)s
+                  AND transaction_date < %(from_date)s
+            """, {'account_name': account_name, 'from_date': from_date})
+            opening_balance = float(cur.fetchone()[0])
+
+            # Period transactions grouped by voucher, determine primary sub_category
+            cur.execute("""
+                SELECT
+                    transaction_date,
+                    voucher_no,
+                    MAX(CASE WHEN sub_category NOT IN ('CGST', 'SGST', 'IGST', 'Roundoff')
+                        THEN sub_category END) AS primary_type,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'Db'), 0) AS debit,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'Cr'), 0) AS credit
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND account_name = %(account_name)s
+                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
+                GROUP BY transaction_date, voucher_no
+                ORDER BY transaction_date ASC, voucher_no ASC
+            """, {'account_name': account_name, 'from_date': from_date, 'to_date': to_date})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    total_debit = 0.0
+    total_credit = 0.0
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        debit = float(row['debit'])
+        credit = float(row['credit'])
+        total_debit += debit
+        total_credit += credit
+        rows.append({
+            'transaction_date': row['transaction_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'transaction_type': row['primary_type'],
+            'debit': round(debit, 2),
+            'credit': round(credit, 2),
+        })
+
+    closing_balance = round(opening_balance + total_debit - total_credit, 2)
+
+    payload = {
+        'account_name': account_name,
+        'from_date': from_date,
+        'to_date': to_date,
+        'opening_balance': round(opening_balance, 2),
+        'rows': rows,
+        'total_debit': round(total_debit, 2),
+        'total_credit': round(total_credit, 2),
+        'closing_balance': closing_balance,
+    }
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Ledger statement cached: account=%s %s→%s rows=%d',
+                account_name, from_date, to_date, len(rows))
     return _response(200, payload)
 
 
