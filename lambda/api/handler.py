@@ -440,11 +440,13 @@ def _handle_purchases_summary(params: dict):
     branch = (params.get('branch') or '').strip()
     from_date = (params.get('from_date') or '').strip()
     to_date = (params.get('to_date') or '').strip()
+    exclude_internal = params.get('exclude_internal', 'false').lower() == 'true'
 
     if not from_date or not to_date:
         return _response(400, {'error': 'from_date and to_date are required'})
 
-    cache_key = f'iravi:purchases:summary:{branch or "all"}:{from_date}:{to_date}'
+    ei_suffix = ':ei' if exclude_internal else ''
+    cache_key = f'iravi:purchases:summary:{branch or "all"}:{from_date}:{to_date}{ei_suffix}'
     r = _get_redis()
     cached = r.get(cache_key)
     if cached:
@@ -471,7 +473,9 @@ def _handle_purchases_summary(params: dict):
                 WHERE out_z IS NULL
                   AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
                   AND (%(branch)s = '' OR branch = %(branch)s)
-            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+                  AND (NOT %(exclude_internal)s OR LOWER(party) NOT LIKE '%%iravi%%')
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch,
+                  'exclude_internal': exclude_internal})
             (total_purchase_invoices, total_return_invoices,
              total_technical_purchase, total_non_technical_purchase,
              total_technical_returns, total_non_technical_returns) = cur.fetchone()
