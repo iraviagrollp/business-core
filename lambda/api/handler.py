@@ -747,29 +747,36 @@ def _handle_customer_details():
 
 
 def _handle_notify(body_str: str) -> dict:
+    import base64
+
     try:
         body = json.loads(body_str or '{}')
     except json.JSONDecodeError:
         return _response(400, {'error': 'Invalid JSON body'})
 
     customer_name = (body.get('customer_name') or '').strip()
-    html_content = (body.get('html_content') or '').strip()
+    pdf_base64 = (body.get('pdf_base64') or '').strip()
 
-    if not customer_name or not html_content:
-        return _response(400, {'error': 'customer_name and html_content are required'})
+    if not customer_name or not pdf_base64:
+        return _response(400, {'error': 'customer_name and pdf_base64 are required'})
+
+    try:
+        pdf_bytes = base64.b64decode(pdf_base64)
+    except Exception:
+        return _response(400, {'error': 'Invalid pdf_base64'})
 
     safe_name = ''.join(
         c if c.isalnum() or c in '-_' else '_'
         for c in customer_name.replace(' ', '_')
     )[:80]
     timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    s3_key = f'notifications/pending/{timestamp}_{safe_name}.html'
+    s3_key = f'notifications/pending/{timestamp}_{safe_name}.pdf'
 
     s3.put_object(
         Bucket=_DATA_BUCKET,
         Key=s3_key,
-        Body=html_content.encode('utf-8'),
-        ContentType='text/html; charset=utf-8',
+        Body=pdf_bytes,
+        ContentType='application/pdf',
         Metadata={'customer_name': customer_name},
     )
     logger.info('Notification queued: %s → s3://%s/%s', customer_name, _DATA_BUCKET, s3_key)
