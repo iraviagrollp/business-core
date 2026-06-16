@@ -11,6 +11,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 secrets = boto3.client('secretsmanager')
+s3 = boto3.client('s3')
+
+_DATA_BUCKET = os.environ.get('DATA_BUCKET', '')
 
 _REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache miss
 _LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
@@ -45,6 +48,9 @@ def lambda_handler(event, context):
     method = event.get('requestContext', {}).get('http', {}).get('method', '')
     path = event.get('rawPath', '')
     logger.info('%s %s', method, path)
+
+    if method == 'POST' and path == '/notify':
+        return _handle_notify(event.get('body') or '')
 
     if method != 'GET':
         return _response(405, {'error': 'Method not allowed'})
@@ -738,6 +744,36 @@ def _handle_customer_details():
 
     r.set('iravi:customers:details', json.dumps(details), ex=_SALES_TTL)
     return _response(200, details)
+
+
+def _handle_notify(body_str: str) -> dict:
+    try:
+        body = json.loads(body_str or '{}')
+    except json.JSONDecodeError:
+        return _response(400, {'error': 'Invalid JSON body'})
+
+    customer_name = (body.get('customer_name') or '').strip()
+    html_content = (body.get('html_content') or '').strip()
+
+    if not customer_name or not html_content:
+        return _response(400, {'error': 'customer_name and html_content are required'})
+
+    safe_name = ''.join(
+        c if c.isalnum() or c in '-_' else '_'
+        for c in customer_name.replace(' ', '_')
+    )[:80]
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    s3_key = f'notifications/pending/{timestamp}_{safe_name}.html'
+
+    s3.put_object(
+        Bucket=_DATA_BUCKET,
+        Key=s3_key,
+        Body=html_content.encode('utf-8'),
+        ContentType='text/html; charset=utf-8',
+        Metadata={'customer_name': customer_name},
+    )
+    logger.info('Notification queued: %s → s3://%s/%s', customer_name, _DATA_BUCKET, s3_key)
+    return _response(200, {'key': s3_key, 'message': 'Notification queued'})
 
 
 def _response(status: int, body) -> dict:

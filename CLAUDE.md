@@ -60,10 +60,12 @@ business-core/
     ├── etl_appendix_b_x11_sale_return/ ← ETL: parse AppendixRetSales xlsx → RDS appendix_b_x11_stock_ledger (in_out=In) + sales (sales_return=Y) [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── whatsapp_notifier/    ← S3 trigger on notifications/pending/ → phase 1 moves to notifications/processed/ → phase 2 sends WhatsApp [PHASE 1 COMPLETE]
+    │   └── handler.py
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
-    └── api/                  ← API: serves dashboard requests via API Gateway
+    └── api/                  ← API: serves dashboard requests via API Gateway + POST /notify
         ├── handler.py
         └── requirements.txt
 ```
@@ -116,7 +118,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | Variable | Set by | Used in |
 |---|---|---|
 | `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, api, whatsapp_notifier |
 | `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `raw/`) |
 | `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
@@ -305,6 +307,38 @@ Source file pattern: `Barcodes Masters*.xlsx` (S3 prefix filter: `raw/Barcodes`)
 
 ---
 
+## whatsapp_notifier — Payment Reminder Notification
+
+**Status: phase 1 complete (file move); phase 2 pending (WhatsApp send)**
+
+Trigger: S3 `ObjectCreated` on `notifications/pending/*.html`.
+
+**Phase 1 (complete):** Copies file to `notifications/processed/`, deletes from `notifications/pending/`. Validates the end-to-end flow from UI → API → S3 → Lambda.
+
+**Phase 2 (pending — WhatsApp account under review):**
+- `s3.head_object` to read `customer_name` from object metadata
+- Query `customer_details` for `mobile_no`, prepend `'91'` for India dial code
+- Fetch bearer token + phone number ID from Secrets Manager (`iravi/dashboard/whatsapp`)
+- Call Meta WhatsApp Cloud API to send HTML as document message
+
+**S3 layout:**
+- `notifications/pending/{YYYYMMDD_HHMMSS}_{safe_customer}.html` — uploaded by API Lambda on `POST /notify`
+- `notifications/processed/{filename}` — archived by this Lambda
+
+**Customer name** is stored in S3 object metadata key `customer_name` (set by API Lambda on `put_object`).
+
+---
+
+## api — POST /notify Endpoint
+
+**Added to existing API Lambda.** Accepts `POST /notify` with JSON body `{customer_name, html_content}`.
+- Sanitises customer name for S3 key (alphanumeric + hyphen + underscore, max 80 chars)
+- Puts HTML to `notifications/pending/{timestamp}_{safe_name}.html` with `ContentType: text/html` and `Metadata: {customer_name}`
+- Returns `{key, message: "Notification queued"}`
+- Requires `DATA_BUCKET` env var + `s3:PutObject` IAM on `notifications/*`
+
+---
+
 ## etl_sales — Sales Processing
 
 **Status: stub — core logic not yet implemented**
@@ -370,6 +404,11 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - [x] etl_appendix_b_x11_sale_return Lambda — same layout, `AppendixRetSales*.xlsx`, in_out=In; also upserts every parsed row into `sales` (sales_return=Y)
 - [x] DB migration `006_create_appendix_b_x11_stock_ledger.sql` — `appendix_b_x11_stock_ledger` table with (purchase_date, iravi_voucher, technical_name, barcode) milestoning
 - [x] DB migration `008_create_sales.sql` — `sales` table with (purchase_date, voucher_no, branch, party, product) milestoning; populated by both etl_appendix_b_x11_sale and etl_appendix_b_x11_sale_return
+- [x] whatsapp_notifier Lambda — phase 1: S3 trigger on `notifications/pending/`, moves file to `notifications/processed/`; phase 2 stub for WhatsApp API call
+- [x] api Lambda — `POST /notify` endpoint: receives `{customer_name, html_content}`, puts HTML to `notifications/pending/` with customer_name metadata, returns `{key, message}`
+- [x] lambda_api.tf — `DATA_BUCKET` env var, `s3:PutObject` IAM on `notifications/*`, CORS `POST`, `POST /notify` API Gateway route
+- [x] lambda_whatsapp_notifier.tf — Lambda + IAM + S3 permission; S3 trigger in lambda_etl_sales.tf on `notifications/pending/*.html`
+- [x] UI CustomerBalances — "Notify Client" split into "Preview" (opens HTML window) + "Notify" (POST to API, per-row sending/sent/error state); both mobile and desktop views updated
 - [x] Terraform + S3 trigger + GitHub Actions layer build for `etl_appendix_b_x11_purchase`
 - [x] etl_sales scaffold (`handler.py`, `requirements.txt`) — parse/upsert logic TODO
 - [x] redis_updater — `ETLStocksSuccess` handler: writes `iravi:stocks:summary` + `iravi:stocks:current`
@@ -381,6 +420,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 ## What Is Next (build in this order)
 
 - [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007`, `008` migrations via bastion SSM port-forward
+- [ ] **whatsapp_notifier phase 2** — once WhatsApp Business approved: add `iravi/dashboard/whatsapp` secret (bearer_token, phone_number_id), add DB + Secrets Manager IAM to Lambda, implement `_send_whatsapp()` in handler
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
