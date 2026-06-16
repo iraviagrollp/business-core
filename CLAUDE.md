@@ -65,7 +65,10 @@ business-core/
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
-    └── api/                  ← API: serves dashboard requests via API Gateway + POST /notify
+    └── api/                  ← API: dashboard reads + POST /notify + RBAC auth/admin
+        ├── handler.py        ← routing, data endpoints, /auth/* + /admin/* handlers
+        ├── auth.py           ← PBKDF2 password hashing + HS256 JWT (stdlib only)
+        └── requirements.txt
         ├── handler.py
         └── requirements.txt
 ```
@@ -123,6 +126,8 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
+| `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
+| `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | Terraform | api (first-login admin bootstrap) |
 
 ---
 
@@ -380,6 +385,29 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /sales` | — | Stub (returns empty array) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
+
+---
+
+## auth — RBAC (login + admin management)
+
+**Status: complete (phase 1).** New module `auth.py` (standard library only — no new layer deps):
+PBKDF2-HMAC-SHA256 password hashing + compact HS256 JWT signed with the key from
+Secrets Manager `iravi/dashboard/jwt` (`JWT_SECRET_ARN`).
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /auth/login` | public | Verify a DB user; **bootstrap** the admin from `BOOTSTRAP_ADMIN_*` on first login if no admin exists; return JWT + `{username, role_name, is_admin, screens}` |
+| `GET /auth/me` | bearer | Re-read the caller's role + screens (so changes apply on refresh) |
+| `GET /admin/screens` | admin | List mappable screens |
+| `GET\|POST /admin/roles`, `PUT\|DELETE /admin/roles/{role_id}` | admin | Role CRUD (PUT replaces screen mappings; Administrator role protected) |
+| `GET\|POST /admin/users`, `PUT\|DELETE /admin/users/{user_id}` | admin | User CRUD (password hashed; last-active-admin protected) |
+
+The admin guard recomputes `is_admin` from the DB (not the token). Tables: `app_users`,
+`app_roles`, `app_role_screens`, `app_screens` (IaC migration 009).
+
+**Enforcement scope (phase 1):** login + `/admin/*` are server-side enforced. The data
+endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:** add an
+`ENDPOINT_SCREENS` authorization check to every data route.
 
 ---
 

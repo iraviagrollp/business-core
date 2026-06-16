@@ -7,6 +7,8 @@ import boto3
 import psycopg2
 import redis
 
+import auth
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -48,6 +50,13 @@ def lambda_handler(event, context):
     method = event.get('requestContext', {}).get('http', {}).get('method', '')
     path = event.get('rawPath', '')
     logger.info('%s %s', method, path)
+
+    # Auth + RBAC admin namespace (login is public; everything else is guarded).
+    if path.startswith('/auth/') or path.startswith('/admin/'):
+        try:
+            return _route_auth_admin(event, method, path)
+        except auth.AuthError as exc:
+            return _response(exc.status, {'error': exc.message})
 
     if method == 'POST' and path == '/notify':
         return _handle_notify(event.get('body') or '')
@@ -869,6 +878,473 @@ def _handle_notify(body_str: str) -> dict:
     )
     logger.info('Notification queued: %s → s3://%s/%s', customer_name, _DATA_BUCKET, s3_key)
     return _response(200, {'key': s3_key, 'message': 'Notification queued'})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RBAC — authentication + admin role/user management
+#
+# Phase 1: login + the /admin/* management endpoints are enforced server-side.
+# The read-only data endpoints above are NOT yet authorized per-role (UI-only
+# gating) — see the "full server-side enforcement" backlog item.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _route_auth_admin(event, method, path):
+    if path == '/auth/login' and method == 'POST':
+        return _handle_login(event.get('body') or '')
+    if path == '/auth/me' and method == 'GET':
+        return _handle_me(event)
+    if path == '/admin/screens' and method == 'GET':
+        return _handle_admin_list_screens(event)
+    if path == '/admin/roles':
+        if method == 'GET':
+            return _handle_admin_list_roles(event)
+        if method == 'POST':
+            return _handle_admin_create_role(event)
+    if path.startswith('/admin/roles/'):
+        role_id = (event.get('pathParameters') or {}).get('role_id')
+        if method == 'PUT':
+            return _handle_admin_update_role(event, role_id)
+        if method == 'DELETE':
+            return _handle_admin_delete_role(event, role_id)
+    if path == '/admin/users':
+        if method == 'GET':
+            return _handle_admin_list_users(event)
+        if method == 'POST':
+            return _handle_admin_create_user(event)
+    if path.startswith('/admin/users/'):
+        user_id = (event.get('pathParameters') or {}).get('user_id')
+        if method == 'PUT':
+            return _handle_admin_update_user(event, user_id)
+        if method == 'DELETE':
+            return _handle_admin_delete_user(event, user_id)
+    return _response(404, {'error': 'Not found'})
+
+
+# ── shared helpers ────────────────────────────────────────────────────────────
+
+def _json_body(event) -> dict:
+    try:
+        return json.loads(event.get('body') or '{}')
+    except json.JSONDecodeError:
+        raise auth.AuthError('Invalid JSON body', 400)
+
+
+def _parse_int_id(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise auth.AuthError('Invalid id', 400)
+
+
+def _require_admin(event, cur) -> dict:
+    """Validate the bearer token AND confirm the user is an active admin (DB-authoritative)."""
+    claims = auth.authenticate(event)
+    username = (claims.get('sub') or '').lower()
+    cur.execute("""
+        SELECT u.user_id, u.is_active, r.is_admin
+        FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+        WHERE u.username = %s
+    """, (username,))
+    row = cur.fetchone()
+    if not row or not row[1]:
+        raise auth.AuthError('User not found or inactive', 401)
+    if not row[2]:
+        raise auth.AuthError('Administrator access required', 403)
+    return {'user_id': row[0], 'username': username}
+
+
+def _fetch_user_row(cur, username: str):
+    cur.execute("""
+        SELECT u.user_id, u.username, u.password_hash, u.is_active,
+               u.role_id, r.role_name, r.is_admin
+        FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+        WHERE u.username = %s
+    """, (username,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    keys = ['user_id', 'username', 'password_hash', 'is_active', 'role_id', 'role_name', 'is_admin']
+    return dict(zip(keys, row))
+
+
+def _fetch_screens(cur, role_id: int, is_admin: bool) -> list:
+    if is_admin:
+        cur.execute('SELECT screen_key FROM app_screens ORDER BY sort_order')
+    else:
+        cur.execute("""
+            SELECT s.screen_key
+            FROM app_role_screens rs JOIN app_screens s ON s.screen_key = rs.screen_key
+            WHERE rs.role_id = %s
+            ORDER BY s.sort_order
+        """, (role_id,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def _set_role_screens(cur, role_id: int, screen_keys: list):
+    cur.execute('DELETE FROM app_role_screens WHERE role_id = %s', (role_id,))
+    if not screen_keys:
+        return
+    cur.execute('SELECT screen_key FROM app_screens')
+    valid = {r[0] for r in cur.fetchall()}
+    rows = [(role_id, k) for k in dict.fromkeys(screen_keys) if k in valid]
+    if rows:
+        cur.executemany(
+            'INSERT INTO app_role_screens (role_id, screen_key) VALUES (%s, %s)', rows
+        )
+
+
+# ── auth ──────────────────────────────────────────────────────────────────────
+
+def _maybe_bootstrap_admin(cur, username: str, password: str):
+    """First-run only: create the admin user from BOOTSTRAP_ADMIN_* if no admin exists yet."""
+    boot_user = (os.environ.get('BOOTSTRAP_ADMIN_USERNAME') or '').strip().lower()
+    boot_pass = os.environ.get('BOOTSTRAP_ADMIN_PASSWORD') or ''
+    if not boot_user or username != boot_user or password != boot_pass:
+        return None
+
+    cur.execute("""
+        SELECT 1 FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+        WHERE r.is_admin LIMIT 1
+    """)
+    if cur.fetchone():
+        return None  # an admin already exists — do not bootstrap
+
+    cur.execute('SELECT role_id FROM app_roles WHERE is_admin ORDER BY role_id LIMIT 1')
+    role_row = cur.fetchone()
+    if not role_row:
+        cur.execute("INSERT INTO app_roles (role_name, is_admin) VALUES ('Administrator', TRUE) RETURNING role_id")
+        role_row = cur.fetchone()
+    role_id = role_row[0]
+
+    pw_hash = auth.hash_password(password)
+    cur.execute(
+        'INSERT INTO app_users (username, password_hash, role_id, is_active) VALUES (%s, %s, %s, TRUE) RETURNING user_id',
+        (username, pw_hash, role_id),
+    )
+    logger.info('Bootstrap admin user created: %s', username)
+    return {
+        'user_id': cur.fetchone()[0], 'username': username, 'password_hash': pw_hash,
+        'is_active': True, 'role_id': role_id, 'role_name': 'Administrator', 'is_admin': True,
+    }
+
+
+def _handle_login(body_str: str):
+    try:
+        body = json.loads(body_str or '{}')
+    except json.JSONDecodeError:
+        return _response(400, {'error': 'Invalid JSON body'})
+
+    username = (body.get('username') or '').strip().lower()
+    password = body.get('password') or ''
+    if not username or not password:
+        return _response(400, {'error': 'username and password are required'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            user = _fetch_user_row(cur, username)
+            if user is None:
+                user = _maybe_bootstrap_admin(cur, username, password)
+                if user is None:
+                    return _response(401, {'error': 'Invalid username or password'})
+                conn.commit()
+            if not user['is_active']:
+                return _response(401, {'error': 'Account is disabled'})
+            if not auth.verify_password(password, user['password_hash']):
+                return _response(401, {'error': 'Invalid username or password'})
+            screens = _fetch_screens(cur, user['role_id'], user['is_admin'])
+    finally:
+        conn.close()
+
+    token = auth.sign_jwt({'sub': user['username'], 'is_admin': user['is_admin']})
+    return _response(200, {
+        'token': token,
+        'user': {
+            'username': user['username'],
+            'role_name': user['role_name'],
+            'is_admin': user['is_admin'],
+            'screens': screens,
+        },
+    })
+
+
+def _handle_me(event):
+    claims = auth.authenticate(event)
+    username = (claims.get('sub') or '').lower()
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            user = _fetch_user_row(cur, username)
+            if user is None or not user['is_active']:
+                raise auth.AuthError('User not found or inactive', 401)
+            screens = _fetch_screens(cur, user['role_id'], user['is_admin'])
+    finally:
+        conn.close()
+    return _response(200, {
+        'username': user['username'],
+        'role_name': user['role_name'],
+        'is_admin': user['is_admin'],
+        'screens': screens,
+    })
+
+
+# ── admin: screens ────────────────────────────────────────────────────────────
+
+def _handle_admin_list_screens(event):
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT screen_key, label, sort_order FROM app_screens ORDER BY sort_order')
+            screens = [{'screen_key': r[0], 'label': r[1], 'sort_order': r[2]} for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return _response(200, screens)
+
+
+# ── admin: roles ──────────────────────────────────────────────────────────────
+
+def _handle_admin_list_roles(event):
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                SELECT r.role_id, r.role_name, r.is_admin,
+                       COALESCE(array_agg(rs.screen_key) FILTER (WHERE rs.screen_key IS NOT NULL), '{}'),
+                       (SELECT COUNT(*) FROM app_users u WHERE u.role_id = r.role_id)
+                FROM app_roles r
+                LEFT JOIN app_role_screens rs ON rs.role_id = r.role_id
+                GROUP BY r.role_id
+                ORDER BY r.is_admin DESC, r.role_name
+            """)
+            roles = [{
+                'role_id': r[0], 'role_name': r[1], 'is_admin': r[2],
+                'screens': list(r[3]), 'user_count': int(r[4]),
+            } for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return _response(200, roles)
+
+
+def _handle_admin_create_role(event):
+    body = _json_body(event)
+    name = (body.get('role_name') or '').strip()
+    screens = body.get('screens') or []
+    if not name:
+        return _response(400, {'error': 'role_name is required'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT 1 FROM app_roles WHERE LOWER(role_name) = LOWER(%s)', (name,))
+            if cur.fetchone():
+                return _response(409, {'error': 'A role with that name already exists'})
+            cur.execute('INSERT INTO app_roles (role_name, is_admin) VALUES (%s, FALSE) RETURNING role_id', (name,))
+            role_id = cur.fetchone()[0]
+            _set_role_screens(cur, role_id, screens)
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(201, {'role_id': role_id})
+
+
+def _handle_admin_update_role(event, role_id_raw):
+    role_id = _parse_int_id(role_id_raw)
+    body = _json_body(event)
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT is_admin FROM app_roles WHERE role_id = %s', (role_id,))
+            row = cur.fetchone()
+            if not row:
+                return _response(404, {'error': 'Role not found'})
+            if row[0]:
+                return _response(409, {'error': 'The Administrator role cannot be modified'})
+
+            if 'role_name' in body:
+                name = (body.get('role_name') or '').strip()
+                if not name:
+                    return _response(400, {'error': 'role_name cannot be empty'})
+                cur.execute('SELECT 1 FROM app_roles WHERE LOWER(role_name) = LOWER(%s) AND role_id <> %s', (name, role_id))
+                if cur.fetchone():
+                    return _response(409, {'error': 'A role with that name already exists'})
+                cur.execute('UPDATE app_roles SET role_name = %s, updated_at = NOW() WHERE role_id = %s', (name, role_id))
+            if 'screens' in body:
+                _set_role_screens(cur, role_id, body.get('screens') or [])
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'role_id': role_id})
+
+
+def _handle_admin_delete_role(event, role_id_raw):
+    role_id = _parse_int_id(role_id_raw)
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT is_admin FROM app_roles WHERE role_id = %s', (role_id,))
+            row = cur.fetchone()
+            if not row:
+                return _response(404, {'error': 'Role not found'})
+            if row[0]:
+                return _response(409, {'error': 'The Administrator role cannot be deleted'})
+            cur.execute('SELECT COUNT(*) FROM app_users WHERE role_id = %s', (role_id,))
+            if cur.fetchone()[0] > 0:
+                return _response(409, {'error': 'Cannot delete a role that still has users assigned'})
+            cur.execute('DELETE FROM app_roles WHERE role_id = %s', (role_id,))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'deleted': role_id})
+
+
+# ── admin: users ──────────────────────────────────────────────────────────────
+
+def _handle_admin_list_users(event):
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                SELECT u.user_id, u.username, u.role_id, r.role_name, r.is_admin,
+                       u.is_active, u.created_at
+                FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+                ORDER BY u.username
+            """)
+            users = [{
+                'user_id': r[0], 'username': r[1], 'role_id': r[2], 'role_name': r[3],
+                'is_admin': r[4], 'is_active': r[5],
+                'created_at': r[6].isoformat() if r[6] else None,
+            } for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return _response(200, users)
+
+
+def _handle_admin_create_user(event):
+    body = _json_body(event)
+    username = (body.get('username') or '').strip().lower()
+    password = body.get('password') or ''
+    role_id = body.get('role_id')
+    if not username or not password or role_id is None:
+        return _response(400, {'error': 'username, password and role_id are required'})
+    if len(password) < 6:
+        return _response(400, {'error': 'Password must be at least 6 characters'})
+    role_id = _parse_int_id(role_id)
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT 1 FROM app_roles WHERE role_id = %s', (role_id,))
+            if not cur.fetchone():
+                return _response(400, {'error': 'role_id does not exist'})
+            cur.execute('SELECT 1 FROM app_users WHERE username = %s', (username,))
+            if cur.fetchone():
+                return _response(409, {'error': 'A user with that username already exists'})
+            cur.execute(
+                'INSERT INTO app_users (username, password_hash, role_id, is_active) VALUES (%s, %s, %s, TRUE) RETURNING user_id',
+                (username, auth.hash_password(password), role_id),
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(201, {'user_id': user_id})
+
+
+def _handle_admin_update_user(event, user_id_raw):
+    user_id = _parse_int_id(user_id_raw)
+    body = _json_body(event)
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                SELECT u.is_active, r.is_admin
+                FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+                WHERE u.user_id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return _response(404, {'error': 'User not found'})
+            was_active, was_admin = row
+
+            sets, vals = [], []
+            resulting_admin = was_admin
+            if body.get('role_id') is not None:
+                new_role = _parse_int_id(body['role_id'])
+                cur.execute('SELECT is_admin FROM app_roles WHERE role_id = %s', (new_role,))
+                rr = cur.fetchone()
+                if not rr:
+                    return _response(400, {'error': 'role_id does not exist'})
+                sets.append('role_id = %s'); vals.append(new_role)
+                resulting_admin = rr[0]
+
+            new_active = was_active
+            if 'is_active' in body:
+                new_active = bool(body['is_active'])
+                sets.append('is_active = %s'); vals.append(new_active)
+
+            if body.get('password'):
+                if len(body['password']) < 6:
+                    return _response(400, {'error': 'Password must be at least 6 characters'})
+                sets.append('password_hash = %s'); vals.append(auth.hash_password(body['password']))
+
+            # Never strand the system without an active admin.
+            if was_active and was_admin and (not resulting_admin or not new_active):
+                cur.execute("""
+                    SELECT COUNT(*) FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+                    WHERE r.is_admin AND u.is_active AND u.user_id <> %s
+                """, (user_id,))
+                if cur.fetchone()[0] == 0:
+                    return _response(409, {'error': 'Cannot remove the last active administrator'})
+
+            if not sets:
+                return _response(400, {'error': 'No updatable fields provided'})
+            sets.append('updated_at = NOW()')
+            vals.append(user_id)
+            cur.execute(f"UPDATE app_users SET {', '.join(sets)} WHERE user_id = %s", vals)
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'user_id': user_id})
+
+
+def _handle_admin_delete_user(event, user_id_raw):
+    user_id = _parse_int_id(user_id_raw)
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            admin = _require_admin(event, cur)
+            if admin['user_id'] == user_id:
+                return _response(409, {'error': 'You cannot delete your own account'})
+            cur.execute("""
+                SELECT u.is_active, r.is_admin
+                FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+                WHERE u.user_id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return _response(404, {'error': 'User not found'})
+            if row[0] and row[1]:
+                cur.execute("""
+                    SELECT COUNT(*) FROM app_users u JOIN app_roles r ON r.role_id = u.role_id
+                    WHERE r.is_admin AND u.is_active AND u.user_id <> %s
+                """, (user_id,))
+                if cur.fetchone()[0] == 0:
+                    return _response(409, {'error': 'Cannot delete the last active administrator'})
+            cur.execute('DELETE FROM app_users WHERE user_id = %s', (user_id,))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'deleted': user_id})
 
 
 def _response(status: int, body) -> dict:
