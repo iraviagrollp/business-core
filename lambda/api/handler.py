@@ -917,6 +917,8 @@ def _route_auth_admin(event, method, path):
             return _handle_admin_update_user(event, user_id)
         if method == 'DELETE':
             return _handle_admin_delete_user(event, user_id)
+    if path == '/admin/cache/flush' and method == 'POST':
+        return _handle_admin_flush_cache(event)
     return _response(404, {'error': 'Not found'})
 
 
@@ -1201,6 +1203,34 @@ def _handle_admin_delete_role(event, role_id_raw):
     finally:
         conn.close()
     return _response(200, {'deleted': role_id})
+
+
+# ── admin: cache ──────────────────────────────────────────────────────────────
+
+def _handle_admin_flush_cache(event):
+    """Admin-only: drop every cached dashboard key (iravi:*) so the next request
+    rehydrates it from RDS. Scoped to the app namespace rather than FLUSHDB so a
+    shared Redis instance is left untouched."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            admin = _require_admin(event, cur)
+    finally:
+        conn.close()
+
+    r = _get_redis()
+    deleted = 0
+    batch = []
+    for key in r.scan_iter(match='iravi:*', count=500):
+        batch.append(key)
+        if len(batch) >= 500:
+            deleted += r.delete(*batch)
+            batch = []
+    if batch:
+        deleted += r.delete(*batch)
+
+    logger.info('Cache flush by %s — %d keys deleted', admin['username'], deleted)
+    return _response(200, {'deleted': deleted})
 
 
 # ── admin: users ──────────────────────────────────────────────────────────────

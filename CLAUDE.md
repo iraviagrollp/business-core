@@ -401,6 +401,7 @@ Secrets Manager `iravi/dashboard/jwt` (`JWT_SECRET_ARN`).
 | `GET /admin/screens` | admin | List mappable screens |
 | `GET\|POST /admin/roles`, `PUT\|DELETE /admin/roles/{role_id}` | admin | Role CRUD (PUT replaces screen mappings; Administrator role protected) |
 | `GET\|POST /admin/users`, `PUT\|DELETE /admin/users/{user_id}` | admin | User CRUD (password hashed; last-active-admin protected) |
+| `POST /admin/cache/flush` | admin | Clear the dashboard Redis cache — `SCAN`s and deletes all `iravi:*` keys in batches of 500, returns `{deleted}`. Namespace-scoped (not `FLUSHDB`) so a shared Redis is left untouched; keys rehydrate from RDS via the existing cache-aside path on next request. UI: admin-only button left of the dark-mode toggle in the navbar. |
 
 The admin guard recomputes `is_admin` from the DB (not the token). Tables: `app_users`,
 `app_roles`, `app_role_screens`, `app_screens` (IaC migration 009).
