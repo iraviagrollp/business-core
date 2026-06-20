@@ -112,5 +112,39 @@ Terraform configs live in `D:\Projects\Iravi\IaC\terraform\environments\producti
 | `iravi:ledger:range` | redis_updater on `ETLCustomerLedgerSuccess` | 24h | `{min_date, max_date}` of active `customer_ledger` rows |
 | `iravi:ledger:data:{from}:{to}` | api (cache-aside) | 1h | `LedgerRow[]` |
 | `iravi:sales:*`, `iravi:purchases:summary:*` | api (cache-aside) | 15 min | meta / list / summary results |
+| `iravi:reports:customer_balances_fy:{fy_count}` | api (cache-aside) | 1h | `{fys, rows, totals}` — customer balances FY report |
 
 > Keys written on a cache miss by the `api` Lambda are populated on demand; keys written by `redis_updater` are refreshed nightly after the ETL success events.
+
+---
+
+## API Endpoints
+
+| Method | Path | Query params | Description |
+|---|---|---|---|
+| `GET` | `/stocks/summary` | — | Aggregate stock summary tiles |
+| `GET` | `/stocks/current` | — | All active stock rows |
+| `GET` | `/ledger/range` | — | Min/max transaction date in ledger |
+| `GET` | `/ledger/outstanding` | `to_date` | Cumulative outstanding balance as of date |
+| `GET` | `/ledger/statement` | `account_name, from_date, to_date` | Per-voucher ledger statement |
+| `GET` | `/ledger` | `from_date, to_date` | Raw ledger rows for a date window |
+| `GET` | `/appendix-b/meta` | — | Customers, branches, technical names, date range |
+| `GET` | `/appendix-b/report` | `branch, technical_name, from_date, to_date` | Appendix-B roll-forward report |
+| `GET` | `/purchases/meta` | — | Branches + date range for purchases |
+| `GET` | `/purchases/summary` | `from_date, to_date[, branch, exclude_internal]` | Purchases/returns invoice counts + AV totals |
+| `GET` | `/purchases/monthly` | `from_date, to_date[, branch]` | Month-by-month purchases vs returns |
+| `GET` | `/purchases/list` | `from_date, to_date[, branch]` | Line-item purchases list |
+| `GET` | `/sales/meta` | — | Branches + date range for sales |
+| `GET` | `/sales/list` | `from_date, to_date[, branch]` | Line-item sales list |
+| `GET` | `/customers/names` | — | Sorted list of customer names |
+| `GET` | `/customers/details` | — | `[{customer_name, city}]` |
+| `GET` | `/reports/customer-balances-fy` | `fy_count=all\|2\|3\|4` | Per-customer multi-FY roll-forward from `customer_ledger` |
+| `POST` | `/notify` | — | Queue a PDF notification to `notifications/pending/` |
+| `POST` | `/auth/login` | — | Authenticate; return JWT + user info |
+| `GET` | `/auth/me` | — | Re-read caller's role + screens |
+| `GET` | `/admin/screens` | — | List RBAC screen keys (admin only) |
+| `GET\|POST` | `/admin/roles` | — | List / create roles (admin only) |
+| `PUT\|DELETE` | `/admin/roles/{role_id}` | — | Update / delete role (admin only) |
+| `GET\|POST` | `/admin/users` | — | List / create users (admin only) |
+| `PUT\|DELETE` | `/admin/users/{user_id}` | — | Update / delete user (admin only) |
+| `POST` | `/admin/cache/flush` | — | Clear all `iravi:*` Redis keys (admin only) |

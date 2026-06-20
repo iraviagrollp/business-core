@@ -110,6 +110,9 @@ def lambda_handler(event, context):
         return _handle_customer_names()
     if path == '/customers/details':
         return _handle_customer_details()
+    if path == '/reports/customer-balances-fy':
+        params = event.get('queryStringParameters') or {}
+        return _handle_customer_balances_fy(params.get('fy_count', 'all'))
 
     return _response(404, {'error': 'Not found'})
 
@@ -841,6 +844,206 @@ def _handle_customer_details():
 
     r.set('iravi:customers:details', json.dumps(details), ex=_SALES_TTL)
     return _response(200, details)
+
+
+def _handle_customer_balances_fy(fy_count_raw: str):
+    """Per-customer, multi-FY roll-forward of debits/credits with running balances.
+
+    fy_count=all  → all FYs in the data, opening balance = 0 for every party.
+    fy_count=2|3|4 → most recent N FYs; first shown FY gets a brought-forward opening.
+    """
+    # Parse fy_count param
+    fy_count: int | str = 'all'
+    if fy_count_raw and fy_count_raw != 'all':
+        try:
+            n = int(fy_count_raw)
+            if n >= 1:
+                fy_count = n
+            # If < 1 we fall back to 'all'
+        except (ValueError, TypeError):
+            pass  # invalid string → default to 'all'
+
+    cache_key = f'iravi:reports:customer_balances_fy:{fy_count}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── Determine the FY range present in the data ─────────────────────
+            cur.execute("""
+                SELECT MIN(transaction_date), MAX(transaction_date)
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND LOWER(account_name) NOT LIKE '%%iravi%%'
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    if min_date is None:
+        payload = {'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balance_dr': 0.0, 'balance_cr': 0.0}}
+        r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+        return _response(200, payload)
+
+    def _fy_start_year(d) -> int:
+        """Return the April-1 year that starts the FY containing date d."""
+        return d.year if d.month >= 4 else d.year - 1
+
+    def _fy_label(start_year: int) -> str:
+        yy1 = start_year % 100
+        yy2 = (start_year + 1) % 100
+        return f'FY {yy1:02d}-{yy2:02d}'
+
+    # All FY start years present in the data
+    all_fy_start = _fy_start_year(min_date)
+    all_fy_end   = _fy_start_year(max_date)
+    all_fy_years = list(range(all_fy_start, all_fy_end + 1))  # e.g. [2024, 2025, 2026]
+
+    # Determine which FYs to show and whether there is a cutoff date for opening
+    from datetime import date as _date
+
+    if fy_count == 'all' or len(all_fy_years) <= (fy_count if isinstance(fy_count, int) else 0):
+        shown_fy_years = all_fy_years
+        cutoff_date = None          # no opening balance needed
+    else:
+        shown_fy_years = all_fy_years[-fy_count:]
+        # Opening balance = sum of all transactions strictly before the first shown FY's April 1
+        cutoff_date = _date(shown_fy_years[0], 4, 1)
+
+    shown_fy_labels = [_fy_label(y) for y in shown_fy_years]
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # ── City lookup from customer_details ──────────────────────────────
+            cur.execute("""
+                SELECT UPPER(customer_name), city
+                FROM customer_details
+            """)
+            city_map = {row[0]: row[1] for row in cur.fetchall()}
+
+            # ── Opening balances (only when cutoff_date is set) ────────────────
+            opening_by_party: dict = {}
+            if cutoff_date is not None:
+                cur.execute("""
+                    SELECT account_name,
+                           COALESCE(SUM(CASE WHEN category = 'Db' THEN amount ELSE -amount END), 0)
+                    FROM customer_ledger
+                    WHERE out_z IS NULL
+                      AND LOWER(account_name) NOT LIKE '%%iravi%%'
+                      AND transaction_date < %(cutoff)s
+                    GROUP BY account_name
+                """, {'cutoff': cutoff_date})
+                for acct, bal in cur.fetchall():
+                    opening_by_party[acct] = float(bal)
+
+            # ── Per-party, per-FY aggregates ───────────────────────────────────
+            # Build the shown FY window: first shown FY start → last shown FY end
+            window_start = _date(shown_fy_years[0], 4, 1)
+            window_end   = _date(shown_fy_years[-1] + 1, 3, 31)
+
+            cur.execute("""
+                SELECT account_name,
+                       transaction_date,
+                       category,
+                       amount
+                FROM customer_ledger
+                WHERE out_z IS NULL
+                  AND LOWER(account_name) NOT LIKE '%%iravi%%'
+                  AND transaction_date BETWEEN %(ws)s AND %(we)s
+            """, {'ws': window_start, 'we': window_end})
+            ledger_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    # ── Aggregate into party → fy_label → {debit, credit} ─────────────────────
+    from collections import defaultdict
+
+    # party → {fy_label: {'debit': float, 'credit': float}}
+    agg: dict = defaultdict(lambda: defaultdict(lambda: {'debit': 0.0, 'credit': 0.0}))
+    all_parties: set = set()
+
+    for account_name, transaction_date, category, amount in ledger_rows:
+        fy_year = _fy_start_year(transaction_date)
+        label = _fy_label(fy_year)
+        if label not in shown_fy_labels:
+            continue  # outside shown window (shouldn't happen given the date filter, but be safe)
+        amt = float(amount)
+        if category == 'Db':
+            agg[account_name][label]['debit'] += amt
+        else:
+            agg[account_name][label]['credit'] += amt
+        all_parties.add(account_name)
+
+    # Also include parties that appear only in the opening period (cutoff_date case)
+    for party in opening_by_party:
+        all_parties.add(party)
+
+    # ── Build result rows ──────────────────────────────────────────────────────
+    result_rows = []
+    totals_per_fy = {label: {'debit': 0.0, 'credit': 0.0, 'balance': 0.0} for label in shown_fy_labels}
+    total_balance_dr = 0.0
+    total_balance_cr = 0.0
+
+    for party in sorted(all_parties):
+        opening = round(opening_by_party.get(party, 0.0), 2)
+        running = opening
+        per_fy = []
+
+        for label in shown_fy_labels:
+            d = agg[party][label]
+            debit  = round(d['debit'],  2)
+            credit = round(d['credit'], 2)
+            running = round(running + debit - credit, 2)
+            per_fy.append({'fy': label, 'debit': debit, 'credit': credit, 'balance': running})
+
+            totals_per_fy[label]['debit']   = round(totals_per_fy[label]['debit']   + debit,  2)
+            totals_per_fy[label]['credit']  = round(totals_per_fy[label]['credit']  + credit, 2)
+
+        # Skip parties that have zero activity across all shown FYs AND zero opening
+        if opening == 0.0 and all(r['debit'] == 0.0 and r['credit'] == 0.0 for r in per_fy):
+            continue
+
+        balance_dr = round(running, 2) if running > 0 else 0.0
+        balance_cr = round(running, 2) if running < 0 else 0.0
+
+        city = city_map.get(party.upper())
+
+        result_rows.append({
+            'party':      party,
+            'city':       city,
+            'opening':    opening,
+            'per_fy':     per_fy,
+            'balance_dr': balance_dr,
+            'balance_cr': balance_cr,
+        })
+
+        total_balance_dr = round(total_balance_dr + balance_dr, 2)
+        total_balance_cr = round(total_balance_cr + balance_cr, 2)
+
+    # Compute running totals balance per FY
+    for label in shown_fy_labels:
+        t = totals_per_fy[label]
+        t['balance'] = round(t['debit'] - t['credit'], 2)  # simple net per FY for totals row
+        t['fy'] = label
+
+    payload = {
+        'fys':  shown_fy_labels,
+        'rows': result_rows,
+        'totals': {
+            'per_fy':     [totals_per_fy[label] for label in shown_fy_labels],
+            'balance_dr': total_balance_dr,
+            'balance_cr': total_balance_cr,
+        },
+    }
+
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Customer balances FY cached: fy_count=%s fys=%d parties=%d',
+                fy_count, len(shown_fy_labels), len(result_rows))
+    return _response(200, payload)
 
 
 def _handle_notify(body_str: str) -> dict:

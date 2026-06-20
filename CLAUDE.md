@@ -376,15 +376,60 @@ Triggered by EventBridge. Routes on `detail-type`:
 
 ## api — API Layer
 
-**Status: stocks complete; sales stub**
+**Status: stocks complete; reports/customer-balances-fy complete; sales stub**
 
 | Endpoint | Redis key | Status |
 |---|---|---|
 | `GET /stocks/summary` | `iravi:stocks:summary` | Complete |
 | `GET /stocks/current` | `iravi:stocks:current` | Complete |
 | `GET /sales` | — | Stub (returns empty array) |
+| `GET /reports/customer-balances-fy` | `iravi:reports:customer_balances_fy:{fy_count}` | Complete |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
+
+---
+
+## api — GET /reports/customer-balances-fy
+
+**Route:** `GET /reports/customer-balances-fy?fy_count=all|2|3|4`
+
+**Query param:**
+- `fy_count=all` (default) — every FY present in `customer_ledger`; opening balance = 0 for every party.
+- `fy_count=2|3|4` — most recent N financial years; the first shown FY gets an opening balance brought forward from all transactions strictly before that FY's April 1 start.
+- Any missing or invalid value defaults to `all`.
+
+**Source tables:** `customer_ledger` (joined to `customer_details` for city via `UPPER(customer_name) = UPPER(account_name)` match).
+
+**FY definition:** April 1 → March 31. Label format: `FY YY-YY` (e.g. `FY 25-26`).
+
+**Ledger fields used:** `transaction_date`, `account_name`, `category` (`Db`/`Cr`), `amount`. Filter: `out_z IS NULL AND LOWER(account_name) NOT LIKE '%%iravi%%'`.
+
+**Response shape:**
+```jsonc
+{
+  "fys": ["FY 24-25", "FY 25-26"],           // shown FYs, oldest → newest
+  "rows": [
+    {
+      "party": "NEW BHARAT TRADERS",
+      "city": "ANAKAPALLE",                   // null if no match in customer_details
+      "opening": 0.0,                         // brought-forward balance; 0 when fy_count=all
+      "per_fy": [
+        { "fy": "FY 24-25", "debit": 0.0, "credit": 0.0, "balance": 0.0 },
+        { "fy": "FY 25-26", "debit": 140047.0, "credit": 100000.0, "balance": 40047.0 }
+      ],
+      "balance_dr": 40047.0,   // final running balance if > 0, else 0
+      "balance_cr": 0.0        // final running balance (negative) if < 0, else 0
+    }
+  ],
+  "totals": {
+    "per_fy": [ { "fy": "FY 25-26", "debit": ..., "credit": ..., "balance": ... } ],
+    "balance_dr": ...,
+    "balance_cr": ...
+  }
+}
+```
+
+**Redis key:** `iravi:reports:customer_balances_fy:{fy_count}` (e.g. `iravi:reports:customer_balances_fy:all`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush`.
 
 ---
 
@@ -435,6 +480,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] DB migration `008_create_sales.sql` — `sales` table with (purchase_date, voucher_no, branch, party, product) milestoning; populated by both etl_appendix_b_x11_sale and etl_appendix_b_x11_sale_return
 - [x] whatsapp_notifier Lambda — phase 1: S3 trigger on `notifications/pending/`, moves file to `notifications/processed/`; phase 2 stub for WhatsApp API call
 - [x] api Lambda — `POST /notify` endpoint: receives `{customer_name, html_content}`, puts HTML to `notifications/pending/` with customer_name metadata, returns `{key, message}`
+- [x] api Lambda — `GET /reports/customer-balances-fy` endpoint: per-customer, multi-FY roll-forward from `customer_ledger`; fy_count=all|2|3|4; cache key `iravi:reports:customer_balances_fy:{fy_count}` (1h TTL)
 - [x] lambda_api.tf — `DATA_BUCKET` env var, `s3:PutObject` IAM on `notifications/*`, CORS `POST`, `POST /notify` API Gateway route
 - [x] lambda_whatsapp_notifier.tf — Lambda + IAM + S3 permission; S3 trigger in lambda_etl_sales.tf on `notifications/pending/*.html`
 - [x] UI CustomerBalances — "Notify Client" split into "Preview" (opens HTML window) + "Notify" (POST to API, per-row sending/sent/error state); both mobile and desktop views updated
@@ -448,6 +494,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC slice for `/reports/customer-balances-fy`** — add API Gateway route `GET /reports/customer-balances-fy` + CORS allow-method in `lambda_api.tf` (iravi-dashboard-iac)
+- [ ] **UI slice for `/reports/customer-balances-fy`** — add `getCustomerBalancesFy(fyCount)` client method in `src/api/client.ts`; add RBAC screen key `reports.customer_balances_fy` to `app_screens` (IaC migration) and wire the screen in the UI router
 - [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007`, `008` migrations via bastion SSM port-forward
 - [ ] **whatsapp_notifier phase 2** — once WhatsApp Business approved: add `iravi/dashboard/whatsapp` secret (bearer_token, phone_number_id), add DB + Secrets Manager IAM to Lambda, implement `_send_whatsapp()` in handler
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
