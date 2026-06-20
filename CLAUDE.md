@@ -203,18 +203,25 @@ Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`
 
 Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `raw/Customer`)
 
-**Column mapping (0-indexed, header row 1, data from row 2):**
-`[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`
+**Sheets read (both from the same workbook):**
+1. `General` sheet — party-code lookup (col[0]=Name, col[2]=Code, e.g. `ANK001`). Read first to build an uppercase-name → code dict.
+2. `Delivery Address` sheet (the workbook's active sheet) — address/contact data. Column mapping (0-indexed, header row 1, data from row 2): `[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`
+
+**Column mapping — General sheet (0-indexed, header row 1, data from row 2):**
+`[0]=Name, [2]=Code (party code)`
 
 **Transformations:**
-- `customer_name` — uppercased
+- `customer_name` — uppercased (used as join key between both sheets)
 - `district`, `city` — title-cased
 - `state` — mapped: `37-Andhra Pradesh` → `AP`, `36-Telangana` → `TG`
 - `mobile_no` — numeric values cast to string; string values stripped of whitespace
+- `customer_code` — cast to string and stripped; blank/None stored as NULL; looked up by uppercased name from the `General` sheet; if no match the customer row is still inserted with `customer_code = NULL`
 
 **Upsert strategy:** `INSERT ... ON CONFLICT (customer_name) DO UPDATE SET ...` — simple dimension upsert, no milestoning. `updated_at` refreshed on each update.
 
-**Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, updated_at)`
+**Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, customer_code, updated_at)`
+
+**Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. Apply migration before running this Lambda. Re-running the ETL on any existing file will backfill `customer_code` for all existing rows via the `ON CONFLICT DO UPDATE` clause.
 
 ---
 
@@ -398,11 +405,13 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 - `fy_count=2|3|4` — most recent N financial years; the first shown FY gets an opening balance brought forward from all transactions strictly before that FY's April 1 start.
 - Any missing or invalid value defaults to `all`.
 
-**Source tables:** `customer_ledger` (joined to `customer_details` for city via `UPPER(customer_name) = UPPER(account_name)` match).
+**Source tables:** `customer_ledger` (joined to `customer_details` for city and customer_code via `UPPER(customer_name) = UPPER(account_name)` match).
 
 **FY definition:** April 1 → March 31. Label format: `FY YY-YY` (e.g. `FY 25-26`).
 
 **Ledger fields used:** `transaction_date`, `account_name`, `category` (`Db`/`Cr`), `amount`. Filter: `out_z IS NULL AND LOWER(account_name) NOT LIKE '%%iravi%%'`.
+
+**Row sort order:** rows are sorted by `code` ascending (zero-padded codes sort correctly as plain strings, e.g. `ANM001 < ANM002`), with NULL/blank-code rows placed last. Tie-breaker within each group is party name ascending.
 
 **Response shape:**
 ```jsonc
@@ -411,6 +420,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
   "rows": [
     {
       "party": "NEW BHARAT TRADERS",
+      "code": "ANK002",                       // party code from customer_details; null if no match or column not yet populated
       "city": "ANAKAPALLE",                   // null if no match in customer_details
       "opening": 0.0,                         // brought-forward balance; 0 when fy_count=all
       "per_fy": [
@@ -468,6 +478,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] etl_customer_ledger Lambda — full handler: parse `Ledger All Accounts*.xlsx`, category/sub-category mapping, unitemporal upsert into `customer_ledger`, archive source, emit `ETLCustomerLedgerSuccess`
 - [x] etl_customer_accounts Lambda — full handler: parse `Customer Accounts Export File*.xlsx`, normalise case + state codes, upsert into `customer_details`
 - [x] etl_customer_accounts mobile_no normalization — strip spaces, take last 10 digits if > 10
+- [x] etl_customer_accounts customer_code — reads `General` sheet (col[2]=Code), builds uppercase-name→code lookup, includes `customer_code` in INSERT and ON CONFLICT UPDATE; requires IaC migration 011
 - [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
 - [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
 - [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
@@ -480,7 +491,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] DB migration `008_create_sales.sql` — `sales` table with (purchase_date, voucher_no, branch, party, product) milestoning; populated by both etl_appendix_b_x11_sale and etl_appendix_b_x11_sale_return
 - [x] whatsapp_notifier Lambda — phase 1: S3 trigger on `notifications/pending/`, moves file to `notifications/processed/`; phase 2 stub for WhatsApp API call
 - [x] api Lambda — `POST /notify` endpoint: receives `{customer_name, html_content}`, puts HTML to `notifications/pending/` with customer_name metadata, returns `{key, message}`
-- [x] api Lambda — `GET /reports/customer-balances-fy` endpoint: per-customer, multi-FY roll-forward from `customer_ledger`; fy_count=all|2|3|4; cache key `iravi:reports:customer_balances_fy:{fy_count}` (1h TTL)
+- [x] api Lambda — `GET /reports/customer-balances-fy` endpoint: per-customer, multi-FY roll-forward from `customer_ledger`; fy_count=all|2|3|4; cache key `iravi:reports:customer_balances_fy:{fy_count}` (1h TTL); each row now includes `code` (party code from `customer_details.customer_code`); rows sorted by code asc (NULLs last), then party name
 - [x] lambda_api.tf — `DATA_BUCKET` env var, `s3:PutObject` IAM on `notifications/*`, CORS `POST`, `POST /notify` API Gateway route
 - [x] lambda_whatsapp_notifier.tf — Lambda + IAM + S3 permission; S3 trigger in lambda_etl_sales.tf on `notifications/pending/*.html`
 - [x] UI CustomerBalances — "Notify Client" split into "Preview" (opens HTML window) + "Notify" (POST to API, per-row sending/sent/error state); both mobile and desktop views updated
@@ -494,6 +505,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **Apply IaC migration 011** — `customer_code VARCHAR(20)` column on `customer_details`; must be applied via psql/SSM before deploying the updated `etl_customer_accounts` Lambda; re-running the ETL on the existing file will backfill codes for all existing rows
+- [ ] **Flush report cache after deploy** — `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries; required after the `code` field was added to the response shape
 - [ ] **IaC slice for `/reports/customer-balances-fy`** — add API Gateway route `GET /reports/customer-balances-fy` + CORS allow-method in `lambda_api.tf` (iravi-dashboard-iac)
 - [ ] **UI slice for `/reports/customer-balances-fy`** — add `getCustomerBalancesFy(fyCount)` client method in `src/api/client.ts`; add RBAC screen key `reports.customer_balances_fy` to `app_screens` (IaC migration) and wire the screen in the UI router
 - [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007`, `008` migrations via bastion SSM port-forward

@@ -20,7 +20,8 @@ _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'Customer Accounts Export File'
 
 # Column indices (0-based), row 1 is header, data starts row 2
-# [0]=Name, [3]=DLAddress3, [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo
+# Delivery Address sheet: [0]=Name, [3]=DLAddress3, [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo
+# General sheet: [0]=Name, [2]=Code (party code, e.g. "ANK001")
 
 _STATE_MAP = {
     '37-Andhra Pradesh': 'AP',
@@ -78,8 +79,39 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Archived source to s3://%s/%s', bucket, archive_key)
 
 
+def _build_code_lookup(wb) -> dict:
+    """Return uppercase-name -> party code dict from the 'General' sheet.
+
+    General sheet layout (0-indexed, header row 1, data from row 2):
+      [0]=Name, [2]=Code (party code, e.g. "ANK001")
+
+    Names are uppercased to match the normalization applied to customer_name
+    in _parse(). Code is cast to str and stripped; blank/None -> None (NULL).
+    """
+    ws = wb['General']
+    lookup = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        name = str(row[0] or '').strip().upper()
+        if not name:
+            continue
+        code_raw = row[2]
+        if code_raw is None:
+            code = None
+        else:
+            code = str(code_raw).strip() or None
+        lookup[name] = code
+    logger.info('Built code lookup: %d entries (%d with a code)',
+                len(lookup), sum(1 for c in lookup.values() if c is not None))
+    return lookup
+
+
 def _parse(src_path: str) -> list[dict]:
     wb = openpyxl.load_workbook(src_path, data_only=True)
+
+    # Build party-code lookup from the General sheet before reading main sheet
+    code_lookup = _build_code_lookup(wb)
+
+    # Main data comes from the 'Delivery Address' sheet (wb.active)
     ws = wb.active
 
     rows = []
@@ -87,6 +119,8 @@ def _parse(src_path: str) -> list[dict]:
         name = str(row[0] or '').strip()
         if not name:
             continue
+
+        customer_name = name.upper()
 
         district = str(row[3] or '').strip()
         city = str(row[4] or '').strip()
@@ -102,13 +136,17 @@ def _parse(src_path: str) -> list[dict]:
         if mobile_no and len(mobile_no) > 10:
             mobile_no = mobile_no[-10:]
 
+        # Party code from General sheet; None (NULL) when not present
+        customer_code = code_lookup.get(customer_name)
+
         rows.append({
-            'customer_name': name.upper(),
+            'customer_name': customer_name,
             'district': district.title() if district else None,
             'city': city.title() if city else None,
             'state': _STATE_MAP.get(state_raw),
             'pin': pin or None,
             'mobile_no': mobile_no,
+            'customer_code': customer_code,
         })
 
     return rows
@@ -119,16 +157,18 @@ def _upsert(conn, rows: list[dict]):
         for row in rows:
             cur.execute(
                 """
-                INSERT INTO customer_details (customer_name, district, city, state, pin, mobile_no)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO customer_details
+                    (customer_name, district, city, state, pin, mobile_no, customer_code)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (customer_name) DO UPDATE SET
-                    district   = EXCLUDED.district,
-                    city       = EXCLUDED.city,
-                    state      = EXCLUDED.state,
-                    pin        = EXCLUDED.pin,
-                    mobile_no  = EXCLUDED.mobile_no,
-                    updated_at = NOW()
+                    district      = EXCLUDED.district,
+                    city          = EXCLUDED.city,
+                    state         = EXCLUDED.state,
+                    pin           = EXCLUDED.pin,
+                    mobile_no     = EXCLUDED.mobile_no,
+                    customer_code = EXCLUDED.customer_code,
+                    updated_at    = NOW()
                 """,
                 (row['customer_name'], row['district'], row['city'],
-                 row['state'], row['pin'], row['mobile_no']),
+                 row['state'], row['pin'], row['mobile_no'], row['customer_code']),
             )
