@@ -918,12 +918,16 @@ def _handle_customer_balances_fy(fy_count_raw: str):
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            # ── City lookup from customer_details ──────────────────────────────
+            # ── City and code lookup from customer_details ─────────────────────
             cur.execute("""
-                SELECT UPPER(customer_name), city
+                SELECT UPPER(customer_name), city, customer_code
                 FROM customer_details
             """)
-            city_map = {row[0]: row[1] for row in cur.fetchall()}
+            city_map = {}
+            code_map = {}
+            for upper_name, city, customer_code in cur.fetchall():
+                city_map[upper_name] = city
+                code_map[upper_name] = customer_code if customer_code else None
 
             # ── Opening balances (only when cutoff_date is set) ────────────────
             opening_by_party: dict = {}
@@ -988,7 +992,12 @@ def _handle_customer_balances_fy(fy_count_raw: str):
     total_balance_dr = 0.0
     total_balance_cr = 0.0
 
-    for party in sorted(all_parties):
+    def _party_sort_key(party):
+        code = code_map.get(party.upper()) or ''
+        # Empty string (NULL/blank code) sorts after all non-empty codes
+        return (0 if code else 1, code, party)
+
+    for party in sorted(all_parties, key=_party_sort_key):
         opening = round(opening_by_party.get(party, 0.0), 2)
         running = opening
         per_fy = []
@@ -1011,9 +1020,11 @@ def _handle_customer_balances_fy(fy_count_raw: str):
         balance_cr = round(running, 2) if running < 0 else 0.0
 
         city = city_map.get(party.upper())
+        code = code_map.get(party.upper())
 
         result_rows.append({
             'party':      party,
+            'code':       code,
             'city':       city,
             'opening':    opening,
             'per_fy':     per_fy,
