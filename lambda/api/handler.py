@@ -17,6 +17,10 @@ s3 = boto3.client('s3')
 
 _DATA_BUCKET = os.environ.get('DATA_BUCKET', '')
 
+# Credit-note sub-category identifier used to split the credit bucket in the FY report.
+# Change this constant if the sub_category value ever changes in customer_ledger.
+_CREDIT_NOTE_SUBCATEGORY = 'Customer Credit Notes'
+
 _REDIS_TTL = 86400       # 24h fallback TTL when populating from RDS on cache miss
 _LEDGER_TTL = 3600       # 1h TTL for ledger range-query results
 _APPENDIX_B_TTL = 900    # 15 min TTL for appendix-b meta and report
@@ -953,6 +957,7 @@ def _handle_customer_balances_fy(fy_count_raw: str):
                 SELECT account_name,
                        transaction_date,
                        category,
+                       sub_category,
                        amount
                 FROM customer_ledger
                 WHERE out_z IS NULL
@@ -963,14 +968,17 @@ def _handle_customer_balances_fy(fy_count_raw: str):
     finally:
         conn.close()
 
-    # ── Aggregate into party → fy_label → {debit, credit} ─────────────────────
+    # ── Aggregate into party → fy_label → {debit, credit, credit_notes} ────────
     from collections import defaultdict
 
-    # party → {fy_label: {'debit': float, 'credit': float}}
-    agg: dict = defaultdict(lambda: defaultdict(lambda: {'debit': 0.0, 'credit': 0.0}))
+    # party → {fy_label: {'debit': float, 'credit': float, 'credit_notes': float}}
+    # credit      = sum(Cr) where sub_category != _CREDIT_NOTE_SUBCATEGORY
+    # credit_notes = sum(Cr) where sub_category == _CREDIT_NOTE_SUBCATEGORY
+    # Together they equal the previous total Cr, so balance is numerically unchanged.
+    agg: dict = defaultdict(lambda: defaultdict(lambda: {'debit': 0.0, 'credit': 0.0, 'credit_notes': 0.0}))
     all_parties: set = set()
 
-    for account_name, transaction_date, category, amount in ledger_rows:
+    for account_name, transaction_date, category, sub_category, amount in ledger_rows:
         fy_year = _fy_start_year(transaction_date)
         label = _fy_label(fy_year)
         if label not in shown_fy_labels:
@@ -978,6 +986,8 @@ def _handle_customer_balances_fy(fy_count_raw: str):
         amt = float(amount)
         if category == 'Db':
             agg[account_name][label]['debit'] += amt
+        elif sub_category == _CREDIT_NOTE_SUBCATEGORY:
+            agg[account_name][label]['credit_notes'] += amt
         else:
             agg[account_name][label]['credit'] += amt
         all_parties.add(account_name)
@@ -988,7 +998,10 @@ def _handle_customer_balances_fy(fy_count_raw: str):
 
     # ── Build result rows ──────────────────────────────────────────────────────
     result_rows = []
-    totals_per_fy = {label: {'debit': 0.0, 'credit': 0.0, 'balance': 0.0} for label in shown_fy_labels}
+    totals_per_fy = {
+        label: {'debit': 0.0, 'credit': 0.0, 'credit_notes': 0.0, 'balance': 0.0}
+        for label in shown_fy_labels
+    }
     total_balance_dr = 0.0
     total_balance_cr = 0.0
 
@@ -1004,16 +1017,29 @@ def _handle_customer_balances_fy(fy_count_raw: str):
 
         for label in shown_fy_labels:
             d = agg[party][label]
-            debit  = round(d['debit'],  2)
-            credit = round(d['credit'], 2)
-            running = round(running + debit - credit, 2)
-            per_fy.append({'fy': label, 'debit': debit, 'credit': credit, 'balance': running})
+            debit        = round(d['debit'],        2)
+            credit       = round(d['credit'],       2)
+            credit_notes = round(d['credit_notes'], 2)
+            # Balance moves by debit − credit − credit_notes; this equals the previous
+            # debit − total_cr because credit + credit_notes == old total Cr.
+            running = round(running + debit - credit - credit_notes, 2)
+            per_fy.append({
+                'fy':           label,
+                'debit':        debit,
+                'credit':       credit,
+                'credit_notes': credit_notes,
+                'balance':      running,
+            })
 
-            totals_per_fy[label]['debit']   = round(totals_per_fy[label]['debit']   + debit,  2)
-            totals_per_fy[label]['credit']  = round(totals_per_fy[label]['credit']  + credit, 2)
+            totals_per_fy[label]['debit']        = round(totals_per_fy[label]['debit']        + debit,        2)
+            totals_per_fy[label]['credit']       = round(totals_per_fy[label]['credit']       + credit,       2)
+            totals_per_fy[label]['credit_notes'] = round(totals_per_fy[label]['credit_notes'] + credit_notes, 2)
 
         # Skip parties that have zero activity across all shown FYs AND zero opening
-        if opening == 0.0 and all(r['debit'] == 0.0 and r['credit'] == 0.0 for r in per_fy):
+        if opening == 0.0 and all(
+            r['debit'] == 0.0 and r['credit'] == 0.0 and r['credit_notes'] == 0.0
+            for r in per_fy
+        ):
             continue
 
         balance_dr = round(running, 2) if running > 0 else 0.0
@@ -1036,9 +1062,10 @@ def _handle_customer_balances_fy(fy_count_raw: str):
         total_balance_cr = round(total_balance_cr + balance_cr, 2)
 
     # Compute running totals balance per FY
+    # net = debit − credit − credit_notes (equals the previous debit − total_cr)
     for label in shown_fy_labels:
         t = totals_per_fy[label]
-        t['balance'] = round(t['debit'] - t['credit'], 2)  # simple net per FY for totals row
+        t['balance'] = round(t['debit'] - t['credit'] - t['credit_notes'], 2)
         t['fy'] = label
 
     payload = {
