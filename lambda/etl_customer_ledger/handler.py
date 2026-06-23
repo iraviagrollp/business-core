@@ -154,7 +154,7 @@ def _parse(src_path: str, known_customers: set) -> list[dict]:
             continue
 
         if transaction_name == 'Sales Invoice Returns':
-            category = 'Cr'
+            category = 'Cr' if credit > 0 else 'Db'
             sub_category = _SALES_RETURN_SUBCATEGORY.get(contra_account, contra_account)
         else:
             category = 'Cr' if credit > 0 else 'Db'
