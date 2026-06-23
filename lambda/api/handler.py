@@ -373,8 +373,16 @@ def _handle_ledger_statement(account_name: str, from_date: str, to_date: str):
     rows = []
     for raw in raw_rows:
         row = dict(zip(col_names, raw))
-        debit = float(row['debit'])
-        credit = float(row['credit'])
+        raw_debit = float(row['debit'])
+        raw_credit = float(row['credit'])
+        # Net the two sides so roundoff/GST sub-components are absorbed into the
+        # voucher they belong to.  The voucher shows on only one side; the running
+        # balance is numerically unchanged because net = raw_debit − raw_credit.
+        net = raw_debit - raw_credit
+        if net >= 0:
+            debit, credit = net, 0.0
+        else:
+            debit, credit = 0.0, -net
         total_debit += debit
         total_credit += credit
         rows.append({
@@ -955,6 +963,7 @@ def _handle_customer_balances_fy(fy_count_raw: str):
 
             cur.execute("""
                 SELECT account_name,
+                       voucher_no,
                        transaction_date,
                        category,
                        sub_category,
@@ -969,28 +978,52 @@ def _handle_customer_balances_fy(fy_count_raw: str):
         conn.close()
 
     # ── Aggregate into party → fy_label → {debit, credit, credit_notes} ────────
+    # Strategy: group rows by (party, voucher_no, fy_label) first, compute each
+    # voucher's net = sum(Db) − sum(Cr).  Roundoff and GST sub-components on the
+    # opposite side are absorbed, so phantom paise credits disappear.  Then bucket:
+    #   is_cn  → credit_notes += -net  (net is negative for credit-note vouchers)
+    #   net > 0 → debit += net
+    #   net < 0 → credit += -net
+    # The sum of all voucher nets equals the old sum(Db)−sum(Cr), so the party's
+    # running balance/opening/closing are numerically unchanged.
     from collections import defaultdict
 
-    # party → {fy_label: {'debit': float, 'credit': float, 'credit_notes': float}}
-    # credit      = sum(Cr) where sub_category != _CREDIT_NOTE_SUBCATEGORY
-    # credit_notes = sum(Cr) where sub_category == _CREDIT_NOTE_SUBCATEGORY
-    # Together they equal the previous total Cr, so balance is numerically unchanged.
-    agg: dict = defaultdict(lambda: defaultdict(lambda: {'debit': 0.0, 'credit': 0.0, 'credit_notes': 0.0}))
+    # voucher_key → {'net': float, 'is_cn': bool, 'party': str, 'label': str}
+    voucher_acc: dict = {}
+
     all_parties: set = set()
 
-    for account_name, transaction_date, category, sub_category, amount in ledger_rows:
+    for account_name, voucher_no, transaction_date, category, sub_category, amount in ledger_rows:
         fy_year = _fy_start_year(transaction_date)
         label = _fy_label(fy_year)
         if label not in shown_fy_labels:
             continue  # outside shown window (shouldn't happen given the date filter, but be safe)
         amt = float(amount)
+        key = (account_name, voucher_no, label)
+        if key not in voucher_acc:
+            voucher_acc[key] = {'net': 0.0, 'is_cn': False, 'party': account_name, 'label': label}
         if category == 'Db':
-            agg[account_name][label]['debit'] += amt
-        elif sub_category == _CREDIT_NOTE_SUBCATEGORY:
-            agg[account_name][label]['credit_notes'] += amt
+            voucher_acc[key]['net'] += amt
         else:
-            agg[account_name][label]['credit'] += amt
+            voucher_acc[key]['net'] -= amt
+            if sub_category == _CREDIT_NOTE_SUBCATEGORY:
+                voucher_acc[key]['is_cn'] = True
         all_parties.add(account_name)
+
+    # party → {fy_label: {'debit': float, 'credit': float, 'credit_notes': float}}
+    agg: dict = defaultdict(lambda: defaultdict(lambda: {'debit': 0.0, 'credit': 0.0, 'credit_notes': 0.0}))
+    for v in voucher_acc.values():
+        net = v['net']
+        party = v['party']
+        label = v['label']
+        if v['is_cn']:
+            # Credit-note vouchers are net-credit; -net is the positive amount.
+            agg[party][label]['credit_notes'] += -net
+        elif net > 0:
+            agg[party][label]['debit'] += net
+        elif net < 0:
+            agg[party][label]['credit'] += -net
+        # net == 0 contributes nothing
 
     # Also include parties that appear only in the opening period (cutoff_date case)
     for party in opening_by_party:
