@@ -177,8 +177,23 @@ Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`
 - Skip if `transaction_date` is None
 - Skip if `account_name` is empty
 - Skip if `voucher_no == 'Brought Forward'`
-- Skip if `debit == 0 and credit == 0`
+- Skip if `debit == 0 and credit == 0` (evaluated AFTER sign normalization below)
 - Skip if `contra_account == 'Default Purchase Account'`
+
+**Sign normalization (applied immediately after reading debit/credit, before the skip check):**
+FUSIL writes some adjustments (e.g. `Roundoff A/C`) as a negative value on one side of the ledger.
+A negative debit is economically a credit of its magnitude, and vice-versa. Two independent `if`s
+normalize both sides so the rest of the logic always receives non-negative values:
+```python
+if debit < 0:
+    credit += -debit
+    debit = 0.0
+if credit < 0:
+    debit += -credit
+    credit = 0.0
+```
+Example: EKR INDUSTRIES voucher POSRT2526-7 `Roundoff A/C` row arrives as `debit=-0.48, credit=0`.
+After normalization: `debit=0.0, credit=0.48` → stored as `category='Cr', sub_category='Roundoff A/C', amount=0.48` (correct — reduces the Dr balance). Before this fix, `amount=-0.48` was stored with `category='Cr'`, which ADDED 0.48 to the balance instead of subtracting it (0.48 reconciliation error).
 
 **Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
 
@@ -489,6 +504,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] etl_customer_accounts mobile_no normalization — strip spaces, take last 10 digits if > 10
 - [x] etl_customer_accounts customer_code — reads `General` sheet (col[2]=Code), builds uppercase-name→code lookup, includes `customer_code` in INSERT and ON CONFLICT UPDATE; requires IaC migration 011
 - [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
+- [x] etl_customer_ledger sign-normalization fix — negative debit/credit values (e.g. FUSIL Roundoff adjustments) are normalized to the opposite side before category/amount classification; fixes 0.48 reconciliation error on EKR INDUSTRIES POSRT2526-7 and any similar rows
 - [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
 - [x] DB migration `005_create_appendix_b_x11_stock.sql` — `appendix_b_x11_stock` table with (barcode, technical_name, vendor) milestoning
 - [x] etl_appendix_b_x11_purchase Lambda — full handler: parse `AppendixPurchaseReport*.xlsx`, skip multi-barcode rows, look up mdf_date/exp_date from `appendix_b_x11_stock`, upsert into `appendix_b_x11_stock_ledger` (in_out=In); also upserts every parsed row into `purchases` (purchase_return=N)
@@ -523,6 +539,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [ ] **whatsapp_notifier phase 2** — once WhatsApp Business approved: add `iravi/dashboard/whatsapp` secret (bearer_token, phone_number_id), add DB + Secrets Manager IAM to Lambda, implement `_send_whatsapp()` in handler
 - [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
+- [ ] **RE-INGEST customer_ledger after sign-normalization fix** — previously stored rows with a negative amount (e.g. EKR INDUSTRIES POSRT2526-7 Roundoff) are wrong in the DB. Re-upload the ledger xlsx to S3 (or run the ETL manually) so the milestoning UPDATE closes the bad rows and INSERT writes the corrected `amount`. Then flush the Redis cache (`POST /admin/cache/flush`) so `iravi:reports:customer_balances_fy:*` and `iravi:ledger:range` rehydrate from the corrected data.
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key
 - [ ] **Test etl_appendix_b_x11 end-to-end** — upload `Barcodes Masters*.xlsx` to S3 `raw/`, verify `appendix_b_x11_stock` rows and milestoning
 - [ ] **Test etl_stocks end-to-end** — verify milestoning works across days, verify `snapshot_stock` rows, Redis keys, API responses

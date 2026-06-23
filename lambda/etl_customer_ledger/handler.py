@@ -126,6 +126,15 @@ def _parse(src_path: str, known_customers: set) -> list[dict]:
         debit = float(row[6] or 0)
         credit = float(row[7] or 0)
 
+        # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on one side.
+        # A negative debit is economically a credit of its magnitude, and vice-versa.
+        if debit < 0:
+            credit += -debit
+            debit = 0.0
+        if credit < 0:
+            debit += -credit
+            credit = 0.0
+
         if transaction_date_raw is None:
             continue
         if not account_name:
