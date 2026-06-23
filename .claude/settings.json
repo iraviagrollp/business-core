@@ -12,7 +12,8 @@
          "Bash(npm run build:*)",
          "Bash(npm run dev:*)",
          "Bash(node:*)",
-         "Bash(python3:*)"
+         "Bash(python3:*)",
+         "Bash(python:*)"
       ],
       "ask":[
          "Bash(rm *)",
