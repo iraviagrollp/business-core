@@ -1,36 +1,42 @@
 {
-  "permissions": {
-    "allow": [
-      "Read(./**)",
-      "Bash(python -c ' *)"
-    ],
-    "ask": [
-      "Bash(rm *)",
-      "PowerShell(Remove-Item *)",
-      "PowerShell(rm *)",
-      "PowerShell(del *)"
-    ],
-    "additionalDirectories": [
-      "../iravi-dashboard-iac/terraform/environments/production",
-      "../iravi-dashboard-iac/.github/workflows"
-    ],
-    "deny": [
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(git push:*)"
-    ]
-  },
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node -e \"require((process.env.CLAUDE_PROJECT_DIR||process.cwd())+'/../.claude/hooks/doc-reminder.js')\"",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
+   "permissions":{
+      "additionalDirectories":[
+         "../business-core/lambda/api",
+         "../iravi-dashboard-iac/terraform/environments/production"
+      ],
+      "allow":[
+         "Read(./**)",
+         "Bash(npx tsc *)",
+         "Bash(npm install:*)",
+         "Bash(npm ci:*)",
+         "Bash(npm run build:*)",
+         "Bash(npm run dev:*)",
+         "Bash(node:*)",
+         "Bash(python3:*)"
+      ],
+      "ask":[
+         "Bash(rm *)",
+         "PowerShell(Remove-Item *)",
+         "PowerShell(rm *)",
+         "PowerShell(del *)"
+      ],
+      "deny":[
+         "Bash(git add:*)",
+         "Bash(git commit:*)",
+         "Bash(git push:*)"
+      ]
+   },
+   "hooks":{
+      "Stop":[
+         {
+            "hooks":[
+               {
+                  "type":"command",
+                  "command":"node -e \"require((process.env.CLAUDE_PROJECT_DIR||process.cwd())+'/../.claude/hooks/doc-reminder.js')\"",
+                  "timeout":30
+               }
+            ]
+         }
+      ]
+   }
 }
