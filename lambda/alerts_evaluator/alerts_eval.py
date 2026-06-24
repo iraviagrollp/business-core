@@ -3,9 +3,10 @@ Shared balances evaluation for Alerts.
 
 Used by:
   - lambda/api/handler.py  (POST /alerts/{id}/test)
-  - lambda/alerts_evaluator/handler.py  (nightly evaluator)
+  - lambda/alerts_evaluator/handler.py  (15-minute evaluator)
 
 Both packages include this file directly (same logic, one source).
+Keep lambda/alerts_evaluator/alerts_eval.py in sync whenever this file changes.
 
 Evaluation contract
 -------------------
@@ -20,6 +21,15 @@ Per customer (from customer_ledger, out_z IS NULL, excluding IRAVI internal acco
                  remainder defines age = (today - that debit's date) in days.
                  If fully covered the customer is excluded.
 
+  days_since_last_receipt
+               = (today - last_receipt_date).days where last_receipt = most recent
+                 credit with sub_category IN ('Bank Receipt','Cash Receipt').
+                 If the customer has NEVER received a receipt (last_receipt_date is NULL),
+                 days_since_last_receipt is treated as effectively infinite — a large
+                 sentinel value (10**9) is used so it satisfies any '> threshold' rule.
+                 This enables "never paid" customers to be flagged by a condition such as
+                 days_since_last_receipt > 90.
+
   last_receipt_amount / last_receipt_date
                = most recent credit whose sub_category IN ('Bank Receipt','Cash Receipt').
                  NULL if none.
@@ -27,7 +37,7 @@ Per customer (from customer_ledger, out_z IS NULL, excluding IRAVI internal acco
 Condition evaluation
 --------------------
 Each condition is one of:
-  field ∈ {'amount', 'age_days'}
+  field ∈ {'amount', 'age_days', 'days_since_last_receipt'}
   op   ∈ {'gt','gte','lt','lte','eq','between'}   (value2 only used for 'between')
 
 Conditions are combined by match_type:
@@ -37,7 +47,7 @@ Conditions are combined by match_type:
 Return value
 ------------
 A list of dicts, one per matching customer:
-  {customer_name, city, code, outstanding, age_days,
+  {customer_name, city, code, outstanding, age_days, days_since_last_receipt,
    last_receipt_amount, last_receipt_date}
 """
 
@@ -48,6 +58,10 @@ from datetime import date
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Sentinel used when a customer has never received any Bank/Cash Receipt.
+# Effectively infinite — satisfies any 'days_since_last_receipt > N' condition.
+_NEVER_PAID_SENTINEL = 10 ** 9
 
 # ── field catalog ─────────────────────────────────────────────────────────────
 
@@ -63,6 +77,12 @@ FIELD_CATALOG = {
         {
             "key": "age_days",
             "label": "Age (days)",
+            "type": "integer",
+            "ops": ["gt", "gte", "lt", "lte", "between"],
+        },
+        {
+            "key": "days_since_last_receipt",
+            "label": "Days since last receipt",
             "type": "integer",
             "ops": ["gt", "gte", "lt", "lte", "between"],
         },
@@ -97,7 +117,13 @@ def _match_condition(value: float, op: str, threshold: float, value2: float | No
     return False
 
 
-def _customer_matches(outstanding: float, age_days: int, conditions: list[dict], match_type: str) -> bool:
+def _customer_matches(
+    outstanding: float,
+    age_days: int,
+    days_since_last_receipt: float,
+    conditions: list[dict],
+    match_type: str,
+) -> bool:
     """Return True if this customer satisfies the conditions under match_type."""
     if not conditions:
         return False
@@ -112,6 +138,8 @@ def _customer_matches(outstanding: float, age_days: int, conditions: list[dict],
             val = outstanding
         elif field == "age_days":
             val = float(age_days)
+        elif field == "days_since_last_receipt":
+            val = float(days_since_last_receipt)
         else:
             results.append(False)
             continue
@@ -160,7 +188,7 @@ def evaluate_balances(conn, conditions: list[dict], match_type: str, today: date
     Returns
     -------
     List of matching customer dicts (sorted by outstanding desc):
-      {customer_name, city, code, outstanding, age_days,
+      {customer_name, city, code, outstanding, age_days, days_since_last_receipt,
        last_receipt_amount, last_receipt_date}
     """
     if today is None:
@@ -237,12 +265,21 @@ def evaluate_balances(conn, conditions: list[dict], match_type: str, today: date
         if age_days_val is None:
             continue  # FIFO says fully covered (shouldn't normally happen if outstanding > 0, but be safe)
 
-        # Check conditions
-        if not _customer_matches(outstanding, age_days_val, conditions, match_type):
+        # days_since_last_receipt
+        # NULL last_receipt_date → sentinel (effectively infinite, flags "never paid" customers)
+        receipt_info = last_receipt.get(cname)
+        if receipt_info is not None:
+            last_receipt_date_obj = receipt_info[0]
+            days_since_last_receipt: float = (today - last_receipt_date_obj).days
+        else:
+            last_receipt_date_obj = None
+            days_since_last_receipt = float(_NEVER_PAID_SENTINEL)
+
+        # Check conditions (now passes days_since_last_receipt)
+        if not _customer_matches(outstanding, age_days_val, days_since_last_receipt, conditions, match_type):
             continue
 
-        receipt_info = last_receipt.get(cname)
-        last_receipt_date = receipt_info[0].isoformat() if receipt_info else None
+        last_receipt_date = last_receipt_date_obj.isoformat() if last_receipt_date_obj else None
         last_receipt_amount = float(receipt_info[1]) if receipt_info else None
 
         info = meta[cname]
@@ -252,6 +289,7 @@ def evaluate_balances(conn, conditions: list[dict], match_type: str, today: date
             "code": info["code"],
             "outstanding": round(outstanding, 2),
             "age_days": age_days_val,
+            "days_since_last_receipt": days_since_last_receipt,
             "last_receipt_amount": last_receipt_amount,
             "last_receipt_date": last_receipt_date,
         })
@@ -274,6 +312,19 @@ _EMAIL_RE = _re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 _FREQUENCY_VALID = {"daily", "weekly", "monthly"}
 _MATCH_TYPE_VALID = {"all", "any"}
+
+_SCHEDULE_TIME_RE = _re.compile(r'^([01]\d|2[0-3]):([0-5]\d)$')
+_DEFAULT_SCHEDULE_TIME = "11:00"
+
+
+def _validate_schedule_time(value: str) -> str:
+    """Validate and normalise a schedule_time string.  Returns the value unchanged if valid.
+    Raises ValidationError if not a valid 24h HH:MM string."""
+    if not _SCHEDULE_TIME_RE.match(value):
+        raise ValidationError(
+            f"schedule_time must be a valid 24h HH:MM string (e.g. '14:30'), got {value!r}"
+        )
+    return value
 
 
 def validate_alert(body: dict) -> None:
@@ -303,6 +354,11 @@ def validate_alert(body: dict) -> None:
     elif frequency == "monthly":
         if schedule_day is None or not isinstance(schedule_day, int) or not (1 <= schedule_day <= 28):
             raise ValidationError("schedule_day must be 1-28 for monthly frequency")
+
+    # schedule_time: optional HH:MM string, defaults to "11:00" on create
+    schedule_time_raw = body.get("schedule_time")
+    if schedule_time_raw is not None:
+        _validate_schedule_time(str(schedule_time_raw))
 
     match_type = body.get("match_type")
     if match_type not in _MATCH_TYPE_VALID:

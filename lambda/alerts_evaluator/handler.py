@@ -1,18 +1,29 @@
 """
-alerts_evaluator — EventBridge-triggered nightly alert evaluation.
+alerts_evaluator — EventBridge-triggered 15-minute alert evaluation.
 
-Trigger: EventBridge cron daily at 11:00 IST (05:30 UTC) — schedule owned by IaC.
+Trigger: EventBridge rate(15 minutes) — schedule owned by IaC.
 
 Logic
 -----
-1. Load all is_active=True alerts from the DB.
-2. Determine today's date in IST.
-3. Filter to alerts that are DUE today (daily=always, weekly=weekday match, monthly=day-of-month match).
-4. For each due alert:
+1. Load all is_active=True alerts from the DB (including schedule_time).
+2. Determine current date and time in IST (UTC+5:30).
+3. For each alert, decide whether to send on this run — ALL three gates must pass:
+   a. Due today (IST):
+      - daily   → always
+      - weekly  → IST weekday (0=Mon) == schedule_day
+      - monthly → IST day-of-month == schedule_day
+   b. Time reached: current IST time-of-day (HH:MM) >= alert's schedule_time (HH:MM).
+   c. Not already done today: no alert_runs row for this alert with
+      run_at (cast to IST date) == today AND status IN ('sent', 'no_match').
+      A previous 'failed' run today may retry (it is not deduplicated).
+4. For each alert that passes all three gates:
    a. Run the shared balances evaluation (alerts_eval.evaluate_balances).
    b. If ≥1 customer matches → render an HTML email table and send via SES to all recipients.
    c. Write an alert_runs row: status='sent'|'no_match'|'failed', error on exception.
 5. One alert failing does NOT abort the others.
+
+This guarantees exactly one send per day per alert, at/after its configured time,
+even with 15-minute polling.
 
 Environment variables
 ---------------------
@@ -57,16 +68,27 @@ def _get_db_conn():
     )
 
 
+def _now_ist() -> datetime:
+    """Return current datetime in IST (UTC+5:30), timezone-naive."""
+    return datetime.now(timezone.utc) + _IST_OFFSET
+
+
 def _today_ist() -> date:
     """Return today's date in IST (UTC+5:30)."""
-    return (datetime.now(timezone.utc) + _IST_OFFSET).date()
+    return _now_ist().date()
+
+
+def _current_hhmm_ist() -> str:
+    """Return current IST time as 'HH:MM' string (for comparison with schedule_time)."""
+    now = _now_ist()
+    return f"{now.hour:02d}:{now.minute:02d}"
 
 
 def _load_active_alerts(conn) -> list[dict]:
     """Return all is_active alerts with their conditions and recipients."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, name, category, frequency, schedule_day, match_type
+            SELECT id, name, category, frequency, schedule_day, schedule_time, match_type
             FROM alerts
             WHERE is_active = TRUE
             ORDER BY id
@@ -74,7 +96,21 @@ def _load_active_alerts(conn) -> list[dict]:
         alert_rows = cur.fetchall()
 
         alerts = []
-        for (alert_id, name, category, frequency, schedule_day, match_type) in alert_rows:
+        for (alert_id, name, category, frequency, schedule_day, schedule_time, match_type) in alert_rows:
+            # Normalise schedule_time to "HH:MM" string.
+            # psycopg2 returns TIME WITHOUT TIME ZONE as datetime.timedelta.
+            if schedule_time is None:
+                st_str = alerts_eval._DEFAULT_SCHEDULE_TIME
+            elif hasattr(schedule_time, 'hour'):
+                # datetime.time object
+                st_str = f"{schedule_time.hour:02d}:{schedule_time.minute:02d}"
+            else:
+                # timedelta (seconds since midnight)
+                total_seconds = int(schedule_time.total_seconds())
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes = remainder // 60
+                st_str = f"{hours:02d}:{minutes:02d}"
+
             cur.execute("""
                 SELECT field, op, value, value2
                 FROM alert_conditions WHERE alert_id = %s ORDER BY id
@@ -96,16 +132,40 @@ def _load_active_alerts(conn) -> list[dict]:
             recipients = [row[0] for row in cur.fetchall()]
 
             alerts.append({
-                "id":           alert_id,
-                "name":         name,
-                "category":     category,
-                "frequency":    frequency,
-                "schedule_day": schedule_day,
-                "match_type":   match_type,
-                "conditions":   conditions,
-                "recipients":   recipients,
+                "id":            alert_id,
+                "name":          name,
+                "category":      category,
+                "frequency":     frequency,
+                "schedule_day":  schedule_day,
+                "schedule_time": st_str,
+                "match_type":    match_type,
+                "conditions":    conditions,
+                "recipients":    recipients,
             })
     return alerts
+
+
+def _already_sent_today(conn, alert_id: int, today: date) -> bool:
+    """
+    Return True if there is already an alert_runs row for this alert where
+    run_at (cast to IST date) == today AND status IN ('sent', 'no_match').
+
+    A previous 'failed' run today does NOT count — the alert may retry on the
+    next 15-minute tick once time and due-today gates still pass.
+
+    run_at is stored as UTC by the DB (NOW()); we convert to IST by adding 5h30m
+    before comparing to today.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM alert_runs
+            WHERE alert_id = %s
+              AND (run_at AT TIME ZONE 'UTC' + INTERVAL '5 hours 30 minutes')::DATE = %s
+              AND status IN ('sent', 'no_match')
+            LIMIT 1
+        """, (alert_id, today))
+        return cur.fetchone() is not None
 
 
 def _write_alert_run(conn, alert_id: int, matched: int, status: str, error: str | None):
@@ -126,18 +186,25 @@ def _render_html_email(alert_name: str, today: date, matched_customers: list[dic
     rows_html = ""
     for row in matched_customers:
         last_amount = (
-            f"₹{row['last_receipt_amount']:,.2f}"
+            f"&#8377;{row['last_receipt_amount']:,.2f}"
             if row["last_receipt_amount"] is not None
             else ""
         )
         last_date = row["last_receipt_date"] or ""
+        # days_since_last_receipt: show sentinel as "Never" for readability
+        dslr_raw = row.get("days_since_last_receipt")
+        if dslr_raw is None or dslr_raw >= alerts_eval._NEVER_PAID_SENTINEL:
+            dslr_display = "Never"
+        else:
+            dslr_display = str(int(dslr_raw))
         rows_html += (
             f"<tr>"
             f"<td style='padding:6px 10px;border:1px solid #ddd'>{_esc(row['customer_name'])}</td>"
             f"<td style='padding:6px 10px;border:1px solid #ddd'>{_esc(row['city'] or '')}</td>"
             f"<td style='padding:6px 10px;border:1px solid #ddd'>{_esc(row['code'] or '')}</td>"
-            f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right'>₹{row['outstanding']:,.2f}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right'>&#8377;{row['outstanding']:,.2f}</td>"
             f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right'>{row['age_days']}</td>"
+            f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right'>{dslr_display}</td>"
             f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right'>{last_amount}</td>"
             f"<td style='padding:6px 10px;border:1px solid #ddd'>{_esc(last_date)}</td>"
             f"</tr>\n"
@@ -147,8 +214,8 @@ def _render_html_email(alert_name: str, today: date, matched_customers: list[dic
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
-<body style="font-family:Arial,sans-serif;color:#333;max-width:900px;margin:0 auto">
-  <h2 style="color:#1a5276">IRAVI AGRO LIFE LLP — Alert: {_esc(alert_name)}</h2>
+<body style="font-family:Arial,sans-serif;color:#333;max-width:1000px;margin:0 auto">
+  <h2 style="color:#1a5276">IRAVI AGRO LIFE LLP &#8212; Alert: {_esc(alert_name)}</h2>
   <p>Date: <strong>{today.strftime('%d %b %Y')}</strong> &nbsp;|&nbsp;
      Matched customers: <strong>{count}</strong></p>
   <table style="border-collapse:collapse;width:100%;font-size:13px">
@@ -157,8 +224,9 @@ def _render_html_email(alert_name: str, today: date, matched_customers: list[dic
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:left">Customer</th>
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:left">City</th>
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:left">Code</th>
-        <th style="padding:8px 10px;border:1px solid #ddd;text-align:right">Outstanding (₹)</th>
+        <th style="padding:8px 10px;border:1px solid #ddd;text-align:right">Outstanding (&#8377;)</th>
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:right">Age (days)</th>
+        <th style="padding:8px 10px;border:1px solid #ddd;text-align:right">Days Since Receipt</th>
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:right">Last Receipt Amt</th>
         <th style="padding:8px 10px;border:1px solid #ddd;text-align:left">Last Receipt Date</th>
       </tr>
@@ -201,14 +269,22 @@ def _send_ses_email(alert_name: str, recipients: list[str], html_body: str, toda
 
 def lambda_handler(event, context):
     """
-    EventBridge-triggered entry point.
+    EventBridge-triggered entry point.  Runs every 15 minutes.
+
+    For each active alert, three gates must ALL pass before sending:
+      1. Due today  (daily=always, weekly=weekday match, monthly=day-of-month match)
+      2. Time reached: current IST HH:MM >= alert's schedule_time HH:MM
+      3. Not already done today: no alert_runs row (status sent|no_match) for today (IST)
+
+    A previously-failed run today is allowed to retry.
 
     event shape: standard EventBridge scheduled event (detail not used).
     """
     logger.info("alerts_evaluator invoked: %s", json.dumps(event))
 
     today = _today_ist()
-    logger.info("Evaluating alerts for IST date: %s", today)
+    current_hhmm = _current_hhmm_ist()
+    logger.info("Evaluating alerts — IST date: %s  time: %s", today, current_hhmm)
 
     conn = _get_db_conn()
     try:
@@ -218,6 +294,7 @@ def lambda_handler(event, context):
         conn.close()
         raise
 
+    # ── Gate 1: due today ─────────────────────────────────────────────────────
     due_alerts = [
         a for a in active_alerts
         if alerts_eval.is_alert_due_today(a["frequency"], a["schedule_day"], today)
@@ -227,13 +304,34 @@ def lambda_handler(event, context):
         len(active_alerts), today, len(due_alerts),
     )
 
-    results = []
+    # ── Gate 2 + 3: time reached AND not already done today ──────────────────
+    actionable = []
     for alert in due_alerts:
+        schedule_time = alert["schedule_time"]  # "HH:MM"
+        if current_hhmm < schedule_time:
+            logger.info(
+                "Alert id=%s skipped — time not yet reached (now=%s, schedule=%s)",
+                alert["id"], current_hhmm, schedule_time,
+            )
+            continue
+        if _already_sent_today(conn, alert["id"], today):
+            logger.info(
+                "Alert id=%s skipped — already sent/no_match today (%s)",
+                alert["id"], today,
+            )
+            continue
+        actionable.append(alert)
+
+    logger.info("Alerts passing all gates (will evaluate): %d", len(actionable))
+
+    results = []
+    for alert in actionable:
         alert_id   = alert["id"]
         alert_name = alert["name"]
         logger.info("Processing alert id=%s name=%r", alert_id, alert_name)
 
         matched_customers: list[dict] = []
+        matched_count = 0
         status = "no_match"
         error_msg = None
 
@@ -271,5 +369,6 @@ def lambda_handler(event, context):
         })
 
     conn.close()
-    logger.info("alerts_evaluator complete: %s", results)
-    return {"processed": len(due_alerts), "results": results}
+    logger.info("alerts_evaluator complete: processed=%d results=%s",
+                len(actionable), results)
+    return {"processed": len(actionable), "results": results}

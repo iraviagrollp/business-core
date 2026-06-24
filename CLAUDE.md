@@ -489,14 +489,19 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 **Status: complete (API + evaluator Lambda)**
 
-### Database tables (created by IaC migration 013)
+### Database tables (created by IaC migration 013; migration 014 adds schedule_time)
 
 | Table | Key columns |
 |---|---|
-| `alerts` | `id, name, category, frequency, schedule_day, match_type, is_active, created_by, created_at, updated_at` |
+| `alerts` | `id, name, category, frequency, schedule_day, schedule_time, match_type, is_active, created_by, created_at, updated_at` |
 | `alert_conditions` | `id, alert_id, field, op, value, value2` |
 | `alert_recipients` | `id, alert_id, channel, address` |
 | `alert_runs` | `id, alert_id, run_at, matched, status, error` |
+
+**Migration 014** (IaC — apply manually via psql/SSM before deploying):
+```sql
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS schedule_time TIME NOT NULL DEFAULT '11:00';
+```
 
 ### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
 
@@ -516,10 +521,16 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 ```json
 {"category":"balances",
  "fields":[{"key":"amount","label":"Outstanding amount (₹)","type":"currency","ops":["gt","gte","lt","lte","between"]},
-           {"key":"age_days","label":"Age (days)","type":"integer","ops":["gt","gte","lt","lte","between"]}],
+           {"key":"age_days","label":"Age (days)","type":"integer","ops":["gt","gte","lt","lte","between"]},
+           {"key":"days_since_last_receipt","label":"Days since last receipt","type":"integer","ops":["gt","gte","lt","lte","between"]}],
  "match_types":["all","any"],
  "frequencies":["daily","weekly","monthly"]}
 ```
+
+**`days_since_last_receipt` semantics:**
+- Value = (today − last_receipt_date) in days, where last_receipt = most recent Bank/Cash Receipt credit.
+- If the customer has NEVER received a receipt (`last_receipt_date` is NULL), `days_since_last_receipt` is set to `10**9` (sentinel for "effectively infinite"), so any `> threshold` rule flags "never paid" customers.
+- NULL last_receipt does NOT exclude the customer from evaluation — `outstanding` and `age_days` conditions are independent.
 
 ### Request body (POST /alerts, PUT /alerts/{id})
 ```jsonc
@@ -528,6 +539,7 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
   "category": "balances",
   "frequency": "weekly",       // daily | weekly | monthly
   "schedule_day": 0,           // null for daily; 0-6 (Mon-Sun) for weekly; 1-28 for monthly
+  "schedule_time": "14:30",    // optional HH:MM 24h string; defaults to "11:00" if omitted on create
   "match_type": "all",         // all (AND) | any (OR)
   "is_active": true,
   "conditions": [
@@ -546,6 +558,7 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
   "category": "balances",
   "frequency": "weekly",
   "schedule_day": 0,
+  "schedule_time": "14:30",
   "match_type": "all",
   "is_active": true,
   "created_by": "admin",
@@ -572,10 +585,11 @@ be kept in sync whenever the source changes.
 
 - `outstanding` = SUM(Db amounts) - SUM(Cr amounts). Customer excluded if outstanding <= 0.
 - `age_days` = FIFO aging: apply total credits to oldest debits first; age = (today - oldest still-unpaid debit date) in days. Customer excluded if FIFO fully covers all debits.
+- `days_since_last_receipt` = (today - last_receipt_date) in days. If the customer has NEVER received a Bank/Cash Receipt (`last_receipt_date` is NULL), `days_since_last_receipt` = `10**9` (sentinel for "never paid") so any `> N` condition flags them.
 - `last_receipt_amount` / `last_receipt_date` = most recent credit with `sub_category IN ('Bank Receipt','Cash Receipt')`; NULL if none.
-- NULL last_receipt does NOT exclude the customer — age and amount conditions are independent.
+- NULL last_receipt does NOT exclude the customer — age, amount, and days_since_last_receipt conditions are independent.
 - Customers are joined to `customer_details` for `city` and `customer_code`.
-- Returned per matched customer: `{customer_name, city, code, outstanding, age_days, last_receipt_amount, last_receipt_date}`.
+- Returned per matched customer: `{customer_name, city, code, outstanding, age_days, days_since_last_receipt, last_receipt_amount, last_receipt_date}`.
 - Output sorted by `outstanding` descending.
 
 **Condition ops:** `gt, gte, lt, lte, eq, between` (`value2` required iff op=`between`).
@@ -584,14 +598,15 @@ be kept in sync whenever the source changes.
 ### alerts_evaluator Lambda (`lambda/alerts_evaluator/handler.py`)
 
 - Entry: `lambda_handler(event, context)`.
-- Trigger: EventBridge cron daily at 11:00 IST (05:30 UTC) — schedule owned by IaC.
-- Due-today logic:
-  - `daily` → always
-  - `weekly` → `today.weekday() == schedule_day` (0=Mon, 6=Sun)
-  - `monthly` → `today.day == schedule_day` (1-28)
-- IST date = UTC now + 5h30m.
-- For each due alert: runs `evaluate_balances`; if ≥1 match → sends HTML table email via `boto3.client('ses').send_email` from `ALERTS_SENDER_EMAIL` to all recipients. Writes `alert_runs` row (`status`: `sent` | `no_match` | `failed`). One alert failing does NOT abort others.
-- Email columns: Customer · City · Code · Outstanding (₹) · Age (days) · Last Receipt Amount · Last Receipt Date.
+- Trigger: EventBridge **rate(15 minutes)** — schedule owned by IaC (IaC migration 014 changes from the old daily cron).
+- Per-invocation gating — for each active alert, ALL three gates must pass before sending:
+  1. **Due today (IST):** `daily` → always; `weekly` → `today.weekday() == schedule_day` (0=Mon); `monthly` → `today.day == schedule_day`.
+  2. **Time reached:** current IST `HH:MM` >= alert's `schedule_time` `HH:MM`.
+  3. **Not already done today:** no `alert_runs` row with `run_at` (cast to IST date) == today AND `status IN ('sent','no_match')`. A previous `'failed'` run today may retry.
+- IST = UTC + 5h30m. Both date and current time derived from `datetime.now(UTC) + timedelta(hours=5, minutes=30)`.
+- For each alert passing all gates: runs `evaluate_balances`; if ≥1 match → sends HTML table email via `boto3.client('ses').send_email` from `ALERTS_SENDER_EMAIL` to all recipients. Writes `alert_runs` row (`status`: `sent` | `no_match` | `failed`). One alert failing does NOT abort others.
+- Email columns: Customer · City · Code · Outstanding (₹) · Age (days) · Days Since Receipt · Last Receipt Amount · Last Receipt Date.
+- `days_since_last_receipt` is displayed as `"Never"` in the email when it equals the sentinel (`10**9`).
 
 ---
 
@@ -625,6 +640,9 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] alerts response contract fix (2026-06-24) — `recipients` in all alert responses (`GET /alerts`, `GET /alerts/{id}`, `POST /alerts`, `PUT /alerts/{id}`) is now a flat array of email-address strings `["a@x.com"]` instead of objects `[{id, channel, address}]`; both serialization sites fixed (`_fetch_alert_with_children` and `_handle_alerts_list`); `_insert_alert_children` request handling unchanged
 - [x] alerts_eval.py shared module (lambda/api/alerts_eval.py + copy in lambda/alerts_evaluator/alerts_eval.py) — FIFO aging, condition matching, field catalog, validate_alert(), is_alert_due_today()
 - [x] alerts_evaluator Lambda (lambda/alerts_evaluator/handler.py + requirements.txt) — EventBridge-triggered nightly evaluator: load due alerts → evaluate balances → send SES HTML email → write alert_runs; one alert failing does not abort others
+- [x] alerts days_since_last_receipt field (2026-06-24) — new evaluable field in both alerts_eval.py copies; NULL last_receipt_date → sentinel 10**9 (flags never-paid customers); field catalog updated; validate_alert() accepts it as valid condition field; _customer_matches() extended; evaluate_balances() returns days_since_last_receipt in matched rows; email table adds Days Since Receipt column (sentinel displayed as "Never")
+- [x] alerts schedule_time field (2026-06-24) — `schedule_time TIME` column added to `alerts` table by IaC migration 014; API accepts/returns as HH:MM string (e.g. "14:30"); defaults to "11:00" if omitted on create; validated by _validate_schedule_time() regex; _alert_row_to_dict() normalises psycopg2 timedelta/time → HH:MM; CREATE and UPDATE SQL updated; _ALERT_SELECT updated
+- [x] alerts_evaluator 15-minute gating logic (2026-06-24) — evaluator now runs every 15 min (IaC changes cron to rate(15 minutes)); per-alert three-gate check: (1) due today, (2) current IST HH:MM >= schedule_time, (3) no alert_runs row with status sent|no_match for today (IST); failed runs may retry; _already_sent_today() uses AT TIME ZONE SQL to convert run_at UTC→IST date; _load_active_alerts() reads schedule_time column
 - [x] Project structure created
 - [x] etl_stocks core logic (`process.py`, `run_local.py`)
 - [x] etl_stocks Lambda handler — S3 trigger, rates lookup, processed upload, source archive, DB upsert (`snapshot_stock`), `ETLStocksSuccess` event
@@ -667,7 +685,9 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ## What Is Next (build in this order)
 
 - [ ] **IaC: migration 013** — create `alerts`, `alert_conditions`, `alert_recipients`, `alert_runs` tables with correct FK + cascade rules. Apply via psql/SSM before deploying the alerts_evaluator Lambda or using the /alerts API.
-- [ ] **IaC: alerts_evaluator Lambda Terraform** — `lambda_alerts_evaluator.tf`: source_dir = `lambda/alerts_evaluator`, runtime python3.12, `DB_SECRET_ARN` + `ALERTS_SENDER_EMAIL` env vars, IAM for Secrets Manager + SES `ses:SendEmail`, EventBridge rule cron(30 5 * * ? *) (11:00 IST = 05:30 UTC). Layer: psycopg2-binary 2.9.9. Add layer build step in `terraform.yml`.
+- [ ] **IaC: migration 014** — `ALTER TABLE alerts ADD COLUMN IF NOT EXISTS schedule_time TIME NOT NULL DEFAULT '11:00';` Must be applied via psql/SSM BEFORE deploying the updated api and alerts_evaluator Lambdas (both now SELECT schedule_time). Push business-core first, then run migration, then terraform apply.
+- [ ] **IaC: alerts_evaluator EventBridge rule** — change from `cron(30 5 * * ? *)` (daily 11:00 IST) to `rate(15 minutes)` in `lambda_alerts_evaluator.tf`. The per-alert schedule_time + alert_runs deduplication logic in the Lambda handles once-per-day semantics.
+- [ ] **IaC: alerts_evaluator Lambda Terraform** — `lambda_alerts_evaluator.tf`: source_dir = `lambda/alerts_evaluator`, runtime python3.12, `DB_SECRET_ARN` + `ALERTS_SENDER_EMAIL` env vars, IAM for Secrets Manager + SES `ses:SendEmail`, EventBridge rule **rate(15 minutes)** (was cron daily — changed for per-alert schedule_time support). Layer: psycopg2-binary 2.9.9. Add layer build step in `terraform.yml`.
 - [ ] **IaC: API Gateway routes for /alerts** — add `GET /alerts`, `GET /alerts/fields`, `POST /alerts`, `GET /alerts/{id}`, `PUT /alerts/{id}`, `DELETE /alerts/{id}`, `POST /alerts/{id}/test` routes + CORS in `lambda_api.tf`.
 - [ ] **SES sender verification** — verify `ALERTS_SENDER_EMAIL` in AWS SES console (or move SES out of sandbox for production sending). Manual step.
 - [ ] **Copy alerts_eval.py on every change** — whenever `lambda/api/alerts_eval.py` is updated, the copy at `lambda/alerts_evaluator/alerts_eval.py` must be kept in sync (cp command).
