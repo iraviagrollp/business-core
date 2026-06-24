@@ -8,6 +8,7 @@ import psycopg2
 import redis
 
 import auth
+import alerts_eval
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,6 +60,13 @@ def lambda_handler(event, context):
     if path.startswith('/auth/') or path.startswith('/admin/'):
         try:
             return _route_auth_admin(event, method, path)
+        except auth.AuthError as exc:
+            return _response(exc.status, {'error': exc.message})
+
+    # Alerts — admin-only CRUD + field catalog + test endpoint.
+    if path.startswith('/alerts'):
+        try:
+            return _route_alerts(event, method, path)
         except auth.AuthError as exc:
             return _response(exc.status, {'error': exc.message})
 
@@ -1649,6 +1657,325 @@ def _handle_admin_delete_user(event, user_id_raw):
     finally:
         conn.close()
     return _response(200, {'deleted': user_id})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALERTS — admin-only CRUD + field catalog + test endpoint
+#
+# All routes here require a valid admin session (recomputed from DB via
+# _require_admin).  Any AuthError propagates to the caller and is mapped to
+# the appropriate HTTP status.
+#
+# Tables (created by IaC migration 013):
+#   alerts(id, name, category, frequency, schedule_day, match_type,
+#          is_active, created_by, created_at, updated_at)
+#   alert_conditions(id, alert_id, field, op, value, value2)
+#   alert_recipients(id, alert_id, channel, address)
+#   alert_runs(id, alert_id, run_at, matched, status, error)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _route_alerts(event, method, path):
+    """Router for /alerts* — every branch verifies admin credentials."""
+
+    # GET /alerts/fields?category=balances  (field catalog — no {id})
+    if path == '/alerts/fields' and method == 'GET':
+        return _handle_alerts_fields(event)
+
+    # Collection routes: GET /alerts, POST /alerts
+    if path == '/alerts':
+        if method == 'GET':
+            return _handle_alerts_list(event)
+        if method == 'POST':
+            return _handle_alerts_create(event)
+        return _response(405, {'error': 'Method not allowed'})
+
+    # Instance routes: /alerts/{id} and /alerts/{id}/test
+    # Detect sub-path by splitting off the /alerts/ prefix.
+    remainder = path[len('/alerts/'):]  # e.g. "42" or "42/test"
+    parts = remainder.split('/', 1)
+    try:
+        alert_id = int(parts[0])
+    except (ValueError, IndexError):
+        return _response(404, {'error': 'Not found'})
+
+    if len(parts) == 1:
+        # /alerts/{id}
+        if method == 'GET':
+            return _handle_alert_get(event, alert_id)
+        if method == 'PUT':
+            return _handle_alerts_update(event, alert_id)
+        if method == 'DELETE':
+            return _handle_alerts_delete(event, alert_id)
+        return _response(405, {'error': 'Method not allowed'})
+
+    if len(parts) == 2 and parts[1] == 'test' and method == 'POST':
+        return _handle_alerts_test(event, alert_id)
+
+    return _response(404, {'error': 'Not found'})
+
+
+def _alert_row_to_dict(row: tuple) -> dict:
+    """Convert a raw SELECT row from the `alerts` table to a dict.
+
+    Expected column order (must match every query below):
+      id, name, category, frequency, schedule_day, match_type,
+      is_active, created_by, created_at, updated_at
+    """
+    (alert_id, name, category, frequency, schedule_day, match_type,
+     is_active, created_by, created_at, updated_at) = row
+    return {
+        'id':           alert_id,
+        'name':         name,
+        'category':     category,
+        'frequency':    frequency,
+        'schedule_day': schedule_day,
+        'match_type':   match_type,
+        'is_active':    is_active,
+        'created_by':   created_by,
+        'created_at':   created_at.isoformat() if created_at else None,
+        'updated_at':   updated_at.isoformat() if updated_at else None,
+    }
+
+
+_ALERT_SELECT = """
+    SELECT id, name, category, frequency, schedule_day, match_type,
+           is_active, created_by, created_at, updated_at
+    FROM alerts
+"""
+
+
+def _fetch_alert_with_children(cur, alert_id: int) -> dict | None:
+    """Fetch one alert row plus its conditions and recipients.  Returns None if not found."""
+    cur.execute(_ALERT_SELECT + " WHERE id = %s", (alert_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    alert = _alert_row_to_dict(row)
+    cur.execute("""
+        SELECT id, field, op, value, value2
+        FROM alert_conditions WHERE alert_id = %s ORDER BY id
+    """, (alert_id,))
+    conditions = []
+    for (cid, field, op, value, value2) in cur.fetchall():
+        conditions.append({
+            'id':     cid,
+            'field':  field,
+            'op':     op,
+            'value':  float(value),
+            'value2': float(value2) if value2 is not None else None,
+        })
+    cur.execute("""
+        SELECT id, channel, address
+        FROM alert_recipients WHERE alert_id = %s ORDER BY id
+    """, (alert_id,))
+    recipients = [
+        address
+        for (_rid, _channel, address) in cur.fetchall()
+    ]
+    alert['conditions'] = conditions
+    alert['recipients'] = recipients
+    return alert
+
+
+def _insert_alert_children(cur, alert_id: int, conditions: list, recipients: list):
+    """Insert condition and recipient rows for an alert (used on create and replace)."""
+    for cond in conditions:
+        cur.execute("""
+            INSERT INTO alert_conditions (alert_id, field, op, value, value2)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            alert_id,
+            cond['field'],
+            cond['op'],
+            float(cond['value']),
+            float(cond['value2']) if cond.get('value2') is not None else None,
+        ))
+    for email in recipients:
+        cur.execute("""
+            INSERT INTO alert_recipients (alert_id, channel, address)
+            VALUES (%s, 'email', %s)
+        """, (alert_id, email.strip()))
+
+
+def _handle_alerts_fields(event):
+    """GET /alerts/fields?category=balances — data-driven field catalog (admin-only)."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+    finally:
+        conn.close()
+    return _response(200, alerts_eval.FIELD_CATALOG)
+
+
+def _handle_alerts_list(event):
+    """GET /alerts — list all alerts with nested conditions and recipients."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute(_ALERT_SELECT + " ORDER BY id")
+            alert_rows = cur.fetchall()
+            alerts = []
+            for row in alert_rows:
+                alert = _alert_row_to_dict(row)
+                cur.execute("""
+                    SELECT id, field, op, value, value2
+                    FROM alert_conditions WHERE alert_id = %s ORDER BY id
+                """, (alert['id'],))
+                alert['conditions'] = [
+                    {'id': cid, 'field': f, 'op': op,
+                     'value': float(v), 'value2': float(v2) if v2 is not None else None}
+                    for cid, f, op, v, v2 in cur.fetchall()
+                ]
+                cur.execute("""
+                    SELECT id, channel, address
+                    FROM alert_recipients WHERE alert_id = %s ORDER BY id
+                """, (alert['id'],))
+                alert['recipients'] = [
+                    addr
+                    for (_rid, _ch, addr) in cur.fetchall()
+                ]
+                alerts.append(alert)
+    finally:
+        conn.close()
+    return _response(200, alerts)
+
+
+def _handle_alert_get(event, alert_id: int):
+    """GET /alerts/{id} — single alert with conditions and recipients."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            alert = _fetch_alert_with_children(cur, alert_id)
+    finally:
+        conn.close()
+    if alert is None:
+        return _response(404, {'error': 'Alert not found'})
+    return _response(200, alert)
+
+
+def _handle_alerts_create(event):
+    """POST /alerts — create alert + conditions + recipients in a transaction."""
+    body = _json_body(event)
+    try:
+        alerts_eval.validate_alert(body)
+    except alerts_eval.ValidationError as exc:
+        return _response(400, {'error': str(exc)})
+
+    name         = body['name'].strip()
+    category     = body.get('category', 'balances')
+    frequency    = body['frequency']
+    schedule_day = body.get('schedule_day')
+    match_type   = body['match_type']
+    is_active    = bool(body.get('is_active', True))
+    conditions   = body['conditions']
+    recipients   = body['recipients']
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            admin = _require_admin(event, cur)
+            cur.execute("""
+                INSERT INTO alerts
+                    (name, category, frequency, schedule_day, match_type,
+                     is_active, created_by, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id
+            """, (name, category, frequency, schedule_day, match_type,
+                  is_active, admin['username']))
+            alert_id = cur.fetchone()[0]
+            _insert_alert_children(cur, alert_id, conditions, recipients)
+            conn.commit()
+            alert = _fetch_alert_with_children(cur, alert_id)
+    finally:
+        conn.close()
+    return _response(201, alert)
+
+
+def _handle_alerts_update(event, alert_id: int):
+    """PUT /alerts/{id} — update alert + replace conditions/recipients."""
+    body = _json_body(event)
+    try:
+        alerts_eval.validate_alert(body)
+    except alerts_eval.ValidationError as exc:
+        return _response(400, {'error': str(exc)})
+
+    name         = body['name'].strip()
+    category     = body.get('category', 'balances')
+    frequency    = body['frequency']
+    schedule_day = body.get('schedule_day')
+    match_type   = body['match_type']
+    is_active    = bool(body.get('is_active', True))
+    conditions   = body['conditions']
+    recipients   = body['recipients']
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT id FROM alerts WHERE id = %s', (alert_id,))
+            if not cur.fetchone():
+                return _response(404, {'error': 'Alert not found'})
+
+            cur.execute("""
+                UPDATE alerts
+                SET name=%s, category=%s, frequency=%s, schedule_day=%s,
+                    match_type=%s, is_active=%s, updated_at=NOW()
+                WHERE id=%s
+            """, (name, category, frequency, schedule_day, match_type,
+                  is_active, alert_id))
+
+            # Replace child rows
+            cur.execute('DELETE FROM alert_conditions WHERE alert_id = %s', (alert_id,))
+            cur.execute('DELETE FROM alert_recipients WHERE alert_id = %s', (alert_id,))
+            _insert_alert_children(cur, alert_id, conditions, recipients)
+            conn.commit()
+            alert = _fetch_alert_with_children(cur, alert_id)
+    finally:
+        conn.close()
+    return _response(200, alert)
+
+
+def _handle_alerts_delete(event, alert_id: int):
+    """DELETE /alerts/{id} — delete alert (cascade removes conditions + recipients)."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute('SELECT id FROM alerts WHERE id = %s', (alert_id,))
+            if not cur.fetchone():
+                return _response(404, {'error': 'Alert not found'})
+            cur.execute('DELETE FROM alerts WHERE id = %s', (alert_id,))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'deleted': alert_id})
+
+
+def _handle_alerts_test(event, alert_id: int):
+    """POST /alerts/{id}/test — dry-run: evaluate alert conditions NOW, return matches (no email sent)."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            alert = _fetch_alert_with_children(cur, alert_id)
+        if alert is None:
+            return _response(404, {'error': 'Alert not found'})
+
+        from datetime import date as _date
+        matched = alerts_eval.evaluate_balances(
+            conn,
+            conditions=alert['conditions'],
+            match_type=alert['match_type'],
+            today=_date.today(),
+        )
+    finally:
+        conn.close()
+
+    sample = matched[:20]
+    return _response(200, {'matched': len(matched), 'sample': sample})
 
 
 def _response(status: int, body) -> dict:

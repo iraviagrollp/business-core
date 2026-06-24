@@ -65,12 +65,15 @@ business-core/
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
     │   ├── handler.py
     │   └── requirements.txt
-    └── api/                  ← API: dashboard reads + POST /notify + RBAC auth/admin
-        ├── handler.py        ← routing, data endpoints, /auth/* + /admin/* handlers
-        ├── auth.py           ← PBKDF2 password hashing + HS256 JWT (stdlib only)
-        └── requirements.txt
-        ├── handler.py
-        └── requirements.txt
+    ├── api/                  ← API: dashboard reads + POST /notify + RBAC auth/admin + alerts admin API [COMPLETE]
+    │   ├── handler.py        ← routing, data endpoints, /auth/* + /admin/* + /alerts/* handlers
+    │   ├── auth.py           ← PBKDF2 password hashing + HS256 JWT (stdlib only)
+    │   ├── alerts_eval.py    ← SHARED: balances evaluation + FIFO aging + field catalog + validation
+    │   └── requirements.txt
+    └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
+        ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
+        ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
+        └── requirements.txt  ← psycopg2-binary==2.9.9 (boto3 from runtime)
 ```
 
 ---
@@ -113,6 +116,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_appendix_b_x11_sale_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
+| alerts_evaluator | Python 3.12 | psycopg2-binary (boto3/ses from runtime) |
 
 ---
 
@@ -128,6 +132,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | `REDIS_HOST` | Terraform | redis_updater, api |
 | `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
 | `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | Terraform | api (first-login admin bootstrap) |
+| `ALERTS_SENDER_EMAIL` | Terraform | alerts_evaluator (verified SES sender address, e.g. alerts@iravi.in) |
 
 ---
 
@@ -480,6 +485,116 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ---
 
+## alerts — Scheduled Balance Alerts (admin-only)
+
+**Status: complete (API + evaluator Lambda)**
+
+### Database tables (created by IaC migration 013)
+
+| Table | Key columns |
+|---|---|
+| `alerts` | `id, name, category, frequency, schedule_day, match_type, is_active, created_by, created_at, updated_at` |
+| `alert_conditions` | `id, alert_id, field, op, value, value2` |
+| `alert_recipients` | `id, alert_id, channel, address` |
+| `alert_runs` | `id, alert_id, run_at, matched, status, error` |
+
+### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/alerts/fields?category=balances` | Field catalog (data-driven) |
+| `GET` | `/alerts` | List alerts with nested `conditions[]` and `recipients[]` |
+| `POST` | `/alerts` | Create alert + children in a transaction |
+| `GET` | `/alerts/{id}` | Single alert |
+| `PUT` | `/alerts/{id}` | Replace alert + conditions + recipients |
+| `DELETE` | `/alerts/{id}` | Delete (cascade) |
+| `POST` | `/alerts/{id}/test` | Dry-run evaluate NOW; returns `{matched, sample}` |
+
+All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-admins with 403).
+
+### Field catalog (`GET /alerts/fields`)
+```json
+{"category":"balances",
+ "fields":[{"key":"amount","label":"Outstanding amount (₹)","type":"currency","ops":["gt","gte","lt","lte","between"]},
+           {"key":"age_days","label":"Age (days)","type":"integer","ops":["gt","gte","lt","lte","between"]}],
+ "match_types":["all","any"],
+ "frequencies":["daily","weekly","monthly"]}
+```
+
+### Request body (POST /alerts, PUT /alerts/{id})
+```jsonc
+{
+  "name": "Overdue > 45 days",
+  "category": "balances",
+  "frequency": "weekly",       // daily | weekly | monthly
+  "schedule_day": 0,           // null for daily; 0-6 (Mon-Sun) for weekly; 1-28 for monthly
+  "match_type": "all",         // all (AND) | any (OR)
+  "is_active": true,
+  "conditions": [
+    {"field": "age_days", "op": "gt", "value": 45, "value2": null}
+  ],
+  "recipients": ["admin@iravi.in"]
+}
+```
+
+### Response shape (GET /alerts, GET /alerts/{id}, POST /alerts, PUT /alerts/{id})
+`recipients` is a **flat array of email-address strings** — NOT objects.
+```jsonc
+{
+  "id": 1,
+  "name": "Overdue > 45 days",
+  "category": "balances",
+  "frequency": "weekly",
+  "schedule_day": 0,
+  "match_type": "all",
+  "is_active": true,
+  "created_by": "admin",
+  "created_at": "2026-06-20T10:00:00",
+  "updated_at": "2026-06-20T10:00:00",
+  "conditions": [
+    {"id": 1, "field": "age_days", "op": "gt", "value": 45.0, "value2": null}
+  ],
+  "recipients": ["admin@iravi.in", "ops@iravi.in"]
+}
+```
+The list endpoint (`GET /alerts`) returns an array of objects with the same shape.
+`conditions` objects still include the `id` field (the UI ignores the extra field and this is acceptable).
+
+### Shared balances evaluation (`lambda/api/alerts_eval.py`)
+
+The evaluation module is imported by both the API Lambda and the evaluator Lambda.
+Because each Lambda is a separate package, `alerts_eval.py` is physically present in both
+`lambda/api/` and `lambda/alerts_evaluator/`. The logic is maintained in ONE source file
+(`lambda/api/alerts_eval.py`); `lambda/alerts_evaluator/alerts_eval.py` is a copy that must
+be kept in sync whenever the source changes.
+
+**Evaluation logic per customer (from `customer_ledger`, `out_z IS NULL`, non-IRAVI):**
+
+- `outstanding` = SUM(Db amounts) - SUM(Cr amounts). Customer excluded if outstanding <= 0.
+- `age_days` = FIFO aging: apply total credits to oldest debits first; age = (today - oldest still-unpaid debit date) in days. Customer excluded if FIFO fully covers all debits.
+- `last_receipt_amount` / `last_receipt_date` = most recent credit with `sub_category IN ('Bank Receipt','Cash Receipt')`; NULL if none.
+- NULL last_receipt does NOT exclude the customer — age and amount conditions are independent.
+- Customers are joined to `customer_details` for `city` and `customer_code`.
+- Returned per matched customer: `{customer_name, city, code, outstanding, age_days, last_receipt_amount, last_receipt_date}`.
+- Output sorted by `outstanding` descending.
+
+**Condition ops:** `gt, gte, lt, lte, eq, between` (`value2` required iff op=`between`).
+**match_type:** `all` = AND across all conditions; `any` = OR.
+
+### alerts_evaluator Lambda (`lambda/alerts_evaluator/handler.py`)
+
+- Entry: `lambda_handler(event, context)`.
+- Trigger: EventBridge cron daily at 11:00 IST (05:30 UTC) — schedule owned by IaC.
+- Due-today logic:
+  - `daily` → always
+  - `weekly` → `today.weekday() == schedule_day` (0=Mon, 6=Sun)
+  - `monthly` → `today.day == schedule_day` (1-28)
+- IST date = UTC now + 5h30m.
+- For each due alert: runs `evaluate_balances`; if ≥1 match → sends HTML table email via `boto3.client('ses').send_email` from `ALERTS_SENDER_EMAIL` to all recipients. Writes `alert_runs` row (`status`: `sent` | `no_match` | `failed`). One alert failing does NOT abort others.
+- Email columns: Customer · City · Code · Outstanding (₹) · Age (days) · Last Receipt Amount · Last Receipt Date.
+
+---
+
 ## auth — RBAC (login + admin management)
 
 **Status: complete (phase 1).** New module `auth.py` (standard library only — no new layer deps):
@@ -506,6 +621,10 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] alerts API endpoints (GET/POST/PUT/DELETE /alerts, GET /alerts/{id}, GET /alerts/fields, POST /alerts/{id}/test) in lambda/api/handler.py — all admin-only via _require_admin()
+- [x] alerts response contract fix (2026-06-24) — `recipients` in all alert responses (`GET /alerts`, `GET /alerts/{id}`, `POST /alerts`, `PUT /alerts/{id}`) is now a flat array of email-address strings `["a@x.com"]` instead of objects `[{id, channel, address}]`; both serialization sites fixed (`_fetch_alert_with_children` and `_handle_alerts_list`); `_insert_alert_children` request handling unchanged
+- [x] alerts_eval.py shared module (lambda/api/alerts_eval.py + copy in lambda/alerts_evaluator/alerts_eval.py) — FIFO aging, condition matching, field catalog, validate_alert(), is_alert_due_today()
+- [x] alerts_evaluator Lambda (lambda/alerts_evaluator/handler.py + requirements.txt) — EventBridge-triggered nightly evaluator: load due alerts → evaluate balances → send SES HTML email → write alert_runs; one alert failing does not abort others
 - [x] Project structure created
 - [x] etl_stocks core logic (`process.py`, `run_local.py`)
 - [x] etl_stocks Lambda handler — S3 trigger, rates lookup, processed upload, source archive, DB upsert (`snapshot_stock`), `ETLStocksSuccess` event
@@ -547,6 +666,11 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: migration 013** — create `alerts`, `alert_conditions`, `alert_recipients`, `alert_runs` tables with correct FK + cascade rules. Apply via psql/SSM before deploying the alerts_evaluator Lambda or using the /alerts API.
+- [ ] **IaC: alerts_evaluator Lambda Terraform** — `lambda_alerts_evaluator.tf`: source_dir = `lambda/alerts_evaluator`, runtime python3.12, `DB_SECRET_ARN` + `ALERTS_SENDER_EMAIL` env vars, IAM for Secrets Manager + SES `ses:SendEmail`, EventBridge rule cron(30 5 * * ? *) (11:00 IST = 05:30 UTC). Layer: psycopg2-binary 2.9.9. Add layer build step in `terraform.yml`.
+- [ ] **IaC: API Gateway routes for /alerts** — add `GET /alerts`, `GET /alerts/fields`, `POST /alerts`, `GET /alerts/{id}`, `PUT /alerts/{id}`, `DELETE /alerts/{id}`, `POST /alerts/{id}/test` routes + CORS in `lambda_api.tf`.
+- [ ] **SES sender verification** — verify `ALERTS_SENDER_EMAIL` in AWS SES console (or move SES out of sandbox for production sending). Manual step.
+- [ ] **Copy alerts_eval.py on every change** — whenever `lambda/api/alerts_eval.py` is updated, the copy at `lambda/alerts_evaluator/alerts_eval.py` must be kept in sync (cp command).
 - [ ] **Apply IaC migration 011** — `customer_code VARCHAR(20)` column on `customer_details`; must be applied via psql/SSM before deploying the updated `etl_customer_accounts` Lambda; re-running the ETL on the existing file will backfill codes for all existing rows
 - [ ] **Flush report cache after deploy** — `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` AND `iravi:ledger:statement:*` entries; required after the `code` field was added, after the `credit_notes` split (2026-06-23), and after the per-voucher netting fix (2026-06-23); no re-ingest needed
 - [ ] **IaC slice for `/reports/customer-balances-fy`** — add API Gateway route `GET /reports/customer-balances-fy` + CORS allow-method in `lambda_api.tf` (iravi-dashboard-iac)
