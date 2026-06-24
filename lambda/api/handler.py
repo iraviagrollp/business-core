@@ -1718,27 +1718,42 @@ def _alert_row_to_dict(row: tuple) -> dict:
     """Convert a raw SELECT row from the `alerts` table to a dict.
 
     Expected column order (must match every query below):
-      id, name, category, frequency, schedule_day, match_type,
+      id, name, category, frequency, schedule_day, schedule_time, match_type,
       is_active, created_by, created_at, updated_at
     """
-    (alert_id, name, category, frequency, schedule_day, match_type,
+    (alert_id, name, category, frequency, schedule_day, schedule_time, match_type,
      is_active, created_by, created_at, updated_at) = row
+    # schedule_time is stored as a TIME column; psycopg2 returns it as a timedelta
+    # (seconds since midnight) or a datetime.time object depending on driver version.
+    # Normalise to "HH:MM" string.
+    if schedule_time is None:
+        st_str = alerts_eval._DEFAULT_SCHEDULE_TIME
+    elif hasattr(schedule_time, 'hour'):
+        # datetime.time object
+        st_str = f"{schedule_time.hour:02d}:{schedule_time.minute:02d}"
+    else:
+        # timedelta (psycopg2 returns timedelta for TIME WITHOUT TIME ZONE)
+        total_seconds = int(schedule_time.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        st_str = f"{hours:02d}:{minutes:02d}"
     return {
-        'id':           alert_id,
-        'name':         name,
-        'category':     category,
-        'frequency':    frequency,
-        'schedule_day': schedule_day,
-        'match_type':   match_type,
-        'is_active':    is_active,
-        'created_by':   created_by,
-        'created_at':   created_at.isoformat() if created_at else None,
-        'updated_at':   updated_at.isoformat() if updated_at else None,
+        'id':            alert_id,
+        'name':          name,
+        'category':      category,
+        'frequency':     frequency,
+        'schedule_day':  schedule_day,
+        'schedule_time': st_str,
+        'match_type':    match_type,
+        'is_active':     is_active,
+        'created_by':    created_by,
+        'created_at':    created_at.isoformat() if created_at else None,
+        'updated_at':    updated_at.isoformat() if updated_at else None,
     }
 
 
 _ALERT_SELECT = """
-    SELECT id, name, category, frequency, schedule_day, match_type,
+    SELECT id, name, category, frequency, schedule_day, schedule_time, match_type,
            is_active, created_by, created_at, updated_at
     FROM alerts
 """
@@ -1864,14 +1879,15 @@ def _handle_alerts_create(event):
     except alerts_eval.ValidationError as exc:
         return _response(400, {'error': str(exc)})
 
-    name         = body['name'].strip()
-    category     = body.get('category', 'balances')
-    frequency    = body['frequency']
-    schedule_day = body.get('schedule_day')
-    match_type   = body['match_type']
-    is_active    = bool(body.get('is_active', True))
-    conditions   = body['conditions']
-    recipients   = body['recipients']
+    name          = body['name'].strip()
+    category      = body.get('category', 'balances')
+    frequency     = body['frequency']
+    schedule_day  = body.get('schedule_day')
+    schedule_time = body.get('schedule_time') or alerts_eval._DEFAULT_SCHEDULE_TIME
+    match_type    = body['match_type']
+    is_active     = bool(body.get('is_active', True))
+    conditions    = body['conditions']
+    recipients    = body['recipients']
 
     conn = _get_db_conn()
     try:
@@ -1879,11 +1895,11 @@ def _handle_alerts_create(event):
             admin = _require_admin(event, cur)
             cur.execute("""
                 INSERT INTO alerts
-                    (name, category, frequency, schedule_day, match_type,
+                    (name, category, frequency, schedule_day, schedule_time, match_type,
                      is_active, created_by, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s::TIME, %s, %s, %s, NOW(), NOW())
                 RETURNING id
-            """, (name, category, frequency, schedule_day, match_type,
+            """, (name, category, frequency, schedule_day, schedule_time, match_type,
                   is_active, admin['username']))
             alert_id = cur.fetchone()[0]
             _insert_alert_children(cur, alert_id, conditions, recipients)
@@ -1902,14 +1918,15 @@ def _handle_alerts_update(event, alert_id: int):
     except alerts_eval.ValidationError as exc:
         return _response(400, {'error': str(exc)})
 
-    name         = body['name'].strip()
-    category     = body.get('category', 'balances')
-    frequency    = body['frequency']
-    schedule_day = body.get('schedule_day')
-    match_type   = body['match_type']
-    is_active    = bool(body.get('is_active', True))
-    conditions   = body['conditions']
-    recipients   = body['recipients']
+    name          = body['name'].strip()
+    category      = body.get('category', 'balances')
+    frequency     = body['frequency']
+    schedule_day  = body.get('schedule_day')
+    schedule_time = body.get('schedule_time') or alerts_eval._DEFAULT_SCHEDULE_TIME
+    match_type    = body['match_type']
+    is_active     = bool(body.get('is_active', True))
+    conditions    = body['conditions']
+    recipients    = body['recipients']
 
     conn = _get_db_conn()
     try:
@@ -1922,9 +1939,9 @@ def _handle_alerts_update(event, alert_id: int):
             cur.execute("""
                 UPDATE alerts
                 SET name=%s, category=%s, frequency=%s, schedule_day=%s,
-                    match_type=%s, is_active=%s, updated_at=NOW()
+                    schedule_time=%s::TIME, match_type=%s, is_active=%s, updated_at=NOW()
                 WHERE id=%s
-            """, (name, category, frequency, schedule_day, match_type,
+            """, (name, category, frequency, schedule_day, schedule_time, match_type,
                   is_active, alert_id))
 
             # Replace child rows
