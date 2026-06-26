@@ -485,39 +485,53 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 ---
 
-## alerts — Scheduled Balance Alerts (admin-only)
+## alerts — Scheduled Alerts (admin-only)
 
-**Status: complete (API + evaluator Lambda)**
+**Status: complete (API + evaluator Lambda). Migration 015 adds `branch` column.**
 
-### Database tables (created by IaC migration 013; migration 014 adds schedule_time)
+### Database tables (created by IaC migration 013; migration 014 adds schedule_time; migration 015 adds branch)
 
 | Table | Key columns |
 |---|---|
-| `alerts` | `id, name, category, frequency, schedule_day, schedule_time, match_type, is_active, created_by, created_at, updated_at` |
+| `alerts` | `id, name, category, frequency, schedule_day, schedule_time, match_type, is_active, created_by, created_at, updated_at, branch` |
 | `alert_conditions` | `id, alert_id, field, op, value, value2` |
 | `alert_recipients` | `id, alert_id, channel, address` |
 | `alert_runs` | `id, alert_id, run_at, matched, status, error` |
 
-**Migration 014** (IaC — apply manually via psql/SSM before deploying):
+**Migration 014** (apply manually via psql/SSM):
 ```sql
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS schedule_time TIME NOT NULL DEFAULT '11:00';
 ```
+**Migration 015** (apply manually via psql/SSM before deploying this version):
+```sql
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);
+```
+
+### Alert categories
+
+| Category | Description | Branch scoped? |
+|---|---|---|
+| `balances` | Per-customer outstanding balance evaluation (FIFO aging) | No |
+| `sales` | Aggregate net customer sales over time windows | Yes |
+| `sale_returns` | Aggregate customer sale returns over time windows | Yes |
 
 ### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/alerts/fields?category=balances` | Field catalog (data-driven) |
+| `GET` | `/alerts/fields?category=<cat>` | Field catalog for a category (balances/sales/sale_returns) |
 | `GET` | `/alerts` | List alerts with nested `conditions[]` and `recipients[]` |
 | `POST` | `/alerts` | Create alert + children in a transaction |
 | `GET` | `/alerts/{id}` | Single alert |
 | `PUT` | `/alerts/{id}` | Replace alert + conditions + recipients |
 | `DELETE` | `/alerts/{id}` | Delete (cascade) |
-| `POST` | `/alerts/{id}/test` | Dry-run evaluate NOW; returns `{matched, sample}` |
+| `POST` | `/alerts/{id}/test` | Dry-run evaluate NOW; response shape differs by category |
 
 All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-admins with 403).
 
-### Field catalog (`GET /alerts/fields`)
+### Field catalogs (`GET /alerts/fields?category=`)
+
+**`?category=balances`** (unchanged):
 ```json
 {"category":"balances",
  "fields":[{"key":"amount","label":"Outstanding amount (₹)","type":"currency","ops":["gt","gte","lt","lte","between"]},
@@ -527,25 +541,69 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
  "frequencies":["daily","weekly","monthly"]}
 ```
 
-**`days_since_last_receipt` semantics:**
-- Value = (today − last_receipt_date) in days, where last_receipt = most recent Bank/Cash Receipt credit.
-- If the customer has NEVER received a receipt (`last_receipt_date` is NULL), `days_since_last_receipt` is set to `10**9` (sentinel for "effectively infinite"), so any `> threshold` rule flags "never paid" customers.
-- NULL last_receipt does NOT exclude the customer from evaluation — `outstanding` and `age_days` conditions are independent.
+**`?category=sales`**:
+```json
+{"category":"sales",
+ "fields":[
+   {"key":"net_sales_prev_day",     "label":"Net customer sales — previous day (₹)",             "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_prev_week",    "label":"Net customer sales — previous week (₹)",             "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_last_month",   "label":"Net customer sales — last month (₹)",               "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_prev_quarter", "label":"Net customer sales — previous fiscal quarter (₹)",  "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_fy",           "label":"Net customer sales — FY to date (₹)",               "type":"currency","ops":["gt","gte","lt","lte","eq","between"]}
+ ],
+ "match_types":["all","any"],
+ "frequencies":["daily","weekly","monthly"],
+ "branch_scoped":true}
+```
+
+**`?category=sale_returns`** (parallel to `sales`, labels "Customer sale returns — …"):
+- Keys: `sale_returns_prev_day`, `sale_returns_prev_week`, `sale_returns_last_month`, `sale_returns_prev_quarter`, `sale_returns_fy`
+- Same type/ops/match_types/frequencies/branch_scoped structure as `sales`.
+
+### Time windows (IST, relative to run_date = today)
+
+| Window key | Date range |
+|---|---|
+| `prev_day` | yesterday |
+| `prev_week` | Mon–Sun of the completed calendar week immediately before the current week |
+| `last_month` | 1st–last of the previous calendar month |
+| `prev_quarter` | Previous fiscal quarter (FY Apr–Mar: Q1=Apr–Jun, Q2=Jul–Sep, Q3=Oct–Dec, Q4=Jan–Mar) |
+| `fy` | April 1 of the current FY through yesterday (empty range if run_date is April 1) |
+
+### Metric definition — sales and sale_returns categories
+
+Source table: `sales`, `out_z IS NULL`.
+Customer restriction: `UPPER(party) IN (SELECT UPPER(customer_name) FROM customer_details) AND party NOT ILIKE '%iravi%'`
+Branch restriction: if `alert.branch` is set and not `'ALL'`/NULL, adds `AND branch = <alert.branch>`.
+Money column: `av`.
+
+- `sales` metric for a window = `SUM(av WHERE sales_return='N') − SUM(av WHERE sales_return='Y')` (rounded to 2 dp)
+- `sale_returns` metric for a window = `SUM(av WHERE sales_return='Y')` (rounded to 2 dp)
+- NULL sums treated as 0.
+
+This matches the Overview's net-sales calculation.
+
+### alerts.branch column (migration 015)
+
+`branch VARCHAR(100)`, nullable. Accept/return `branch` in all alert CRUD endpoints.
+- `sales`/`sale_returns`: branch filters the metric query. NULL or `'ALL'` = all branches.
+- `balances`: branch accepted and stored but ignored in evaluation.
 
 ### Request body (POST /alerts, PUT /alerts/{id})
 ```jsonc
 {
-  "name": "Overdue > 45 days",
-  "category": "balances",
-  "frequency": "weekly",       // daily | weekly | monthly
-  "schedule_day": 0,           // null for daily; 0-6 (Mon-Sun) for weekly; 1-28 for monthly
-  "schedule_time": "14:30",    // optional HH:MM 24h string; defaults to "11:00" if omitted on create
-  "match_type": "all",         // all (AND) | any (OR)
+  "name": "Daily Net Sales Check",
+  "category": "sales",          // balances | sales | sale_returns
+  "frequency": "daily",
+  "schedule_day": null,
+  "schedule_time": "08:00",
+  "match_type": "all",
   "is_active": true,
+  "branch": "RAJAHMUNDRY",      // optional; null/'ALL' = all branches
   "conditions": [
-    {"field": "age_days", "op": "gt", "value": 45, "value2": null}
+    {"field": "net_sales_prev_day", "op": "lt", "value": 50000, "value2": null}
   ],
-  "recipients": ["admin@iravi.in"]
+  "recipients": ["ops@iravi.in"]
 }
 ```
 
@@ -554,59 +612,91 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 ```jsonc
 {
   "id": 1,
-  "name": "Overdue > 45 days",
-  "category": "balances",
-  "frequency": "weekly",
-  "schedule_day": 0,
-  "schedule_time": "14:30",
+  "name": "Daily Net Sales Check",
+  "category": "sales",
+  "frequency": "daily",
+  "schedule_day": null,
+  "schedule_time": "08:00",
   "match_type": "all",
   "is_active": true,
   "created_by": "admin",
-  "created_at": "2026-06-20T10:00:00",
-  "updated_at": "2026-06-20T10:00:00",
+  "created_at": "2026-06-26T10:00:00",
+  "updated_at": "2026-06-26T10:00:00",
+  "branch": "RAJAHMUNDRY",
   "conditions": [
-    {"id": 1, "field": "age_days", "op": "gt", "value": 45.0, "value2": null}
+    {"id": 1, "field": "net_sales_prev_day", "op": "lt", "value": 50000.0, "value2": null}
   ],
-  "recipients": ["admin@iravi.in", "ops@iravi.in"]
+  "recipients": ["ops@iravi.in"]
 }
 ```
-The list endpoint (`GET /alerts`) returns an array of objects with the same shape.
-`conditions` objects still include the `id` field (the UI ignores the extra field and this is acceptable).
 
-### Shared balances evaluation (`lambda/api/alerts_eval.py`)
+### POST /alerts/{id}/test — response shapes
 
-The evaluation module is imported by both the API Lambda and the evaluator Lambda.
-Because each Lambda is a separate package, `alerts_eval.py` is physically present in both
-`lambda/api/` and `lambda/alerts_evaluator/`. The logic is maintained in ONE source file
-(`lambda/api/alerts_eval.py`); `lambda/alerts_evaluator/alerts_eval.py` is a copy that must
-be kept in sync whenever the source changes.
+**`balances` category (unchanged):**
+```json
+{"matched": 3, "sample": [{...customer dict...}]}
+```
 
-**Evaluation logic per customer (from `customer_ledger`, `out_z IS NULL`, non-IRAVI):**
+**`sales` / `sale_returns` categories — aggregate shape:**
+```jsonc
+{
+  "category": "sales",
+  "matched": true,
+  "metrics": {
+    "net_sales_prev_day": 42000.0
+  },
+  "conditions": [
+    {
+      "field": "net_sales_prev_day",
+      "op": "lt",
+      "value": 50000.0,
+      "value2": null,
+      "actual": 42000.0,
+      "breached": true
+    }
+  ]
+}
+```
+`metrics` contains only the windows referenced by the alert's conditions.
 
-- `outstanding` = SUM(Db amounts) - SUM(Cr amounts). Customer excluded if outstanding <= 0.
-- `age_days` = FIFO aging: apply total credits to oldest debits first; age = (today - oldest still-unpaid debit date) in days. Customer excluded if FIFO fully covers all debits.
-- `days_since_last_receipt` = (today - last_receipt_date) in days. If the customer has NEVER received a Bank/Cash Receipt (`last_receipt_date` is NULL), `days_since_last_receipt` = `10**9` (sentinel for "never paid") so any `> N` condition flags them.
-- `last_receipt_amount` / `last_receipt_date` = most recent credit with `sub_category IN ('Bank Receipt','Cash Receipt')`; NULL if none.
-- NULL last_receipt does NOT exclude the customer — age, amount, and days_since_last_receipt conditions are independent.
-- Customers are joined to `customer_details` for `city` and `customer_code`.
-- Returned per matched customer: `{customer_name, city, code, outstanding, age_days, days_since_last_receipt, last_receipt_amount, last_receipt_date}`.
-- Output sorted by `outstanding` descending.
+### Shared evaluation module (`lambda/api/alerts_eval.py`)
 
-**Condition ops:** `gt, gte, lt, lte, eq, between` (`value2` required iff op=`between`).
-**match_type:** `all` = AND across all conditions; `any` = OR.
+The module is imported by both the API Lambda and the evaluator Lambda.
+Each Lambda package includes a copy; `lambda/api/alerts_eval.py` is the source of truth.
+`lambda/alerts_evaluator/alerts_eval.py` is an identical copy (maintained with `cp`).
+
+**Public surface:**
+- `FIELD_CATALOG` — balances catalog (backward compat)
+- `FIELD_CATALOG_SALES`, `FIELD_CATALOG_SALE_RETURNS` — new aggregate catalogs
+- `FIELD_CATALOGS` — dict mapping category → catalog
+- `compute_window_dates(run_date)` — returns `{window_key: (start, end)}` for all 5 windows
+- `evaluate_balances(conn, conditions, match_type, today)` — per-customer balances eval (unchanged)
+- `evaluate_aggregate(conn, alert, today)` — aggregate eval for sales/sale_returns
+- `_query_aggregate_metrics(conn, category, branch, windows, windows_needed)` — internal SQL helper
+- `validate_alert(body)` — validates all three categories; field keys are per-category
+- `is_alert_due_today(frequency, schedule_day, today)` — scheduling helper (unchanged)
 
 ### alerts_evaluator Lambda (`lambda/alerts_evaluator/handler.py`)
 
-- Entry: `lambda_handler(event, context)`.
-- Trigger: EventBridge **rate(15 minutes)** — schedule owned by IaC (IaC migration 014 changes from the old daily cron).
-- Per-invocation gating — for each active alert, ALL three gates must pass before sending:
-  1. **Due today (IST):** `daily` → always; `weekly` → `today.weekday() == schedule_day` (0=Mon); `monthly` → `today.day == schedule_day`.
-  2. **Time reached:** current IST `HH:MM` >= alert's `schedule_time` `HH:MM`.
-  3. **Not already done today:** no `alert_runs` row with `run_at` (cast to IST date) == today AND `status IN ('sent','no_match')`. A previous `'failed'` run today may retry.
-- IST = UTC + 5h30m. Both date and current time derived from `datetime.now(UTC) + timedelta(hours=5, minutes=30)`.
-- For each alert passing all gates: runs `evaluate_balances`; if ≥1 match → sends HTML table email via `boto3.client('ses').send_email` from `ALERTS_SENDER_EMAIL` to all recipients. Writes `alert_runs` row (`status`: `sent` | `no_match` | `failed`). One alert failing does NOT abort others.
-- Email columns: Customer · City · Code · Outstanding (₹) · Age (days) · Days Since Receipt · Last Receipt Amount · Last Receipt Date.
-- `days_since_last_receipt` is displayed as `"Never"` in the email when it equals the sentinel (`10**9`).
+All existing gating is unchanged (due-today, time-reached, success-dedupe, 5/day failed cap).
+
+**Category dispatch in the evaluation loop:**
+
+- `balances` → `evaluate_balances()` → HTML customer-table email (unchanged path)
+  - Subject: `[IRAVI Alert] <alert_name> — <date>`
+  - `alert_runs.matched` = count of matched customers
+- `sales` / `sale_returns` → `evaluate_aggregate()` → metrics-summary email if `matched=True`
+  - Subject: `[IRAVI Alert] Sales — <date>` or `[IRAVI Alert] Sale Returns — <date>`
+  - Email: two HTML tables — Conditions (field label, op, threshold, actual, breached?) + Window Metrics (metric label, value ₹)
+  - `alert_runs.matched` = 1 if fired, 0 if not
+  - `status` = `sent` if fired, `no_match` if conditions did not fire, `failed` on exception
+
+`_send_ses_email` signature changed from `(alert_name, recipients, html_body, today)` to `(subject, recipients, html_body)` — subject is now built by the caller.
+
+**`days_since_last_receipt` semantics (balances only, unchanged):**
+- Value = (today − last_receipt_date) in days.
+- NULL last_receipt_date → sentinel `10**9` flags "never paid" customers for `> threshold` rules.
+- Displayed as `"Never"` in the email.
 
 ---
 
@@ -636,6 +726,11 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] alerts aggregate categories `sales` + `sale_returns` (2026-06-26) — new FIELD_CATALOG_SALES and FIELD_CATALOG_SALE_RETURNS in alerts_eval.py; compute_window_dates() for 5 time windows (prev_day/prev_week/last_month/prev_quarter/fy) with fiscal-quarter + April-FY-boundary handling; _query_aggregate_metrics() builds a single SQL with FILTER clauses per window (sales=net, sale_returns=returns-only); evaluate_aggregate() returns {category,matched,metrics,conditions}; both alerts_eval.py copies updated in sync; validate_alert() now accepts all 3 categories with per-category field validation; IaC migration 015 required for alerts.branch VARCHAR(100)
+- [x] alerts.branch column support (2026-06-26) — _ALERT_SELECT, _alert_row_to_dict, _handle_alerts_create INSERT, _handle_alerts_update UPDATE all include branch; _load_active_alerts in evaluator includes branch; branch accepted/returned in all CRUD endpoints; NULL/'ALL'/'' = no branch filter in metric query
+- [x] GET /alerts/fields category dispatch (2026-06-26) — reads ?category= query param; serves correct catalog from FIELD_CATALOGS dict; returns 400 for unknown category; defaults to balances if param absent
+- [x] POST /alerts/{id}/test category dispatch (2026-06-26) — balances → existing {matched,sample} shape (unchanged); sales/sale_returns → aggregate shape {category,matched,metrics,conditions}
+- [x] alerts_evaluator category dispatch (2026-06-26) — balances path unchanged; sales/sale_returns path calls evaluate_aggregate(); fires _render_metrics_email() + _send_ses_email() on match; subject "[IRAVI Alert] Sales|Sale Returns — <date>"; alert_runs.matched=1/0 for aggregate; _send_ses_email signature changed to (subject, recipients, html_body)
 - [x] alerts API endpoints (GET/POST/PUT/DELETE /alerts, GET /alerts/{id}, GET /alerts/fields, POST /alerts/{id}/test) in lambda/api/handler.py — all admin-only via _require_admin()
 - [x] alerts response contract fix (2026-06-24) — `recipients` in all alert responses (`GET /alerts`, `GET /alerts/{id}`, `POST /alerts`, `PUT /alerts/{id}`) is now a flat array of email-address strings `["a@x.com"]` instead of objects `[{id, channel, address}]`; both serialization sites fixed (`_fetch_alert_with_children` and `_handle_alerts_list`); `_insert_alert_children` request handling unchanged
 - [x] alerts_eval.py shared module (lambda/api/alerts_eval.py + copy in lambda/alerts_evaluator/alerts_eval.py) — FIFO aging, condition matching, field catalog, validate_alert(), is_alert_due_today()
@@ -643,6 +738,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] alerts days_since_last_receipt field (2026-06-24) — new evaluable field in both alerts_eval.py copies; NULL last_receipt_date → sentinel 10**9 (flags never-paid customers); field catalog updated; validate_alert() accepts it as valid condition field; _customer_matches() extended; evaluate_balances() returns days_since_last_receipt in matched rows; email table adds Days Since Receipt column (sentinel displayed as "Never")
 - [x] alerts schedule_time field (2026-06-24) — `schedule_time TIME` column added to `alerts` table by IaC migration 014; API accepts/returns as HH:MM string (e.g. "14:30"); defaults to "11:00" if omitted on create; validated by _validate_schedule_time() regex; _alert_row_to_dict() normalises psycopg2 timedelta/time → HH:MM; CREATE and UPDATE SQL updated; _ALERT_SELECT updated
 - [x] alerts_evaluator 15-minute gating logic (2026-06-24) — evaluator now runs every 15 min (IaC changes cron to rate(15 minutes)); per-alert three-gate check: (1) due today, (2) current IST HH:MM >= schedule_time, (3) no alert_runs row with status sent|no_match for today (IST); failed runs may retry; _already_sent_today() uses AT TIME ZONE SQL to convert run_at UTC→IST date; _load_active_alerts() reads schedule_time column
+- [x] alerts_evaluator per-day failed-retry cap (2026-06-25) — module constant _MAX_FAILED_ATTEMPTS_PER_DAY=5; _already_sent_today() replaced by _check_today_runs() which returns (done: bool, failed_count: int) in one query using COUNT(*) FILTER; gate-2+3 block now also skips if failed_today >= 5 and logs INFO "alert <id>: reached 5 failed attempts today, skipping until tomorrow"; success dedupe, due-today logic, time-reached gate, SES send, and alert_runs writing are all unchanged
 - [x] Project structure created
 - [x] etl_stocks core logic (`process.py`, `run_local.py`)
 - [x] etl_stocks Lambda handler — S3 trigger, rates lookup, processed upload, source archive, DB upsert (`snapshot_stock`), `ETLStocksSuccess` event
@@ -684,6 +780,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: migration 015** — `ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);` Must be applied via psql/SSM BEFORE deploying the updated api and alerts_evaluator Lambdas (both now SELECT branch). Push business-core first, then run migration, then terraform apply.
+- [ ] **IaC: API Gateway routes for /alerts/fields with new categories** — the existing route serves /alerts/fields; the new ?category= param requires no additional IaC change (same route, same Lambda). No IaC change needed.
 - [ ] **IaC: migration 013** — create `alerts`, `alert_conditions`, `alert_recipients`, `alert_runs` tables with correct FK + cascade rules. Apply via psql/SSM before deploying the alerts_evaluator Lambda or using the /alerts API.
 - [ ] **IaC: migration 014** — `ALTER TABLE alerts ADD COLUMN IF NOT EXISTS schedule_time TIME NOT NULL DEFAULT '11:00';` Must be applied via psql/SSM BEFORE deploying the updated api and alerts_evaluator Lambdas (both now SELECT schedule_time). Push business-core first, then run migration, then terraform apply.
 - [ ] **IaC: alerts_evaluator EventBridge rule** — change from `cron(30 5 * * ? *)` (daily 11:00 IST) to `rate(15 minutes)` in `lambda_alerts_evaluator.tf`. The per-alert schedule_time + alert_runs deduplication logic in the Lambda handles once-per-day semantics.
