@@ -1719,10 +1719,10 @@ def _alert_row_to_dict(row: tuple) -> dict:
 
     Expected column order (must match every query below):
       id, name, category, frequency, schedule_day, schedule_time, match_type,
-      is_active, created_by, created_at, updated_at
+      is_active, created_by, created_at, updated_at, branch
     """
     (alert_id, name, category, frequency, schedule_day, schedule_time, match_type,
-     is_active, created_by, created_at, updated_at) = row
+     is_active, created_by, created_at, updated_at, branch) = row
     # schedule_time is stored as a TIME column; psycopg2 returns it as a timedelta
     # (seconds since midnight) or a datetime.time object depending on driver version.
     # Normalise to "HH:MM" string.
@@ -1749,12 +1749,13 @@ def _alert_row_to_dict(row: tuple) -> dict:
         'created_by':    created_by,
         'created_at':    created_at.isoformat() if created_at else None,
         'updated_at':    updated_at.isoformat() if updated_at else None,
+        'branch':        branch,
     }
 
 
 _ALERT_SELECT = """
     SELECT id, name, category, frequency, schedule_day, schedule_time, match_type,
-           is_active, created_by, created_at, updated_at
+           is_active, created_by, created_at, updated_at, branch
     FROM alerts
 """
 
@@ -1813,14 +1814,21 @@ def _insert_alert_children(cur, alert_id: int, conditions: list, recipients: lis
 
 
 def _handle_alerts_fields(event):
-    """GET /alerts/fields?category=balances — data-driven field catalog (admin-only)."""
+    """GET /alerts/fields?category=<balances|sales|sale_returns> — field catalog (admin-only)."""
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
             _require_admin(event, cur)
     finally:
         conn.close()
-    return _response(200, alerts_eval.FIELD_CATALOG)
+    params = event.get('queryStringParameters') or {}
+    category = (params.get('category') or 'balances').strip()
+    catalog = alerts_eval.FIELD_CATALOGS.get(category)
+    if catalog is None:
+        return _response(400, {
+            'error': f"Unknown category {category!r}. Must be one of: {sorted(alerts_eval.FIELD_CATALOGS)}"
+        })
+    return _response(200, catalog)
 
 
 def _handle_alerts_list(event):
@@ -1888,6 +1896,7 @@ def _handle_alerts_create(event):
     is_active     = bool(body.get('is_active', True))
     conditions    = body['conditions']
     recipients    = body['recipients']
+    branch        = body.get('branch') or None  # NULL stored as NULL; 'ALL' stored as 'ALL'
 
     conn = _get_db_conn()
     try:
@@ -1896,11 +1905,11 @@ def _handle_alerts_create(event):
             cur.execute("""
                 INSERT INTO alerts
                     (name, category, frequency, schedule_day, schedule_time, match_type,
-                     is_active, created_by, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s::TIME, %s, %s, %s, NOW(), NOW())
+                     is_active, created_by, created_at, updated_at, branch)
+                VALUES (%s, %s, %s, %s, %s::TIME, %s, %s, %s, NOW(), NOW(), %s)
                 RETURNING id
             """, (name, category, frequency, schedule_day, schedule_time, match_type,
-                  is_active, admin['username']))
+                  is_active, admin['username'], branch))
             alert_id = cur.fetchone()[0]
             _insert_alert_children(cur, alert_id, conditions, recipients)
             conn.commit()
@@ -1927,6 +1936,7 @@ def _handle_alerts_update(event, alert_id: int):
     is_active     = bool(body.get('is_active', True))
     conditions    = body['conditions']
     recipients    = body['recipients']
+    branch        = body.get('branch') or None
 
     conn = _get_db_conn()
     try:
@@ -1939,10 +1949,11 @@ def _handle_alerts_update(event, alert_id: int):
             cur.execute("""
                 UPDATE alerts
                 SET name=%s, category=%s, frequency=%s, schedule_day=%s,
-                    schedule_time=%s::TIME, match_type=%s, is_active=%s, updated_at=NOW()
+                    schedule_time=%s::TIME, match_type=%s, is_active=%s,
+                    branch=%s, updated_at=NOW()
                 WHERE id=%s
             """, (name, category, frequency, schedule_day, schedule_time, match_type,
-                  is_active, alert_id))
+                  is_active, branch, alert_id))
 
             # Replace child rows
             cur.execute('DELETE FROM alert_conditions WHERE alert_id = %s', (alert_id,))
@@ -1972,27 +1983,41 @@ def _handle_alerts_delete(event, alert_id: int):
 
 
 def _handle_alerts_test(event, alert_id: int):
-    """POST /alerts/{id}/test — dry-run: evaluate alert conditions NOW, return matches (no email sent)."""
+    """POST /alerts/{id}/test — dry-run: evaluate alert conditions NOW (no email sent).
+
+    balances category:
+        Returns {matched: <count>, sample: [<up to 20 customer dicts>]}.
+    sales / sale_returns categories:
+        Returns the aggregate shape:
+        {category, matched: <bool>, metrics: {<field>: <float>...}, conditions: [...]}
+    """
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
             _require_admin(event, cur)
             alert = _fetch_alert_with_children(cur, alert_id)
+
         if alert is None:
             return _response(404, {'error': 'Alert not found'})
 
         from datetime import date as _date
-        matched = alerts_eval.evaluate_balances(
-            conn,
-            conditions=alert['conditions'],
-            match_type=alert['match_type'],
-            today=_date.today(),
-        )
+        today = _date.today()
+
+        if alert['category'] == 'balances':
+            matched = alerts_eval.evaluate_balances(
+                conn,
+                conditions=alert['conditions'],
+                match_type=alert['match_type'],
+                today=today,
+            )
+            result = {'matched': len(matched), 'sample': matched[:20]}
+        else:
+            # sales / sale_returns — aggregate shape
+            result = alerts_eval.evaluate_aggregate(conn, alert=alert, today=today)
     finally:
         conn.close()
 
-    sample = matched[:20]
-    return _response(200, {'matched': len(matched), 'sample': sample})
+    return _response(200, result)
 
 
 def _response(status: int, body) -> dict:
