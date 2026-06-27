@@ -60,6 +60,9 @@ business-core/
     ├── etl_appendix_b_x11_sale_return/ ← ETL: parse AppendixRetSales xlsx → RDS appendix_b_x11_stock_ledger (in_out=In) + sales (sales_return=Y) [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_supplier_accounts/ ← ETL: parse Supplier Accounts Export File xlsx → RDS supplier_accounts [COMPLETE]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── whatsapp_notifier/    ← S3 trigger on notifications/pending/ → phase 1 moves to notifications/processed/ → phase 2 sends WhatsApp [PHASE 1 COMPLETE]
     │   └── handler.py
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
@@ -114,6 +117,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_appendix_b_x11_purchase_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11_sale | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11_sale_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 | alerts_evaluator | Python 3.12 | psycopg2-binary (boto3/ses from runtime) |
@@ -125,9 +129,9 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | Variable | Set by | Used in |
 |---|---|---|
 | `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, api, whatsapp_notifier |
-| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11 (default: `processed/`) |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, api, whatsapp_notifier |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
 | `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
@@ -245,6 +249,47 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 **Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, customer_code, updated_at)`
 
 **Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. Apply migration before running this Lambda. Re-running the ETL on any existing file will backfill `customer_code` for all existing rows via the `ON CONFLICT DO UPDATE` clause.
+
+---
+
+## etl_supplier_accounts — Supplier Master Processing
+
+**Status: complete**
+
+Source file pattern: `Supplier Accounts Export File*.xlsx` (S3 prefix filter: `raw/Supplier`)
+
+**Workbook layout:** Sheet `General` (header row 1, data from row 2). A second empty `Sheet1` exists — it is ignored.
+
+**Column mapping (0-indexed):**
+`[0]=Name, [6]=GST, [7]=GSTValid, [12]=City, [13]=State`
+
+**Transforms (applied in order per row):**
+- `name` = `str(row[0] or '').strip()` — blank row → SKIP.
+- IRAVI FILTER: `'iravi' in name.lower()` → SKIP (drops "IRAVI AGRO LIFE HYD" and "IRAVI AGRO LIFE LLP - GNT").
+- `gst` = `str(row[6] or '').strip() or None`
+- `gst_valid`: `row[7] is None` → `None` (NULL); else `bool(int(row[7]))` — 1 → `True`, 0 → `False`. None and 0 are distinct: None = no GST registered; False = GST present but invalid.
+- `city` = `str(row[12] or '').strip().title() or None` (source casing inconsistent; normalised to title case).
+- `state`: raw = `str(row[13] or '').strip()`; if `'-'` in raw → take the part after the first `'-'` (e.g. `"36-Telangana"` → `"Telangana"`); else keep raw; blank → `None`.
+
+**Milestoning upsert (uni-temporal, close-then-insert):**
+Natural key = `name`. Partial unique index on `(name) WHERE out_z IS NULL`.
+For each parsed row:
+```sql
+UPDATE supplier_accounts SET out_z = NOW() WHERE name = %s AND out_z IS NULL;
+INSERT INTO supplier_accounts (name, gst, gst_valid, city, state) VALUES (%s,%s,%s,%s,%s);
+```
+All rows written in a single DB transaction; committed once after the loop.
+
+**On success:** archives source to `processed/raw/`. No EventBridge event (supplier master data; no redis cache step required).
+
+**Target table:** `supplier_accounts` (IaC migration 016). Schema:
+```
+id BIGSERIAL PK, name VARCHAR(255) NOT NULL, gst VARCHAR(20), gst_valid BOOLEAN,
+city VARCHAR(120), state VARCHAR(100), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ NULL.
+Partial unique index on (name) WHERE out_z IS NULL.
+```
+
+**Migration dependency:** IaC migration 016 must be applied before running this Lambda.
 
 ---
 
@@ -726,6 +771,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] etl_supplier_accounts Lambda (2026-06-27) — full handler: parse `Supplier Accounts Export File*.xlsx` (General sheet, header row 1, data from row 2); columns [0]=Name [6]=GST [7]=GSTValid [12]=City [13]=State; IRAVI own-company rows filtered; gst_valid int→bool with None/0 distinction; city title-cased; state prefix-stripped ("36-Telangana" → "Telangana"); uni-temporal milestoning upsert (close-then-insert on name); archives source to processed/raw/; no EventBridge emit; requires IaC migration 016 + lambda_etl_supplier_accounts.tf
 - [x] alerts aggregate categories `sales` + `sale_returns` (2026-06-26) — new FIELD_CATALOG_SALES and FIELD_CATALOG_SALE_RETURNS in alerts_eval.py; compute_window_dates() for 5 time windows (prev_day/prev_week/last_month/prev_quarter/fy) with fiscal-quarter + April-FY-boundary handling; _query_aggregate_metrics() builds a single SQL with FILTER clauses per window (sales=net, sale_returns=returns-only); evaluate_aggregate() returns {category,matched,metrics,conditions}; both alerts_eval.py copies updated in sync; validate_alert() now accepts all 3 categories with per-category field validation; IaC migration 015 required for alerts.branch VARCHAR(100)
 - [x] alerts.branch column support (2026-06-26) — _ALERT_SELECT, _alert_row_to_dict, _handle_alerts_create INSERT, _handle_alerts_update UPDATE all include branch; _load_active_alerts in evaluator includes branch; branch accepted/returned in all CRUD endpoints; NULL/'ALL'/'' = no branch filter in metric query
 - [x] GET /alerts/fields category dispatch (2026-06-26) — reads ?category= query param; serves correct catalog from FIELD_CATALOGS dict; returns 400 for unknown category; defaults to balances if param absent
@@ -780,6 +826,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: migration 016** — create `supplier_accounts` table. Schema: `id BIGSERIAL PK, name VARCHAR(255) NOT NULL, gst VARCHAR(20), gst_valid BOOLEAN, city VARCHAR(120), state VARCHAR(100), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ NULL`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_accounts (name) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_accounts.
+- [ ] **IaC: lambda_etl_supplier_accounts.tf** — Lambda function (source_dir = `lambda/etl_supplier_accounts`, runtime python3.12, handler `handler.lambda_handler`); env vars `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; IAM for Secrets Manager + `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` on `DATA_BUCKET`; S3 ObjectCreated notification with prefix filter `raw/Supplier` (i.e. `raw/Supplier Accounts Export File`). Layer: openpyxl + psycopg2-binary; add CI pip-layer build step in `terraform.yml`.
 - [ ] **IaC: migration 015** — `ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);` Must be applied via psql/SSM BEFORE deploying the updated api and alerts_evaluator Lambdas (both now SELECT branch). Push business-core first, then run migration, then terraform apply.
 - [ ] **IaC: API Gateway routes for /alerts/fields with new categories** — the existing route serves /alerts/fields; the new ?category= param requires no additional IaC change (same route, same Lambda). No IaC change needed.
 - [ ] **IaC: migration 013** — create `alerts`, `alert_conditions`, `alert_recipients`, `alert_runs` tables with correct FK + cascade rules. Apply via psql/SSM before deploying the alerts_evaluator Lambda or using the /alerts API.
