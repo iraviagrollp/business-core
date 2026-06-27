@@ -72,26 +72,17 @@ def lambda_handler(event, context):
         _process(bucket, key, filename)
 
 
-def _load_known_customers(conn) -> set:
-    with conn.cursor() as cur:
-        cur.execute('SELECT customer_name FROM customer_details')
-        return {row[0] for row in cur.fetchall()}
-
-
 def _process(bucket: str, key: str, filename: str):
     archive_key = _PROCESSED_PREFIX + 'raw/' + filename
 
     conn = _get_db_conn()
     try:
-        known_customers = _load_known_customers(conn)
-        logger.info('Loaded %d known customers from customer_details', len(known_customers))
-
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, filename)
             logger.info('Downloading s3://%s/%s', bucket, key)
             s3.download_file(bucket, key, src_path)
-            rows = _parse(src_path, known_customers)
-            logger.info('Parsed %d ledger rows (after customer filter)', len(rows))
+            rows = _parse(src_path)
+            logger.info('Parsed %d ledger rows (after Account Group filter)', len(rows))
 
         _upsert(conn, rows)
         conn.commit()
@@ -112,7 +103,19 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Emitted ETLCustomerLedgerSuccess rows=%d', len(rows))
 
 
-def _parse(src_path: str, known_customers: set) -> list[dict]:
+def _parse(src_path: str) -> list[dict]:
+    """Parse the active sheet of the Ledger All Accounts workbook.
+
+    Column layout (0-indexed), header row 5, data from min_row=6:
+      [0] transaction_date   [1] voucher_no      [2] transaction_name
+      [4] account_name       [5] contra_account  [6] debit   [7] credit
+      [10] account_group
+
+    Only rows where account_group == 'All Customer Accounts' (case-insensitive)
+    are kept.  IRAVI own-company rows within that group are explicitly dropped.
+    No database read is required for filtering — the ledger file itself carries
+    the account group in col[10].
+    """
     wb = openpyxl.load_workbook(src_path, data_only=True)
     ws = wb.active
 
@@ -125,6 +128,7 @@ def _parse(src_path: str, known_customers: set) -> list[dict]:
         contra_account = str(row[5] or '').strip()
         debit = float(row[6] or 0)
         credit = float(row[7] or 0)
+        account_group = str(row[10] or '').strip()
 
         # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on one side.
         # A negative debit is economically a credit of its magnitude, and vice-versa.
@@ -145,7 +149,15 @@ def _parse(src_path: str, known_customers: set) -> list[dict]:
             continue
         if contra_account == 'Default Purchase Account':
             continue
-        if account_name not in known_customers:
+        # Account Group filter: keep only customer rows identified by col[10].
+        # Case-insensitive for safety; distinct groups include "All Customer Accounts",
+        # "All Supplier Accounts", "All Sales Accounts", "All Bank Accounts", plus blank
+        # for GL/GST contra-leg rows.
+        if account_group.lower() != 'all customer accounts':
+            continue
+        # Explicit IRAVI exclusion: IRAVI own-company accounts must not land in
+        # customer_ledger (previously provided implicitly by the customer_details join).
+        if 'iravi' in account_name.lower():
             continue
 
         transaction_date = _parse_date(transaction_date_raw)

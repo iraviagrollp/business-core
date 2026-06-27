@@ -2,9 +2,9 @@
 etl_supplier_ledger — EventBridge-triggered Lambda.
 
 Reads the same "Ledger All Accounts*.xlsx" export used by etl_customer_ledger
-but keeps ONLY rows whose account_name matches a known supplier (from
-supplier_accounts).  Applies purchase-side category/sub-category logic and
-writes to the supplier_ledger table using uni-temporal milestoning.
+but keeps ONLY rows where col[10] (Account Group) == 'All Supplier Accounts'.
+Applies purchase-side category/sub-category logic and writes to the
+supplier_ledger table using uni-temporal milestoning.
 
 This Lambda is STRICTLY READ-ONLY on S3:
   - It does NOT copy, move, or delete any S3 object.
@@ -85,18 +85,6 @@ def _get_db_conn():
     )
 
 
-def _load_known_suppliers(conn) -> set:
-    """Return an uppercase set of all names in supplier_accounts.
-
-    Uses all rows (no out_z filter) so that a supplier whose master row was
-    recently re-milestoned is not inadvertently excluded.
-    supplier_accounts already excludes IRAVI own-company entries.
-    """
-    with conn.cursor() as cur:
-        cur.execute('SELECT name FROM supplier_accounts')
-        return {row[0].strip().upper() for row in cur.fetchall()}
-
-
 # ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
@@ -132,15 +120,12 @@ def _process(bucket: str, key: str, filename: str):
 
     conn = _get_db_conn()
     try:
-        known_suppliers = _load_known_suppliers(conn)
-        logger.info('Loaded %d known suppliers from supplier_accounts', len(known_suppliers))
-
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, filename)
             used_key = _download_with_fallback(bucket, key, fallback_key, src_path)
             logger.info('Downloaded from s3://%s/%s', bucket, used_key)
-            rows = _parse(src_path, known_suppliers)
-            logger.info('Parsed %d supplier ledger rows (after supplier filter)', len(rows))
+            rows = _parse(src_path)
+            logger.info('Parsed %d supplier ledger rows (after Account Group filter)', len(rows))
 
         _upsert(conn, rows)
         conn.commit()
@@ -180,14 +165,18 @@ def _download_with_fallback(bucket: str, primary_key: str, fallback_key: str, de
 # Parse
 # ---------------------------------------------------------------------------
 
-def _parse(src_path: str, known_suppliers: set) -> list[dict]:
+def _parse(src_path: str) -> list[dict]:
     """Parse the active sheet of the Ledger All Accounts workbook.
 
     Column layout (0-indexed), data from min_row=6:
       [0] transaction_date   [1] voucher_no      [2] transaction_name
       [4] account_name       [5] contra_account  [6] debit   [7] credit
+      [10] account_group
 
-    Only rows whose account_name (uppercased) is in known_suppliers are kept.
+    Only rows where account_group == 'All Supplier Accounts' (case-insensitive)
+    are kept.  IRAVI own-company rows within that group are explicitly dropped.
+    No database read is required for filtering — the ledger file itself carries
+    the account group in col[10].
     """
     wb = openpyxl.load_workbook(src_path, data_only=True)
     ws = wb.active  # Sheet is named "Invoice" in the real export
@@ -201,6 +190,7 @@ def _parse(src_path: str, known_suppliers: set) -> list[dict]:
         contra_account       = str(row[5] or '').strip()
         debit                = float(row[6] or 0)
         credit               = float(row[7] or 0)
+        account_group        = str(row[10] or '').strip()
 
         # --- Sign normalization (identical to etl_customer_ledger) ---
         # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on
@@ -227,8 +217,14 @@ def _parse(src_path: str, known_suppliers: set) -> list[dict]:
         # unexpected cross-account data).
         if contra_account == 'Default Sales Account':
             continue
-        # Supplier filter: case-insensitive match (file casing is mixed)
-        if account_name.strip().upper() not in known_suppliers:
+        # Account Group filter: keep only supplier rows identified by the
+        # ledger file itself (col[10]).  Case-insensitive comparison for safety.
+        if account_group.lower() != 'all supplier accounts':
+            continue
+        # Explicit IRAVI exclusion: IRAVI own-company accounts appear under
+        # 'All Supplier Accounts' in the ledger but must not land in
+        # supplier_ledger.
+        if 'iravi' in account_name.lower():
             continue
 
         transaction_date = _parse_date(transaction_date_raw)
