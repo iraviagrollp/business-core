@@ -520,7 +520,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 
 ## api — API Layer
 
-**Status: stocks complete; reports/customer-balances-fy complete; sales stub**
+**Status: stocks complete; reports/customer-balances-fy complete; reports/supplier-balances-fy complete; sales stub**
 
 | Endpoint | Redis key | Status |
 |---|---|---|
@@ -528,6 +528,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /stocks/current` | `iravi:stocks:current` | Complete |
 | `GET /sales` | — | Stub (returns empty array) |
 | `GET /reports/customer-balances-fy` | `iravi:reports:customer_balances_fy:{fy_count}` | Complete |
+| `GET /reports/supplier-balances-fy` | `iravi:reports:supplier_balances_fy:{fy_count}` | Complete |
 | `GET /ledger/statement` | `iravi:ledger:statement:{account}:{from}:{to}` | Complete |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
@@ -596,6 +597,69 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 ```
 
 **Redis key:** `iravi:reports:customer_balances_fy:{fy_count}` (e.g. `iravi:reports:customer_balances_fy:all`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush`.
+
+---
+
+## api — GET /reports/supplier-balances-fy
+
+**Route:** `GET /reports/supplier-balances-fy?fy_count=all|2|3|4`
+
+**Query param:** identical semantics to `GET /reports/customer-balances-fy` — `fy_count=all` (default) shows all FYs with zero opening; integer values show the most recent N FYs with a brought-forward opening.
+
+**Source tables:** `supplier_ledger` (`out_z IS NULL`, `LOWER(account_name) NOT LIKE '%%iravi%%'`) and `supplier_accounts` (city lookup only — `SELECT UPPER(name), city FROM supplier_accounts`).
+
+**Key differences from customer-balances-fy:**
+
+| Aspect | Customer | Supplier |
+|---|---|---|
+| Ledger table | `customer_ledger` | `supplier_ledger` |
+| Lookup table | `customer_details` | `supplier_accounts` |
+| Party code | Yes (`code` in response) | No (`supplier_accounts` has no code column; omitted from response) |
+| Credit notes | Yes (`credit_notes` bucket, `_CREDIT_NOTE_SUBCATEGORY`) | No — all Cr rows treated as credit |
+| Per-voucher netting | `net > 0 → debit; net < 0 → credit; is_cn → credit_notes` | `net > 0 → debit; net < 0 → credit; net == 0 → nothing` |
+| Balance formula | `running + debit − credit − credit_notes` | `running + debit − credit` |
+| Sort order | Code ascending (NULLs last), then party name | Party name ascending (`(p.upper(), p)`) |
+| RBAC screen key | `reports.customer_balances_fy` | `reports.supplier_balances_fy` |
+
+**FY definition:** April 1 → March 31. Label format: `FY YY-YY` (e.g. `FY 25-26`). Identical logic to customer handler.
+
+**Per-voucher netting:** rows are grouped by `(account_name, voucher_no, fy_label)`. `net = sum(Db rows) − sum(Cr rows)`. `net > 0 → debit += net`; `net < 0 → credit += -net`; `net == 0 → nothing`. Running balance per FY: `running = round(running + debit − credit, 2)`.
+
+**Zero-activity skip:** parties (suppliers) with zero opening AND all-zero debit/credit across every shown FY are excluded from the response.
+
+**Response shape:**
+```jsonc
+{
+  "fys": ["FY 24-25", "FY 25-26"],
+  "rows": [
+    {
+      "party": "JAGRUTHI AGRO CHEMICALS",
+      "city": "Hyderabad",                      // null if no match in supplier_accounts
+      "opening": 0.0,                           // brought-forward balance; 0 when fy_count=all
+      "per_fy": [
+        { "fy": "FY 25-26", "debit": 0.0, "credit": 860000.0, "balance": -860000.0 }
+      ],
+      "balance_dr": 0.0,    // final running balance if > 0, else 0
+      "balance_cr": -860000.0  // final running balance (negative) if < 0, else 0
+    }
+  ],
+  "totals": {
+    "per_fy": [ { "fy": "FY 25-26", "debit": ..., "credit": ..., "balance": ... } ],
+    "balance_dr": ...,
+    "balance_cr": ...
+  }
+}
+```
+
+Note: `balance_cr` is returned as a negative number when the supplier has a net credit balance (mirrors `_handle_customer_balances_fy` exactly: `round(running, 2) if running < 0 else 0.0`).
+
+Empty-data case returns `{'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balance_dr': 0.0, 'balance_cr': 0.0}}`.
+
+**Redis key:** `iravi:reports:supplier_balances_fy:{fy_count}` (e.g. `iravi:reports:supplier_balances_fy:all`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush` (deletes all `iravi:*`).
+
+**RBAC screen key (IaC + UI must register):** `reports.supplier_balances_fy`
+
+**Runtime dependency:** `supplier_ledger` (IaC migration 017) and `supplier_accounts` (IaC migration 016) must exist and be populated. No code change in the ETL layer is needed.
 
 ---
 
