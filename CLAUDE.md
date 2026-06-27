@@ -63,6 +63,9 @@ business-core/
     ├── etl_supplier_accounts/ ← ETL: parse Supplier Accounts Export File xlsx → RDS supplier_accounts [COMPLETE]
     │   ├── handler.py
     │   └── requirements.txt
+    ├── etl_supplier_ledger/  ← ETL: parse Ledger All Accounts xlsx (supplier rows) → RDS supplier_ledger [COMPLETE]
+    │   ├── handler.py        ← EventBridge-triggered; read-only on S3; fallback to processed/raw/ if raw gone
+    │   └── requirements.txt
     ├── whatsapp_notifier/    ← S3 trigger on notifications/pending/ → phase 1 moves to notifications/processed/ → phase 2 sends WhatsApp [PHASE 1 COMPLETE]
     │   └── handler.py
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
@@ -118,6 +121,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_appendix_b_x11_sale | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11_sale_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 | alerts_evaluator | Python 3.12 | psycopg2-binary (boto3/ses from runtime) |
@@ -128,10 +132,10 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 | Variable | Set by | Used in |
 |---|---|---|
-| `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, api, whatsapp_notifier |
-| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts (default: `processed/`) |
+| `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_supplier_ledger, redis_updater, api |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger, api, whatsapp_notifier |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger (default: `processed/`) |
 | `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
 | `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
@@ -290,6 +294,71 @@ Partial unique index on (name) WHERE out_z IS NULL.
 ```
 
 **Migration dependency:** IaC migration 016 must be applied before running this Lambda.
+
+---
+
+## etl_supplier_ledger — Supplier Ledger Processing
+
+**Status: complete**
+
+Source file: same `Ledger All Accounts*.xlsx` used by `etl_customer_ledger`. Reads `wb.active` (sheet named "Invoice"); data from `min_row=6`.
+
+**Trigger:** EventBridge "Object Created" rule (NOT an S3 Records event). Event shape:
+```
+bucket = event['detail']['bucket']['name']
+key    = urllib.parse.unquote(event['detail']['object']['key'])   # %20 not '+'; use unquote not unquote_plus
+```
+
+**S3 behaviour — strictly read-only:**
+- Downloads the source file. If the primary key returns 404/NoSuchKey (because `etl_customer_ledger` may have already archived it), falls back to downloading `{PROCESSED_PREFIX}raw/{filename}`.
+- Does NOT copy, move, or delete any S3 object.
+- Does NOT emit any EventBridge event.
+- `etl_customer_ledger` owns the file lifecycle entirely.
+
+**Supplier filter:**
+- Loads all names from `supplier_accounts` (`SELECT name FROM supplier_accounts` — all rows, no out_z filter) and builds an uppercase set.
+- Keeps a row only if `account_name.strip().upper()` is in that set. Case-insensitive because file casing is mixed (e.g. "Sree Venkata Sai Packing" in the file vs mixed case in supplier_accounts).
+- `supplier_accounts` already excludes IRAVI own-company rows.
+- **Migration dependency:** IaC migration 016 (`supplier_accounts` table) must exist and be populated before running this Lambda.
+
+**Column mapping (0-indexed):** `[0]=transaction_date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
+
+**Parse / skip rules (identical mechanics to etl_customer_ledger):**
+- Sign normalization applied first: negative debit → add to credit & zero; negative credit → add to debit & zero.
+- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `contra_account == 'Default Sales Account'` (defensive); `account_name.upper() not in known_suppliers`.
+- Date parsed with multi-format `_parse_date` (datetime / date / `%Y-%m-%d` / `%d-%m-%Y` / `%d/%m/%Y`). Unparseable → log warning and skip.
+
+**Category / sub-category (purchase-side mapping):**
+```
+_PURCHASE_CONTRA_SUBCATEGORY = {'CGST Input A/C':'CGST','SGST Input A/C':'SGST','IGST Input A/C':'IGST','Default Purchase Account':'Purchase','Roundoff A/C':'Roundoff'}
+_TXN_SUBCATEGORY = {'Bank Payments':'Bank Payment','Cash Payments':'Cash Payment','Bank Receipts':'Bank Receipt','Cash Receipts':'Cash Receipt'}
+
+category    = 'Cr' if credit > 0 else 'Db'
+amount      = credit if credit > 0 else debit
+sub_category = _PURCHASE_CONTRA_SUBCATEGORY.get(contra_account)
+               or _TXN_SUBCATEGORY.get(transaction_name)
+               or transaction_name or contra_account
+```
+Purchase Vouchers credit the supplier (`Cr`); Bank/Cash Payments debit the supplier (`Db`).
+
+**Milestoning upsert:** identical close-then-insert into `supplier_ledger`.
+Natural key = `(transaction_date, voucher_no, account_name, category, sub_category)`.
+All rows in a single transaction, committed once.
+
+**Target table:** `supplier_ledger` (IaC migration 017). Schema:
+```
+id SERIAL PK, transaction_date DATE NOT NULL, voucher_no VARCHAR(50) NOT NULL,
+account_name VARCHAR(200) NOT NULL, category VARCHAR(10) NOT NULL,
+sub_category VARCHAR(100) NOT NULL, amount NUMERIC(15,4) NOT NULL,
+in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ.
+Partial unique index on (transaction_date, voucher_no, account_name, category, sub_category) WHERE out_z IS NULL.
+```
+
+**IaC requirements (report to orchestrator):**
+- Migration 017 — create `supplier_ledger` table + partial unique index (schema above).
+- `lambda_etl_supplier_ledger.tf` — EventBridge "Object Created" rule on key prefix `raw/Ledger`; IAM: `s3:GetObject` on `DATA_BUCKET` (read-only, no PutObject/DeleteObject); Secrets Manager `secretsmanager:GetSecretValue` on `DB_SECRET_ARN`; env vars: `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; handler = `handler.lambda_handler`; runtime python3.12.
+- S3 bucket EventBridge notifications must be enabled (already enabled if etl_customer_ledger's rule is active on the same bucket).
+- CI layer build step for this Lambda (openpyxl + psycopg2-binary layer in `terraform.yml`).
 
 ---
 
@@ -771,6 +840,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] etl_supplier_ledger Lambda (2026-06-27) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; filters to supplier rows via case-insensitive match against supplier_accounts; purchase-side sign-normalization + category/sub-category mapping; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf
 - [x] etl_supplier_accounts Lambda (2026-06-27) — full handler: parse `Supplier Accounts Export File*.xlsx` (General sheet, header row 1, data from row 2); columns [0]=Name [6]=GST [7]=GSTValid [12]=City [13]=State; IRAVI own-company rows filtered; gst_valid int→bool with None/0 distinction; city title-cased; state prefix-stripped ("36-Telangana" → "Telangana"); uni-temporal milestoning upsert (close-then-insert on name); archives source to processed/raw/; no EventBridge emit; requires IaC migration 016 + lambda_etl_supplier_accounts.tf
 - [x] alerts aggregate categories `sales` + `sale_returns` (2026-06-26) — new FIELD_CATALOG_SALES and FIELD_CATALOG_SALE_RETURNS in alerts_eval.py; compute_window_dates() for 5 time windows (prev_day/prev_week/last_month/prev_quarter/fy) with fiscal-quarter + April-FY-boundary handling; _query_aggregate_metrics() builds a single SQL with FILTER clauses per window (sales=net, sale_returns=returns-only); evaluate_aggregate() returns {category,matched,metrics,conditions}; both alerts_eval.py copies updated in sync; validate_alert() now accepts all 3 categories with per-category field validation; IaC migration 015 required for alerts.branch VARCHAR(100)
 - [x] alerts.branch column support (2026-06-26) — _ALERT_SELECT, _alert_row_to_dict, _handle_alerts_create INSERT, _handle_alerts_update UPDATE all include branch; _load_active_alerts in evaluator includes branch; branch accepted/returned in all CRUD endpoints; NULL/'ALL'/'' = no branch filter in metric query
@@ -826,6 +896,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: migration 017** — create `supplier_ledger` table. Schema: `id SERIAL PK, transaction_date DATE NOT NULL, voucher_no VARCHAR(50) NOT NULL, account_name VARCHAR(200) NOT NULL, category VARCHAR(10) NOT NULL, sub_category VARCHAR(100) NOT NULL, amount NUMERIC(15,4) NOT NULL, in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_ledger (transaction_date, voucher_no, account_name, category, sub_category) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_ledger. Requires migration 016 (supplier_accounts) to be applied first.
+- [ ] **IaC: lambda_etl_supplier_ledger.tf** — Lambda function (source_dir = `lambda/etl_supplier_ledger`, runtime python3.12, handler `handler.lambda_handler`); env vars `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; IAM: Secrets Manager `GetSecretValue` on `DB_SECRET_ARN`; `s3:GetObject` on `DATA_BUCKET` (read-only — no PutObject, no DeleteObject); trigger: EventBridge "Object Created" rule on key prefix `raw/Ledger` (same bucket/prefix as etl_customer_ledger's S3 trigger — both Lambdas receive the same event). S3 bucket EventBridge notifications must be enabled (already enabled if etl_customer_ledger is active). Layer: openpyxl + psycopg2-binary; add CI pip-layer build step in `terraform.yml`.
 - [ ] **IaC: migration 016** — create `supplier_accounts` table. Schema: `id BIGSERIAL PK, name VARCHAR(255) NOT NULL, gst VARCHAR(20), gst_valid BOOLEAN, city VARCHAR(120), state VARCHAR(100), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ NULL`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_accounts (name) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_accounts.
 - [ ] **IaC: lambda_etl_supplier_accounts.tf** — Lambda function (source_dir = `lambda/etl_supplier_accounts`, runtime python3.12, handler `handler.lambda_handler`); env vars `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; IAM for Secrets Manager + `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` on `DATA_BUCKET`; S3 ObjectCreated notification with prefix filter `raw/Supplier` (i.e. `raw/Supplier Accounts Export File`). Layer: openpyxl + psycopg2-binary; add CI pip-layer build step in `terraform.yml`.
 - [ ] **IaC: migration 015** — `ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);` Must be applied via psql/SSM BEFORE deploying the updated api and alerts_evaluator Lambdas (both now SELECT branch). Push business-core first, then run migration, then terraform apply.
