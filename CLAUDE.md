@@ -349,8 +349,15 @@ key    = urllib.parse.unquote(event['detail']['object']['key'])   # %20 not '+';
 
 **Parse / skip rules (identical mechanics to etl_customer_ledger):**
 - Sign normalization applied first: negative debit → add to credit & zero; negative credit → add to debit & zero.
-- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `contra_account == 'Default Sales Account'` (defensive); `account_name.upper() not in known_suppliers`.
+- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `contra_account == 'Default Sales Account'` (defensive); `transaction_name.lower().startswith('sales')` (see below); `account_group.lower() != 'all supplier accounts'`; `'iravi' in account_name.lower()`.
 - Date parsed with multi-format `_parse_date` (datetime / date / `%Y-%m-%d` / `%d-%m-%Y` / `%d/%m/%Y`). Unparseable → log warning and skip.
+
+**Sales-side transaction exclusion (added 2026-06-27):**
+- Skip rule: `if transaction_name.lower().startswith('sales'): continue` — placed after the `contra_account == 'Default Sales Account'` check, before the Account Group filter.
+- Rationale: `MERCO ENERGY SOLUTIONS PRIVATE LIMITED` is classified under `All Supplier Accounts` in FUSIL but was billed on a `Sales Invoice` (it is the debtor — all Debit). Without this rule its CGST Output / SGST Output legs (₹1,12,612.50 each) fall through `_PURCHASE_CONTRA_SUBCATEGORY` (neither is a purchase-contra account) and land as `sub_category = 'Sales Invoice'`. Because both legs share the same five-column natural key they also cause milestoning thrash on every re-ingest.
+- Covers `"Sales Invoice"` and `"Sales Invoice Returns"` (source may have trailing space — already stripped). The existing `Default Sales Account` contra-check is kept as a secondary defensive guard.
+- Re-ingest required after deploy: the `Ledger All Accounts*.xlsx` must be re-uploaded to S3 `raw/` (or the latest copy re-triggered) so the Lambda re-runs and closes the stale MERCO sales rows in `supplier_ledger` (sets `out_z = NOW()`). After re-ingest, flush cache (`POST /admin/cache/flush`) to purge stale `iravi:reports:supplier_balances_fy:*` Redis entries.
+- Verified (2026-06-27): MERCO file `Ledger All Accounts27-6-2026(16.3.50).xlsx` — 2 kept rows before filter → 0 after (both CGST/SGST Output Sales Invoice legs excluded). Main file `Ledger All Accounts27-6-2026(12.20.22).xlsx` — 83 kept rows before → 83 after (0 sales-named rows in supplier accounts; all 7 suppliers including JAGRUTHI AGRO CHEMICALS (36 rows) fully intact).
 
 **Category / sub-category (purchase-side mapping):**
 ```

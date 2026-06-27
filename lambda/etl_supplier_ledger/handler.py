@@ -217,6 +217,14 @@ def _parse(src_path: str) -> list[dict]:
         # unexpected cross-account data).
         if contra_account == 'Default Sales Account':
             continue
+        # Exclude sales-side transactions: a supplier account that is mis-used
+        # on a Sales Invoice in FUSIL (e.g. a debtor whose Account Group is
+        # 'All Supplier Accounts') must not pollute the purchase/payable ledger.
+        # Covers 'Sales Invoice' and 'Sales Invoice Returns' (trailing spaces
+        # already stripped above).  This also eliminates the natural-key
+        # collision caused by duplicate GST-output legs on the same voucher.
+        if transaction_name.lower().startswith('sales'):
+            continue
         # Account Group filter: keep only supplier rows identified by the
         # ledger file itself (col[10]).  Case-insensitive comparison for safety.
         if account_group.lower() != 'all supplier accounts':
