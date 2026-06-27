@@ -186,12 +186,21 @@ Source file pattern: `Current Stock Balances*.xlsx` (S3 prefix filter: `raw/Curr
 
 Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`)
 
+**Customer row selection (col[10] — Account Group, 2026-06-27):**
+- Identifies customer rows directly from the ledger file: `account_group = str(row[10] or '').strip()`.
+- Keeps a row only if `account_group.lower() == 'all customer accounts'`. Case-insensitive comparison for safety. Distinct groups in the file include "All Customer Accounts" (341 rows in sample file), "All Supplier Accounts" (114), "All Sales Accounts", "All Bank Accounts", blank (GL/GST contra-leg rows), etc.
+- Explicit IRAVI exclusion: after the account group check, rows where `'iravi' in account_name.lower()` are dropped. IRAVI own-company accounts appear under "All Customer Accounts" in the ledger and must not land in `customer_ledger`.
+- **Does NOT read `customer_details` at all.** No DB read is required for filtering. This means customers who have ledger rows but no `customer_details` master record (no party code) are now correctly included. The API's `_handle_customer_balances_fy` still LEFT-joins `customer_details` for code/city; customers without a master record show null code and null city (UI renders as a dash).
+- Sample file (2026-06-27): 341 raw "All Customer Accounts" rows → 2 IRAVI rows dropped → remaining skip rules (Brought Forward 213, Default Purchase Account 27, no date 2) → **268 rows written** from 36 distinct customer parties.
+
 **Parse rules (rows 6+):**
 - Skip if `transaction_date` is None
 - Skip if `account_name` is empty
 - Skip if `voucher_no == 'Brought Forward'`
 - Skip if `debit == 0 and credit == 0` (evaluated AFTER sign normalization below)
 - Skip if `contra_account == 'Default Purchase Account'`
+- Skip if `account_group != 'All Customer Accounts'` (case-insensitive, col[10])
+- Skip if `'iravi' in account_name.lower()` (explicit IRAVI own-company exclusion)
 
 **Sign normalization (applied immediately after reading debit/credit, before the skip check):**
 FUSIL writes some adjustments (e.g. `Roundoff A/C`) as a negative value on one side of the ledger.
@@ -208,7 +217,7 @@ if credit < 0:
 Example: EKR INDUSTRIES voucher POSRT2526-7 `Roundoff A/C` row arrives as `debit=-0.48, credit=0`.
 After normalization: `debit=0.0, credit=0.48` → stored as `category='Cr', sub_category='Roundoff A/C', amount=0.48` (correct — reduces the Dr balance). Before this fix, `amount=-0.48` was stored with `category='Cr'`, which ADDED 0.48 to the balance instead of subtracting it (0.48 reconciliation error).
 
-**Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
+**Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name (Account field), [5]=contra_account, [6]=debit, [7]=credit, [10]=account_group`
 
 **Category & sub-category logic:**
 | Transaction Name | Category | Sub-category (from Contra Account) |
@@ -235,8 +244,20 @@ Previously the Sales Invoice Returns branch hardcoded `category = 'Cr'` regardle
 Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `raw/Customer`)
 
 **Sheets read (both from the same workbook):**
-1. `General` sheet — party-code lookup (col[0]=Name, col[2]=Code, e.g. `ANK001`). Read first to build an uppercase-name → code dict.
-2. `Delivery Address` sheet (the workbook's active sheet) — address/contact data. Column mapping (0-indexed, header row 1, data from row 2): `[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`
+1. `General` sheet — **authoritative customer list** (col[0]=Name, col[2]=Code, e.g. `ANK001`). Every account in the General sheet produces a row in `customer_details` with its party code. Read by `_build_code_lookup(wb)` → `{UPPER_NAME -> code|None}`.
+2. `Delivery Address` sheet (the workbook's active sheet) — address/contact enrichment. Read by `_build_delivery_lookup(wb)` → `{UPPER_NAME -> {district, city, state, pin, mobile_no}}`. First occurrence of a name wins when duplicates exist. Column mapping (0-indexed, header row 1, data from row 2): `[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`.
+
+**Row source (changed 2026-06-27):**
+The master customer list is now the **union** of `General` and `Delivery Address` names
+(`all_names = set(code_lookup) | set(delivery_lookup)`). Previously the row source was
+only the `Delivery Address` sheet, which caused customers without a delivery address to be
+missing from `customer_details` entirely — and therefore to show no code in the Customer
+Balances FY report. Now:
+- **General-only customers** — inserted WITH their code; address fields all NULL.
+- **Delivery-Address-only customers** — inserted with address fields; `customer_code = NULL`.
+- **Customers in both sheets** — inserted WITH their code AND their address fields.
+
+No customer is lost relative to the previous behaviour; the union strictly adds rows.
 
 **Column mapping — General sheet (0-indexed, header row 1, data from row 2):**
 `[0]=Name, [2]=Code (party code)`
@@ -245,7 +266,7 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 - `customer_name` — uppercased (used as join key between both sheets)
 - `district`, `city` — title-cased
 - `state` — mapped: `37-Andhra Pradesh` → `AP`, `36-Telangana` → `TG`
-- `mobile_no` — numeric values cast to string; string values stripped of whitespace
+- `mobile_no` — numeric values cast to string; string values stripped of whitespace; last 10 digits used if > 10
 - `customer_code` — cast to string and stripped; blank/None stored as NULL; looked up by uppercased name from the `General` sheet; if no match the customer row is still inserted with `customer_code = NULL`
 
 **Upsert strategy:** `INSERT ... ON CONFLICT (customer_name) DO UPDATE SET ...` — simple dimension upsert, no milestoning. `updated_at` refreshed on each update.
@@ -253,6 +274,8 @@ Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `r
 **Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, customer_code, updated_at)`
 
 **Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. Apply migration before running this Lambda. Re-running the ETL on any existing file will backfill `customer_code` for all existing rows via the `ON CONFLICT DO UPDATE` clause.
+
+**Re-ingest required after 2026-06-27 deploy:** the `Customer Accounts Export File*.xlsx` must be re-uploaded to S3 `raw/` so the updated Lambda can insert General-only customers and backfill codes for existing rows. After re-ingest, run `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries from Redis.
 
 ---
 
@@ -301,7 +324,7 @@ Partial unique index on (name) WHERE out_z IS NULL.
 
 **Status: complete**
 
-Source file: same `Ledger All Accounts*.xlsx` used by `etl_customer_ledger`. Reads `wb.active` (sheet named "Invoice"); data from `min_row=6`.
+Source file: same `Ledger All Accounts*.xlsx` used by `etl_customer_ledger`. Reads `wb.active` (sheet named "Invoice"); header row 5; data from `min_row=6`.
 
 **Trigger:** EventBridge "Object Created" rule (NOT an S3 Records event). Event shape:
 ```
@@ -315,13 +338,14 @@ key    = urllib.parse.unquote(event['detail']['object']['key'])   # %20 not '+';
 - Does NOT emit any EventBridge event.
 - `etl_customer_ledger` owns the file lifecycle entirely.
 
-**Supplier filter:**
-- Loads all names from `supplier_accounts` (`SELECT name FROM supplier_accounts` — all rows, no out_z filter) and builds an uppercase set.
-- Keeps a row only if `account_name.strip().upper()` is in that set. Case-insensitive because file casing is mixed (e.g. "Sree Venkata Sai Packing" in the file vs mixed case in supplier_accounts).
-- `supplier_accounts` already excludes IRAVI own-company rows.
-- **Migration dependency:** IaC migration 016 (`supplier_accounts` table) must exist and be populated before running this Lambda.
+**Supplier filter (col[10] — Account Group):**
+- Identifies supplier rows directly from the ledger file: `account_group = str(row[10] or '').strip()`.
+- Keeps a row only if `account_group.lower() == 'all supplier accounts'`. Case-insensitive comparison for safety. Distinct groups in the file include "All Customer Accounts", "All Supplier Accounts", "All Sales Accounts", "All Bank Accounts", etc.
+- Explicit IRAVI exclusion: after the account group check, rows where `'iravi' in account_name.lower()` are dropped. IRAVI own-company accounts ("IRAVI AGRO LIFE HYD", "IRAVI AGRO LIFE LLP - GNT") appear under "All Supplier Accounts" in the ledger and must not land in `supplier_ledger`.
+- **Does NOT read `supplier_accounts` at all.** No DB read is required for filtering.
+- Sample file (2026-06-27): 114 raw "All Supplier Accounts" rows → 10 IRAVI rows dropped → remaining skip rules (Brought Forward, zero-value, null-date) → **83 rows written** from 7 distinct suppliers including JAGRUTHI AGRO CHEMICALS (36 rows).
 
-**Column mapping (0-indexed):** `[0]=transaction_date, [1]=voucher_no, [2]=transaction_name, [4]=account_name, [5]=contra_account, [6]=debit, [7]=credit`
+**Column mapping (0-indexed):** `[0]=transaction_date, [1]=voucher_no, [2]=transaction_name, [4]=account_name (Account field), [5]=contra_account, [6]=debit, [7]=credit, [10]=account_group`
 
 **Parse / skip rules (identical mechanics to etl_customer_ledger):**
 - Sign normalization applied first: negative debit → add to credit & zero; negative credit → add to debit & zero.
@@ -356,7 +380,7 @@ Partial unique index on (transaction_date, voucher_no, account_name, category, s
 
 **IaC requirements (report to orchestrator):**
 - Migration 017 — create `supplier_ledger` table + partial unique index (schema above).
-- `lambda_etl_supplier_ledger.tf` — EventBridge "Object Created" rule on key prefix `raw/Ledger`; IAM: `s3:GetObject` on `DATA_BUCKET` (read-only, no PutObject/DeleteObject); Secrets Manager `secretsmanager:GetSecretValue` on `DB_SECRET_ARN`; env vars: `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; handler = `handler.lambda_handler`; runtime python3.12.
+- `lambda_etl_supplier_ledger.tf` — EventBridge "Object Created" rule on key prefix `raw/Ledger`; IAM: `s3:GetObject` on `DATA_BUCKET` (read-only, no PutObject/DeleteObject); Secrets Manager `secretsmanager:GetSecretValue` on `DB_SECRET_ARN`; env vars: `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; handler = `handler.lambda_handler`; runtime python3.12. **No `supplier_accounts` read at runtime** — the IAM policy does not need DB read for that table.
 - S3 bucket EventBridge notifications must be enabled (already enabled if etl_customer_ledger's rule is active on the same bucket).
 - CI layer build step for this Lambda (openpyxl + psycopg2-binary layer in `terraform.yml`).
 
@@ -659,7 +683,7 @@ Empty-data case returns `{'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balan
 
 **RBAC screen key (IaC + UI must register):** `reports.supplier_balances_fy`
 
-**Runtime dependency:** `supplier_ledger` (IaC migration 017) and `supplier_accounts` (IaC migration 016) must exist and be populated. No code change in the ETL layer is needed.
+**Runtime dependency:** `supplier_ledger` (IaC migration 017) must exist. `supplier_accounts` (IaC migration 016) is joined for city lookup only (LEFT JOIN — unmatched suppliers show null city). `etl_supplier_ledger` no longer reads `supplier_accounts` at all; it identifies supplier rows via col[10] of the ledger file.
 
 ---
 
@@ -904,7 +928,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
-- [x] etl_supplier_ledger Lambda (2026-06-27) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; filters to supplier rows via case-insensitive match against supplier_accounts; purchase-side sign-normalization + category/sub-category mapping; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf
+- [x] etl_supplier_ledger Lambda (2026-06-27, revised 2026-06-27) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; identifies supplier rows by col[10] (Account Group) == 'All Supplier Accounts' (case-insensitive); explicit iravi exclusion (`'iravi' in account_name.lower()`); does NOT read supplier_accounts at all; account_name from col[4] (Account field); contra_account from col[5] drives sub_category; purchase-side sign-normalization + category/sub-category mapping; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf
 - [x] etl_supplier_accounts Lambda (2026-06-27) — full handler: parse `Supplier Accounts Export File*.xlsx` (General sheet, header row 1, data from row 2); columns [0]=Name [6]=GST [7]=GSTValid [12]=City [13]=State; IRAVI own-company rows filtered; gst_valid int→bool with None/0 distinction; city title-cased; state prefix-stripped ("36-Telangana" → "Telangana"); uni-temporal milestoning upsert (close-then-insert on name); archives source to processed/raw/; no EventBridge emit; requires IaC migration 016 + lambda_etl_supplier_accounts.tf
 - [x] alerts aggregate categories `sales` + `sale_returns` (2026-06-26) — new FIELD_CATALOG_SALES and FIELD_CATALOG_SALE_RETURNS in alerts_eval.py; compute_window_dates() for 5 time windows (prev_day/prev_week/last_month/prev_quarter/fy) with fiscal-quarter + April-FY-boundary handling; _query_aggregate_metrics() builds a single SQL with FILTER clauses per window (sales=net, sale_returns=returns-only); evaluate_aggregate() returns {category,matched,metrics,conditions}; both alerts_eval.py copies updated in sync; validate_alert() now accepts all 3 categories with per-category field validation; IaC migration 015 required for alerts.branch VARCHAR(100)
 - [x] alerts.branch column support (2026-06-26) — _ALERT_SELECT, _alert_row_to_dict, _handle_alerts_create INSERT, _handle_alerts_update UPDATE all include branch; _load_active_alerts in evaluator includes branch; branch accepted/returned in all CRUD endpoints; NULL/'ALL'/'' = no branch filter in metric query
@@ -929,7 +953,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] etl_customer_accounts Lambda — full handler: parse `Customer Accounts Export File*.xlsx`, normalise case + state codes, upsert into `customer_details`
 - [x] etl_customer_accounts mobile_no normalization — strip spaces, take last 10 digits if > 10
 - [x] etl_customer_accounts customer_code — reads `General` sheet (col[2]=Code), builds uppercase-name→code lookup, includes `customer_code` in INSERT and ON CONFLICT UPDATE; requires IaC migration 011
-- [x] etl_customer_ledger `known_customers` filter — loads customer set from `customer_details` once per invocation; skips any ledger row whose `account_name` is not in the set
+- [x] etl_customer_accounts General-as-master-list fix (2026-06-27) — `_parse` now builds two lookups: `_build_code_lookup(wb)` from General (unchanged) and new `_build_delivery_lookup(wb)` from Delivery Address; row set is the UNION of both name sets so every General-sheet customer is inserted WITH its code even when absent from Delivery Address; General-only customers get address fields NULL; Delivery-only customers get customer_code NULL; no previously-included customer is lost; fixes missing party codes in Customer Balances FY report; re-ingest of `Customer Accounts Export File*.xlsx` + `POST /admin/cache/flush` required after deploy
+- [x] etl_customer_ledger Account Group filter (2026-06-27) — customer rows now identified by col[10] (`account_group == 'All Customer Accounts'`, case-insensitive) instead of joining to `customer_details`; explicit `'iravi' in account_name.lower()` exclusion; `_load_known_customers` and `known_customers` parameter removed; no DB read at parse time; customers without a `customer_details` record are now included in `customer_ledger` and appear in Customer Balances FY with null code/city; 268 rows kept from sample file (36 parties); re-ingest required for change to take effect
 - [x] etl_customer_ledger sign-normalization fix — negative debit/credit values (e.g. FUSIL Roundoff adjustments) are normalized to the opposite side before category/amount classification; fixes 0.48 reconciliation error on EKR INDUSTRIES POSRT2526-7 and any similar rows
 - [x] etl_customer_ledger Sales Invoice Returns category-by-column fix — Sales Invoice Returns branch now classifies `category = 'Cr' if credit > 0 else 'Db'` instead of hardcoding `'Cr'`; fixes roundoff rows that land on the debit side after sign-normalization (e.g. SRI VENKATESWARA COFFEE AND GENERAL STORES excess Cr 0.20, EKR INDUSTRIES excess Cr 0.48); re-ingest with close-then-reload required for affected months
 - [x] etl_appendix_b_x11 Lambda — full handler: parse `Barcodes Masters*.xlsx`, normalize barcodes + dates, unitemporal upsert into `appendix_b_x11_stock`
@@ -974,12 +999,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [ ] **SES sender verification** — verify `ALERTS_SENDER_EMAIL` in AWS SES console (or move SES out of sandbox for production sending). Manual step.
 - [ ] **Copy alerts_eval.py on every change** — whenever `lambda/api/alerts_eval.py` is updated, the copy at `lambda/alerts_evaluator/alerts_eval.py` must be kept in sync (cp command).
 - [ ] **Apply IaC migration 011** — `customer_code VARCHAR(20)` column on `customer_details`; must be applied via psql/SSM before deploying the updated `etl_customer_accounts` Lambda; re-running the ETL on the existing file will backfill codes for all existing rows
+- [ ] **RE-INGEST customer_details after General-as-master-list fix (2026-06-27)** — upload `Customer Accounts Export File*.xlsx` to S3 `raw/` so the updated Lambda inserts all General-sheet customers (with codes) and backfills codes + addresses for existing rows via ON CONFLICT DO UPDATE. Then run `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries. No schema change needed (same 7 columns; no IaC migration required).
 - [ ] **Flush report cache after deploy** — `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` AND `iravi:ledger:statement:*` entries; required after the `code` field was added, after the `credit_notes` split (2026-06-23), and after the per-voucher netting fix (2026-06-23); no re-ingest needed
 - [ ] **IaC slice for `/reports/customer-balances-fy`** — add API Gateway route `GET /reports/customer-balances-fy` + CORS allow-method in `lambda_api.tf` (iravi-dashboard-iac)
 - [ ] **UI slice for `/reports/customer-balances-fy`** — add `getCustomerBalancesFy(fyCount)` client method in `src/api/client.ts`; add RBAC screen key `reports.customer_balances_fy` to `app_screens` (IaC migration) and wire the screen in the UI router
 - [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007`, `008` migrations via bastion SSM port-forward
 - [ ] **whatsapp_notifier phase 2** — once WhatsApp Business approved: add `iravi/dashboard/whatsapp` secret (bearer_token, phone_number_id), add DB + Secrets Manager IAM to Lambda, implement `_send_whatsapp()` in handler
-- [ ] **Run cleanup SQL** — close bad `customer_ledger` rows: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND account_name NOT IN (SELECT customer_name FROM customer_details)`
+- [ ] **RE-INGEST customer_ledger after Account Group filter change (2026-06-27)** — the new filter selects by col[10] instead of `customer_details` membership, so previously-dropped customer rows are now included. The Ledger All Accounts file must be re-uploaded to S3 `raw/` to pick up the change. Note: this affects ALL consumers of `customer_ledger` (Customer Balances FY report, ledger statement, alerts balances evaluation, `iravi:ledger:range` redis key) — previously-missing customers will appear everywhere after re-ingest. Flush Redis (`POST /admin/cache/flush`) after re-ingest.
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`
 - [ ] **RE-INGEST customer_ledger after category-by-column fix** — the Sales Invoice Returns roundoff fix changes `category` from `Cr` → `Db` for affected rows. Because `category` is part of the milestoning natural key `(transaction_date, voucher_no, account_name, category, sub_category)`, a plain re-ingest will NOT close the old `Cr` row (key mismatch); it will INSERT a duplicate `Db` row alongside the wrong `Cr` row. Required procedure: (1) **close** all open roundoff rows for affected vouchers manually (SQL: `UPDATE customer_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category = 'Roundoff A/C' AND category = 'Cr' AND voucher_no IN (<affected voucher list>)`), then (2) re-upload the ledger xlsx to S3 so the ETL inserts corrected `Db` rows. Then flush Redis (`POST /admin/cache/flush`). Affected customers confirmed: EKR INDUSTRIES (POSRT2526-7, excess Cr 0.48), SRI VENKATESWARA COFFEE AND GENERAL STORES Podili (excess Cr 0.20). Also requires per-voucher netting deploy in the API (already implemented, pending cache flush).
 - [ ] **Test etl_customer_ledger end-to-end** — upload ledger xlsx to S3, verify only valid customer rows inserted, verify `iravi:ledger:range` Redis key

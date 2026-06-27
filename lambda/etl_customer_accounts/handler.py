@@ -105,22 +105,32 @@ def _build_code_lookup(wb) -> dict:
     return lookup
 
 
-def _parse(src_path: str) -> list[dict]:
-    wb = openpyxl.load_workbook(src_path, data_only=True)
+def _build_delivery_lookup(wb) -> dict:
+    """Return uppercase-name -> address-fields dict from the 'Delivery Address' sheet.
 
-    # Build party-code lookup from the General sheet before reading main sheet
-    code_lookup = _build_code_lookup(wb)
+    Delivery Address sheet layout (0-indexed, header row 1, data from row 2):
+      [0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState,
+      [7]=DLPIN, [9]=DLMobileNo
 
-    # Main data comes from the 'Delivery Address' sheet (wb.active)
+    Names are uppercased to match the normalization applied elsewhere.
+    All address transforms are identical to those previously applied in _parse():
+      - district/city: title-cased, blank -> None
+      - state: mapped via _STATE_MAP, missing key -> None
+      - pin: str-stripped, blank -> None
+      - mobile_no: int/float -> str(int()), str -> strip spaces; last 10 digits if > 10
+
+    First occurrence of a name wins when the same name appears more than once.
+    """
     ws = wb.active
-
-    rows = []
+    lookup = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
         name = str(row[0] or '').strip()
         if not name:
             continue
-
-        customer_name = name.upper()
+        upper_name = name.upper()
+        if upper_name in lookup:
+            # first occurrence wins
+            continue
 
         district = str(row[3] or '').strip()
         city = str(row[4] or '').strip()
@@ -136,17 +146,51 @@ def _parse(src_path: str) -> list[dict]:
         if mobile_no and len(mobile_no) > 10:
             mobile_no = mobile_no[-10:]
 
-        # Party code from General sheet; None (NULL) when not present
-        customer_code = code_lookup.get(customer_name)
-
-        rows.append({
-            'customer_name': customer_name,
+        lookup[upper_name] = {
             'district': district.title() if district else None,
             'city': city.title() if city else None,
             'state': _STATE_MAP.get(state_raw),
             'pin': pin or None,
             'mobile_no': mobile_no,
-            'customer_code': customer_code,
+        }
+
+    logger.info('Built delivery lookup: %d entries', len(lookup))
+    return lookup
+
+
+def _parse(src_path: str) -> list[dict]:
+    wb = openpyxl.load_workbook(src_path, data_only=True)
+
+    # Build party-code lookup from the General sheet — this is the authoritative
+    # customer list: every account in General gets a row WITH its code.
+    code_lookup = _build_code_lookup(wb)
+
+    # Build address lookup from the Delivery Address sheet (wb.active).
+    # Used for enrichment only; customers absent from here still get inserted.
+    delivery_lookup = _build_delivery_lookup(wb)
+
+    logger.info(
+        'Customer counts — General: %d, Delivery Address: %d',
+        len(code_lookup), len(delivery_lookup),
+    )
+
+    # Union of both sets: no customer is lost regardless of which sheet they
+    # appear on.  General-only customers get address fields = None.
+    # Delivery-only customers get customer_code = None.
+    all_names = set(code_lookup) | set(delivery_lookup)
+    logger.info('Total unique customers after union: %d', len(all_names))
+
+    rows = []
+    for name in sorted(all_names):
+        addr = delivery_lookup.get(name, {})
+        rows.append({
+            'customer_name': name,
+            'district': addr.get('district'),
+            'city': addr.get('city'),
+            'state': addr.get('state'),
+            'pin': addr.get('pin'),
+            'mobile_no': addr.get('mobile_no'),
+            'customer_code': code_lookup.get(name),
         })
 
     return rows
