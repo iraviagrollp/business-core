@@ -349,28 +349,45 @@ key    = urllib.parse.unquote(event['detail']['object']['key'])   # %20 not '+';
 
 **Parse / skip rules (identical mechanics to etl_customer_ledger):**
 - Sign normalization applied first: negative debit → add to credit & zero; negative credit → add to debit & zero.
-- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `contra_account == 'Default Sales Account'` (defensive); `transaction_name.lower().startswith('sales')` (see below); `account_group.lower() != 'all supplier accounts'`; `'iravi' in account_name.lower()`.
+- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `account_group.lower() != 'all supplier accounts'`; `'iravi' in account_name.lower()`.
 - Date parsed with multi-format `_parse_date` (datetime / date / `%Y-%m-%d` / `%d-%m-%Y` / `%d/%m/%Y`). Unparseable → log warning and skip.
+- **No sales-transaction exclusion.** Sales made TO a supplier (where the supplier is classified under `All Supplier Accounts` in FUSIL but is also an IRAVI customer) are legitimate and must appear in `supplier_ledger` so they show in Supplier Balances FY. The `Default Sales Account` skip and the `transaction_name.startswith('sales')` skip that were added 2026-06-27 have been reverted (2026-06-27).
 
-**Sales-side transaction exclusion (added 2026-06-27):**
-- Skip rule: `if transaction_name.lower().startswith('sales'): continue` — placed after the `contra_account == 'Default Sales Account'` check, before the Account Group filter.
-- Rationale: `MERCO ENERGY SOLUTIONS PRIVATE LIMITED` is classified under `All Supplier Accounts` in FUSIL but was billed on a `Sales Invoice` (it is the debtor — all Debit). Without this rule its CGST Output / SGST Output legs (₹1,12,612.50 each) fall through `_PURCHASE_CONTRA_SUBCATEGORY` (neither is a purchase-contra account) and land as `sub_category = 'Sales Invoice'`. Because both legs share the same five-column natural key they also cause milestoning thrash on every re-ingest.
-- Covers `"Sales Invoice"` and `"Sales Invoice Returns"` (source may have trailing space — already stripped). The existing `Default Sales Account` contra-check is kept as a secondary defensive guard.
-- Re-ingest required after deploy: the `Ledger All Accounts*.xlsx` must be re-uploaded to S3 `raw/` (or the latest copy re-triggered) so the Lambda re-runs and closes the stale MERCO sales rows in `supplier_ledger` (sets `out_z = NOW()`). After re-ingest, flush cache (`POST /admin/cache/flush`) to purge stale `iravi:reports:supplier_balances_fy:*` Redis entries.
-- Verified (2026-06-27): MERCO file `Ledger All Accounts27-6-2026(16.3.50).xlsx` — 2 kept rows before filter → 0 after (both CGST/SGST Output Sales Invoice legs excluded). Main file `Ledger All Accounts27-6-2026(12.20.22).xlsx` — 83 kept rows before → 83 after (0 sales-named rows in supplier accounts; all 7 suppliers including JAGRUTHI AGRO CHEMICALS (36 rows) fully intact).
+**Sales-side transactions in supplier_ledger (revised 2026-06-27):**
+- MERCO ENERGY SOLUTIONS PRIVATE LIMITED (`All Supplier Accounts`) has Sales Invoice SIA2627-1 with three Debit legs: `Default Sales Account` 1,251,250.00, `CGST Output A/C` 112,612.50, `SGST Output A/C` 112,612.50 (total 1,476,475.00 Db).
+- The expanded `_CONTRA_SUBCATEGORY` map resolves these to `sub_category = Sale / CGST / SGST` → three distinct natural keys → no milestoning collision → all three captured.
+- Previously: (a) the `Default Sales Account` leg was dropped by a defensive skip; (b) both GST-output legs fell through to `sub_category = 'Sales Invoice'` (the transaction name fallback) → identical natural key → collision on every re-ingest. Both bugs are now fixed.
+- Verified: FILE 1 (`Ledger All Accounts27-6-2026(12.19.10).xlsx`, April 2026) — 40 total supplier rows; MERCO yields exactly 3 rows: (Db, Sale, 1,251,250.00), (Db, CGST, 112,612.50), (Db, SGST, 112,612.50); total 1,476,475.00; all distinct natural keys.
+- Verified: FILE 2 (`Ledger All Accounts27-6-2026(12.20.22).xlsx`, June 2026) — 83 total supplier rows; JAGRUTHI AGRO CHEMICALS 36 rows (`sub_categories: {'Roundoff','IGST','Bank Payment','Purchase'}`); all 7 purchase suppliers intact and unaffected.
+- **One-time DB cleanup required** (stale rows from the previous exclusion deploy): `UPDATE supplier_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category IN ('Sales Invoice','Sales Invoice Returns');`
 
-**Category / sub-category (purchase-side mapping):**
-```
-_PURCHASE_CONTRA_SUBCATEGORY = {'CGST Input A/C':'CGST','SGST Input A/C':'SGST','IGST Input A/C':'IGST','Default Purchase Account':'Purchase','Roundoff A/C':'Roundoff'}
+**Category / sub-category (purchase-side AND sales-side combined):**
+```python
+_CONTRA_SUBCATEGORY = {
+    # Purchase-side (supplier credited)
+    'CGST Input A/C':             'CGST',
+    'SGST Input A/C':             'SGST',
+    'IGST Input A/C':             'IGST',
+    'Default Purchase Account':   'Purchase',
+    'Default PurchaseReturn Account': 'Purchase Return',
+    # Sales-side (supplier debited — we also sell to this supplier)
+    'CGST Output A/C':            'CGST',
+    'SGST Output A/C':            'SGST',
+    'IGST Output A/C':            'IGST',
+    'Default Sales Account':      'Sale',
+    'Default SalesReturn Account': 'Sales Return',
+    # Shared
+    'Roundoff A/C':               'Roundoff',
+}
 _TXN_SUBCATEGORY = {'Bank Payments':'Bank Payment','Cash Payments':'Cash Payment','Bank Receipts':'Bank Receipt','Cash Receipts':'Cash Receipt'}
 
 category    = 'Cr' if credit > 0 else 'Db'
 amount      = credit if credit > 0 else debit
-sub_category = _PURCHASE_CONTRA_SUBCATEGORY.get(contra_account)
+sub_category = _CONTRA_SUBCATEGORY.get(contra_account)
                or _TXN_SUBCATEGORY.get(transaction_name)
                or transaction_name or contra_account
 ```
-Purchase Vouchers credit the supplier (`Cr`); Bank/Cash Payments debit the supplier (`Db`).
+Purchase Vouchers credit the supplier (`Cr`); Bank/Cash Payments debit the supplier (`Db`); Sales Invoices TO the supplier debit the supplier (`Db`).
 
 **Milestoning upsert:** identical close-then-insert into `supplier_ledger`.
 Natural key = `(transaction_date, voucher_no, account_name, category, sub_category)`.
@@ -935,7 +952,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
-- [x] etl_supplier_ledger Lambda (2026-06-27, revised 2026-06-27) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; identifies supplier rows by col[10] (Account Group) == 'All Supplier Accounts' (case-insensitive); explicit iravi exclusion (`'iravi' in account_name.lower()`); does NOT read supplier_accounts at all; account_name from col[4] (Account field); contra_account from col[5] drives sub_category; purchase-side sign-normalization + category/sub-category mapping; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf
+- [x] etl_supplier_ledger Lambda (2026-06-27, revised 2026-06-27 x2) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; identifies supplier rows by col[10] (Account Group) == 'All Supplier Accounts' (case-insensitive); explicit iravi exclusion (`'iravi' in account_name.lower()`); does NOT read supplier_accounts at all; account_name from col[4] (Account field); contra_account from col[5] drives sub_category; combined `_CONTRA_SUBCATEGORY` map covers BOTH purchase-side (Input GST/Default Purchase/Purchase Return/Roundoff → Cr rows) AND sales-side (Output GST/Default Sales/Sales Return → Db rows), eliminating the dropped-principal and natural-key-collision bugs for MERCO-style Sales Invoice rows; `_TXN_SUBCATEGORY` fallback unchanged; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf; one-time cleanup SQL: `UPDATE supplier_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category IN ('Sales Invoice','Sales Invoice Returns');`
 - [x] etl_supplier_accounts Lambda (2026-06-27) — full handler: parse `Supplier Accounts Export File*.xlsx` (General sheet, header row 1, data from row 2); columns [0]=Name [6]=GST [7]=GSTValid [12]=City [13]=State; IRAVI own-company rows filtered; gst_valid int→bool with None/0 distinction; city title-cased; state prefix-stripped ("36-Telangana" → "Telangana"); uni-temporal milestoning upsert (close-then-insert on name); archives source to processed/raw/; no EventBridge emit; requires IaC migration 016 + lambda_etl_supplier_accounts.tf
 - [x] alerts aggregate categories `sales` + `sale_returns` (2026-06-26) — new FIELD_CATALOG_SALES and FIELD_CATALOG_SALE_RETURNS in alerts_eval.py; compute_window_dates() for 5 time windows (prev_day/prev_week/last_month/prev_quarter/fy) with fiscal-quarter + April-FY-boundary handling; _query_aggregate_metrics() builds a single SQL with FILTER clauses per window (sales=net, sale_returns=returns-only); evaluate_aggregate() returns {category,matched,metrics,conditions}; both alerts_eval.py copies updated in sync; validate_alert() now accepts all 3 categories with per-category field validation; IaC migration 015 required for alerts.branch VARCHAR(100)
 - [x] alerts.branch column support (2026-06-26) — _ALERT_SELECT, _alert_row_to_dict, _handle_alerts_create INSERT, _handle_alerts_update UPDATE all include branch; _load_active_alerts in evaluator includes branch; branch accepted/returned in all CRUD endpoints; NULL/'ALL'/'' = no branch filter in metric query
@@ -992,6 +1009,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **POST-DEPLOY: supplier_ledger cleanup + re-ingest (2026-06-27)** — after deploying the revised etl_supplier_ledger (combined _CONTRA_SUBCATEGORY map, sales-side rows kept): (a) re-upload / re-trigger `Ledger All Accounts*.xlsx` to S3 `raw/` so the Lambda re-runs and correctly inserts MERCO's 3 Sales Invoice legs as distinct rows; (b) run the one-time cleanup to close stale malformed rows left by the previous deploy: `UPDATE supplier_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category IN ('Sales Invoice','Sales Invoice Returns');`; (c) flush Redis cache: `POST /admin/cache/flush` to purge stale `iravi:reports:supplier_balances_fy:*` entries. All three steps in order.
 - [ ] **IaC: migration 017** — create `supplier_ledger` table. Schema: `id SERIAL PK, transaction_date DATE NOT NULL, voucher_no VARCHAR(50) NOT NULL, account_name VARCHAR(200) NOT NULL, category VARCHAR(10) NOT NULL, sub_category VARCHAR(100) NOT NULL, amount NUMERIC(15,4) NOT NULL, in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_ledger (transaction_date, voucher_no, account_name, category, sub_category) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_ledger. Requires migration 016 (supplier_accounts) to be applied first.
 - [ ] **IaC: lambda_etl_supplier_ledger.tf** — Lambda function (source_dir = `lambda/etl_supplier_ledger`, runtime python3.12, handler `handler.lambda_handler`); env vars `DATA_BUCKET`, `DB_SECRET_ARN`, `RAW_PREFIX`, `PROCESSED_PREFIX`; IAM: Secrets Manager `GetSecretValue` on `DB_SECRET_ARN`; `s3:GetObject` on `DATA_BUCKET` (read-only — no PutObject, no DeleteObject); trigger: EventBridge "Object Created" rule on key prefix `raw/Ledger` (same bucket/prefix as etl_customer_ledger's S3 trigger — both Lambdas receive the same event). S3 bucket EventBridge notifications must be enabled (already enabled if etl_customer_ledger is active). Layer: openpyxl + psycopg2-binary; add CI pip-layer build step in `terraform.yml`.
 - [ ] **IaC: migration 016** — create `supplier_accounts` table. Schema: `id BIGSERIAL PK, name VARCHAR(255) NOT NULL, gst VARCHAR(20), gst_valid BOOLEAN, city VARCHAR(120), state VARCHAR(100), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ NULL`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_accounts (name) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_accounts.

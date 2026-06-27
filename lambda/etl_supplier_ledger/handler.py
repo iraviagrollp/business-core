@@ -3,8 +3,14 @@ etl_supplier_ledger — EventBridge-triggered Lambda.
 
 Reads the same "Ledger All Accounts*.xlsx" export used by etl_customer_ledger
 but keeps ONLY rows where col[10] (Account Group) == 'All Supplier Accounts'.
-Applies purchase-side category/sub-category logic and writes to the
-supplier_ledger table using uni-temporal milestoning.
+Applies purchase-side AND sales-side category/sub-category logic and writes to
+the supplier_ledger table using uni-temporal milestoning.
+
+Sales made TO a supplier (i.e. the supplier is also a customer of IRAVI) are
+legitimate and must appear in supplier_ledger so they show in Supplier Balances
+FY.  The expanded _CONTRA_SUBCATEGORY map resolves both purchase-side and
+sales-side contra accounts to distinct sub-categories, preventing natural-key
+collisions on multi-leg GST vouchers.
 
 This Lambda is STRICTLY READ-ONLY on S3:
   - It does NOT copy, move, or delete any S3 object.
@@ -49,14 +55,27 @@ _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'Ledger All Accounts'
 
-# Contra Account → sub_category (purchase-side)
-# Purchase Vouchers credit the supplier; contra accounts are the debit side.
-_PURCHASE_CONTRA_SUBCATEGORY = {
-    'CGST Input A/C': 'CGST',
-    'SGST Input A/C': 'SGST',
-    'IGST Input A/C': 'IGST',
-    'Default Purchase Account': 'Purchase',
-    'Roundoff A/C': 'Roundoff',
+# Contra Account → sub_category (purchase-side AND sales-side combined).
+# Purchase Vouchers credit the supplier; their contra accounts are the debit side.
+# Sales Invoices TO a supplier debit the supplier; their contra accounts are the
+# credit side.  Both sets must be mapped to distinct, meaningful sub-categories
+# so that multi-leg vouchers (e.g. principal + CGST + SGST) each get a unique
+# natural key and do not collide during milestoning.
+_CONTRA_SUBCATEGORY = {
+    # Purchase-side (supplier credited)
+    'CGST Input A/C':             'CGST',
+    'SGST Input A/C':             'SGST',
+    'IGST Input A/C':             'IGST',
+    'Default Purchase Account':   'Purchase',
+    'Default PurchaseReturn Account': 'Purchase Return',
+    # Sales-side (supplier debited — we also sell to this supplier)
+    'CGST Output A/C':            'CGST',
+    'SGST Output A/C':            'SGST',
+    'IGST Output A/C':            'IGST',
+    'Default Sales Account':      'Sale',
+    'Default SalesReturn Account': 'Sales Return',
+    # Shared
+    'Roundoff A/C':               'Roundoff',
 }
 
 # Transaction Name → sub_category (fallback for payment / receipt transactions)
@@ -211,20 +230,6 @@ def _parse(src_path: str) -> list[dict]:
             continue
         if debit == 0 and credit == 0:
             continue
-        # Defensive: drop any row contra'd against the sales account
-        # (mirrors customer_ledger's 'Default Purchase Account' skip on the
-        # customer side; should not appear in supplier rows but guards against
-        # unexpected cross-account data).
-        if contra_account == 'Default Sales Account':
-            continue
-        # Exclude sales-side transactions: a supplier account that is mis-used
-        # on a Sales Invoice in FUSIL (e.g. a debtor whose Account Group is
-        # 'All Supplier Accounts') must not pollute the purchase/payable ledger.
-        # Covers 'Sales Invoice' and 'Sales Invoice Returns' (trailing spaces
-        # already stripped above).  This also eliminates the natural-key
-        # collision caused by duplicate GST-output legs on the same voucher.
-        if transaction_name.lower().startswith('sales'):
-            continue
         # Account Group filter: keep only supplier rows identified by the
         # ledger file itself (col[10]).  Case-insensitive comparison for safety.
         if account_group.lower() != 'all supplier accounts':
@@ -240,18 +245,19 @@ def _parse(src_path: str) -> list[dict]:
             logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
             continue
 
-        # --- Category (purchase-side semantics) ---
+        # --- Category (purchase-side and sales-side semantics) ---
         # Purchase Vouchers credit the supplier (liability increases): category = 'Cr'
         # Bank/Cash Payments debit the supplier (liability decreases):  category = 'Db'
+        # Sales Invoices TO the supplier debit the supplier (receivable): category = 'Db'
         category = 'Cr' if credit > 0 else 'Db'
         amount   = credit if credit > 0 else debit
 
         # --- Sub-category resolution order ---
-        # 1. Contra account mapping (CGST/SGST/IGST/Purchase/Roundoff)
+        # 1. Contra account mapping (purchase-side + sales-side, see _CONTRA_SUBCATEGORY)
         # 2. Transaction name mapping (Bank Payment / Cash Payment / etc.)
         # 3. Fallback: transaction_name then contra_account
         sub_category = (
-            _PURCHASE_CONTRA_SUBCATEGORY.get(contra_account)
+            _CONTRA_SUBCATEGORY.get(contra_account)
             or _TXN_SUBCATEGORY.get(transaction_name)
             or transaction_name
             or contra_account
