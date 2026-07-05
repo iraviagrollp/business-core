@@ -517,14 +517,19 @@ def evaluate_aggregate(conn, alert: dict, today: date | None = None) -> dict:
     {
         "category":   "sales" | "sale_returns",
         "matched":    bool,
-        "metrics":    {<field>: <float>}   (only windows referenced in conditions)
+        "metrics":    {<field>: <float>}   (only windows referenced in conditions;
+                      empty dict when conditions list is empty)
         "conditions": [
             {
                 "field": str, "op": str, "value": float, "value2": float | None,
                 "actual": float, "breached": bool
             }
-        ]
+        ]  (empty list when conditions list is empty)
     }
+
+    When conditions is an empty list the alert is unconditional:
+    matched is always True so the alert fires on every scheduled run.
+    metrics and conditions in the returned dict will be empty ({} and []).
     """
     if today is None:
         today = date.today()
@@ -565,11 +570,15 @@ def evaluate_aggregate(conn, alert: dict, today: date | None = None) -> dict:
         })
 
     # Combine results according to match_type.
-    breached_flags = [c["breached"] for c in condition_results]
-    if match_type == "all":
-        matched = bool(condition_results) and all(breached_flags)
-    else:  # any
-        matched = bool(condition_results) and any(breached_flags)
+    # Empty conditions → unconditional alert; always fires.
+    if not condition_results:
+        matched = True
+    else:
+        breached_flags = [c["breached"] for c in condition_results]
+        if match_type == "all":
+            matched = all(breached_flags)
+        else:  # any
+            matched = any(breached_flags)
 
     return {
         "category":   category,
@@ -760,8 +769,13 @@ def validate_alert(body: dict) -> None:
         raise ValidationError(f"match_type must be one of: {sorted(_MATCH_TYPE_VALID)}")
 
     conditions = body.get("conditions")
-    if not isinstance(conditions, list) or len(conditions) == 0:
-        raise ValidationError("conditions must be a non-empty list")
+    if not isinstance(conditions, list):
+        raise ValidationError("conditions must be a list")
+    # balances always requires at least one condition.
+    # sales / sale_returns may have zero conditions (unconditional scheduled alert —
+    # always fires on schedule regardless of metric values).
+    if category == "balances" and len(conditions) == 0:
+        raise ValidationError("conditions must be a non-empty list for balances alerts")
 
     valid_fields = _VALID_FIELDS_BY_CATEGORY[category]
 
