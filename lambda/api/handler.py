@@ -9,6 +9,7 @@ import redis
 
 import auth
 import alerts_eval
+import monthly_sales
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
