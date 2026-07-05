@@ -568,7 +568,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 
 ## api — API Layer
 
-**Status: stocks complete; reports/customer-balances-fy complete; reports/supplier-balances-fy complete; sales stub**
+**Status: stocks complete; reports/customer-balances-fy complete; reports/supplier-balances-fy complete; reports/monthly-sales complete; sales stub**
 
 | Endpoint | Redis key | Status |
 |---|---|---|
@@ -577,6 +577,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /sales` | — | Stub (returns empty array) |
 | `GET /reports/customer-balances-fy` | `iravi:reports:customer_balances_fy:{fy_count}` | Complete |
 | `GET /reports/supplier-balances-fy` | `iravi:reports:supplier_balances_fy:{fy_count}` | Complete |
+| `GET /reports/monthly-sales` | `iravi:reports:monthly_sales:{month}` | Complete |
 | `GET /ledger/statement` | `iravi:ledger:statement:{account}:{from}:{to}` | Complete |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
@@ -711,6 +712,76 @@ Empty-data case returns `{'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balan
 
 ---
 
+## api — GET /reports/monthly-sales
+
+**Route:** `GET /reports/monthly-sales?month=YYYY-MM`
+
+**Query param:** `month` in `YYYY-MM` format (e.g. `2026-06`). Absent or invalid → default to the current calendar month in IST.
+
+**Source table:** `sales`, `out_z IS NULL`. Date column: `purchase_date`. Money column: `av`.
+
+**Customer restriction (same as alerts Sales metric):**
+`UPPER(party) IN (SELECT UPPER(customer_name) FROM customer_details) AND party NOT ILIKE '%iravi%'`
+
+**Net sales per (day, state):** `SUM(av WHERE sales_return='N') − SUM(av WHERE sales_return='Y')`
+
+**State mapping by branch:**
+
+| Branch | State |
+|---|---|
+| `'Guntur C & F'` | `andhra` |
+| `'Auto Nagar'` | `telangana` |
+| *(any other)* | excluded from both buckets AND from `total`; branch name collected in `unmapped_branches`, warning logged |
+
+**`total`** = andhra + telangana only (unmapped branches excluded).
+
+**Values:** raw rupees (Python float, 2 dp). UI handles conversion to lakhs.
+
+**`as_on_date`:** `min(today IST, last calendar day of selected month)`, formatted `YYYY-MM-DD`.
+
+**`days`:** one entry per calendar day of the month (day 1 through last day), each `{date, andhra, telangana, total}` in raw rupees (0.0 where no data). All days included — future days are 0.0; the UI blanks them after `as_on_date`.
+
+**`grand_total`:** sum over the full month per state (future days naturally contribute 0).
+
+**FY definition:** April 1 → March 31. `fy_label` format: `"YYYY-YY"` (e.g. `"2026-27"`) for the FY containing the selected month. Months Jan–Mar belong to the FY whose April is in the previous calendar year.
+
+**`analysis.up_to_prev_month`:** net sales per state from FY-start (April 1 of the containing FY) through the last day of the month before the selected month. If the selected month is April, this range is empty → all zeros.
+
+**`analysis.prev_month_label`:** abbreviated month name (Python `%b`) of the month before the selected month, e.g. `"May"`, `"Jun"`.
+
+**`analysis.as_on_date`:** equals `grand_total` (selected-month net per state); explicit copy for the UI's Sales Analysis "as on Date" column.
+
+**`month_label`:** uppercase month + year, e.g. `"JUNE 2026"`.
+
+**Response shape:**
+```jsonc
+{
+  "month": "2026-06",
+  "month_label": "JUNE 2026",
+  "fy_label": "2026-27",
+  "as_on_date": "2026-06-14",
+  "days": [
+    { "date": "2026-06-01", "andhra": 0.0, "telangana": 0.0, "total": 0.0 },
+    ...
+  ],
+  "grand_total": { "andhra": 3776000.0, "telangana": 403000.0, "total": 4179000.0 },
+  "analysis": {
+    "prev_month_label": "May",
+    "up_to_prev_month": { "andhra": 0.0, "telangana": 0.0, "total": 0.0 },
+    "as_on_date":       { "andhra": 3776000.0, "telangana": 403000.0, "total": 4179000.0 }
+  },
+  "unmapped_branches": []
+}
+```
+
+**Redis key:** `iravi:reports:monthly_sales:{month}` (e.g. `iravi:reports:monthly_sales:2026-06`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush`.
+
+**RBAC screen key (IaC + UI must register):** `reports.monthly_sales`
+
+**IaC requirements:** API Gateway route `GET /reports/monthly-sales` + CORS in `lambda_api.tf`; `app_screens` seed migration to insert `reports.monthly_sales`. No new DB table or column needed — reads from existing `sales` and `customer_details` tables.
+
+---
+
 ## alerts — Scheduled Alerts (admin-only)
 
 **Status: complete (API + evaluator Lambda). Migration 015 adds `branch` column.**
@@ -771,11 +842,12 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 ```json
 {"category":"sales",
  "fields":[
-   {"key":"net_sales_prev_day",     "label":"Net customer sales — previous day (₹)",             "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
-   {"key":"net_sales_prev_week",    "label":"Net customer sales — previous week (₹)",             "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
-   {"key":"net_sales_last_month",   "label":"Net customer sales — last month (₹)",               "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
-   {"key":"net_sales_prev_quarter", "label":"Net customer sales — previous fiscal quarter (₹)",  "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
-   {"key":"net_sales_fy",           "label":"Net customer sales — FY to date (₹)",               "type":"currency","ops":["gt","gte","lt","lte","eq","between"]}
+   {"key":"net_sales_prev_day",        "label":"Net customer sales — previous day (₹)",                   "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_prev_week",       "label":"Net customer sales — previous week (₹)",                  "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_last_month",      "label":"Net customer sales — last month (₹)",                    "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_prev_quarter",    "label":"Net customer sales — previous fiscal quarter (₹)",       "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_fy",              "label":"Net customer sales — FY to date (₹)",                    "type":"currency","ops":["gt","gte","lt","lte","eq","between"]},
+   {"key":"net_sales_current_month",   "label":"Net customer sales — current month to date (₹)",         "type":"currency","ops":["gt","gte","lt","lte","eq","between"]}
  ],
  "match_types":["all","any"],
  "frequencies":["daily","weekly","monthly"],
@@ -783,7 +855,7 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 ```
 
 **`?category=sale_returns`** (parallel to `sales`, labels "Customer sale returns — …"):
-- Keys: `sale_returns_prev_day`, `sale_returns_prev_week`, `sale_returns_last_month`, `sale_returns_prev_quarter`, `sale_returns_fy`
+- Keys: `sale_returns_prev_day`, `sale_returns_prev_week`, `sale_returns_last_month`, `sale_returns_prev_quarter`, `sale_returns_fy`, `sale_returns_current_month`
 - Same type/ops/match_types/frequencies/branch_scoped structure as `sales`.
 
 ### Time windows (IST, relative to run_date = today)
@@ -795,6 +867,7 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 | `last_month` | 1st–last of the previous calendar month |
 | `prev_quarter` | Previous fiscal quarter (FY Apr–Mar: Q1=Apr–Jun, Q2=Jul–Sep, Q3=Oct–Dec, Q4=Jan–Mar) |
 | `fy` | April 1 of the current FY through yesterday (empty range if run_date is April 1) |
+| `current_month` | First day of the current calendar month through yesterday (MTD). Empty range if run_date is the 1st of the month (no completed day yet). |
 
 ### Metric definition — sales and sale_returns categories
 
@@ -893,13 +966,13 @@ Each Lambda package includes a copy; `lambda/api/alerts_eval.py` is the source o
 
 **Public surface:**
 - `FIELD_CATALOG` — balances catalog (backward compat)
-- `FIELD_CATALOG_SALES`, `FIELD_CATALOG_SALE_RETURNS` — new aggregate catalogs
+- `FIELD_CATALOG_SALES`, `FIELD_CATALOG_SALE_RETURNS` — aggregate catalogs (6 fields each, including `net_sales_current_month` / `sale_returns_current_month`)
 - `FIELD_CATALOGS` — dict mapping category → catalog
-- `compute_window_dates(run_date)` — returns `{window_key: (start, end)}` for all 5 windows
+- `compute_window_dates(run_date)` — returns `{window_key: (start, end)}` for all 6 windows (prev_day, prev_week, last_month, prev_quarter, fy, current_month)
 - `evaluate_balances(conn, conditions, match_type, today)` — per-customer balances eval (unchanged)
 - `evaluate_aggregate(conn, alert, today)` — aggregate eval for sales/sale_returns
 - `_query_aggregate_metrics(conn, category, branch, windows, windows_needed)` — internal SQL helper
-- `validate_alert(body)` — validates all three categories; field keys are per-category
+- `validate_alert(body)` — validates all three categories; field keys are per-category; auto-accepts `net_sales_current_month` / `sale_returns_current_month` via catalog-driven validation
 - `is_alert_due_today(frequency, schedule_day, today)` — scheduling helper (unchanged)
 
 ### alerts_evaluator Lambda (`lambda/alerts_evaluator/handler.py`)
@@ -951,6 +1024,9 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] api Lambda — `GET /reports/monthly-sales` endpoint (2026-07-05): state-wise net customer sales for one calendar month; ?month=YYYY-MM (default current IST month); branch→state mapping (Guntur C & F=andhra, Auto Nagar=telangana; others excluded + logged); all calendar days returned with 0.0 fill; as_on_date=min(today IST, last day of month); FY label (Apr→Mar); analysis block includes up_to_prev_month (FY-start→prev-month-end, empty for April), prev_month_label (%b abbreviated), as_on_date copy of grand_total; unmapped_branches collected; raw rupees 2dp; Redis key `iravi:reports:monthly_sales:{month}` TTL _LEDGER_TTL; cleared by POST /admin/cache/flush. No new DB table/column needed. IaC: needs API Gateway route GET /reports/monthly-sales + app_screens seed for reports.monthly_sales; UI: needs client method + page + screen key.
+- [x] alerts `current_month` window + fields (2026-07-05): added `current_month` to `_WINDOW_SUFFIXES` and `compute_window_dates` (start=first day of current month, end=yesterday; empty range if run_date is 1st); added `net_sales_current_month` to FIELD_CATALOG_SALES and `sale_returns_current_month` to FIELD_CATALOG_SALE_RETURNS; window resolution via suffix-endswith (same mechanism as all other windows); `validate_alert` auto-accepts new keys via catalog-driven _VALID_FIELDS_BY_CATEGORY; `_WINDOW_TO_FIELD` auto-includes via _WINDOW_SUFFIXES comprehension; both alerts_eval.py copies synced (byte-identical). No IaC/DB change needed.
 
 - [x] etl_supplier_ledger Lambda (2026-06-27, revised 2026-06-27 x2) — EventBridge-triggered (Object Created), read-only on S3; reads same `Ledger All Accounts*.xlsx` as etl_customer_ledger; identifies supplier rows by col[10] (Account Group) == 'All Supplier Accounts' (case-insensitive); explicit iravi exclusion (`'iravi' in account_name.lower()`); does NOT read supplier_accounts at all; account_name from col[4] (Account field); contra_account from col[5] drives sub_category; combined `_CONTRA_SUBCATEGORY` map covers BOTH purchase-side (Input GST/Default Purchase/Purchase Return/Roundoff → Cr rows) AND sales-side (Output GST/Default Sales/Sales Return → Db rows), eliminating the dropped-principal and natural-key-collision bugs for MERCO-style Sales Invoice rows; `_TXN_SUBCATEGORY` fallback unchanged; close-then-insert milestoning into supplier_ledger; fallback to processed/raw/ if raw key already archived by etl_customer_ledger; no S3 writes, no EventBridge emit; requires IaC migration 017 + lambda_etl_supplier_ledger.tf; one-time cleanup SQL: `UPDATE supplier_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category IN ('Sales Invoice','Sales Invoice Returns');`
 - [x] etl_supplier_accounts Lambda (2026-06-27) — full handler: parse `Supplier Accounts Export File*.xlsx` (General sheet, header row 1, data from row 2); columns [0]=Name [6]=GST [7]=GSTValid [12]=City [13]=State; IRAVI own-company rows filtered; gst_valid int→bool with None/0 distinction; city title-cased; state prefix-stripped ("36-Telangana" → "Telangana"); uni-temporal milestoning upsert (close-then-insert on name); archives source to processed/raw/; no EventBridge emit; requires IaC migration 016 + lambda_etl_supplier_accounts.tf
@@ -1008,6 +1084,10 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] GitHub Actions layer build steps for all Lambdas (plan + apply jobs)
 
 ## What Is Next (build in this order)
+
+- [ ] **IaC: API Gateway route GET /reports/monthly-sales** — add `GET /reports/monthly-sales` route + CORS allow-method in `lambda_api.tf`; add `app_screens` seed migration row for `reports.monthly_sales` (screen_key, label, sort_order). No new Lambda, layer, or DB migration needed — existing `sales` and `customer_details` tables are used.
+- [ ] **UI slice for /reports/monthly-sales** — add `getMonthlySales(month?: string)` client method in `src/api/client.ts` with typed response shape matching the JSON contract; add Monthly Sales report page + wire RBAC screen key `reports.monthly_sales` in the UI router.
+- [ ] **No IaC/DB change needed for alert fields** — `net_sales_current_month` and `sale_returns_current_month` are served by the existing `GET /alerts/fields` route; no new API Gateway route, no new DB migration, no new Lambda layer. The `current_month` window SQL uses existing date-range FILTER clauses within `_query_aggregate_metrics` — same pattern as all other windows.
 
 - [ ] **POST-DEPLOY: supplier_ledger cleanup + re-ingest (2026-06-27)** — after deploying the revised etl_supplier_ledger (combined _CONTRA_SUBCATEGORY map, sales-side rows kept): (a) re-upload / re-trigger `Ledger All Accounts*.xlsx` to S3 `raw/` so the Lambda re-runs and correctly inserts MERCO's 3 Sales Invoice legs as distinct rows; (b) run the one-time cleanup to close stale malformed rows left by the previous deploy: `UPDATE supplier_ledger SET out_z = NOW() WHERE out_z IS NULL AND sub_category IN ('Sales Invoice','Sales Invoice Returns');`; (c) flush Redis cache: `POST /admin/cache/flush` to purge stale `iravi:reports:supplier_balances_fy:*` entries. All three steps in order.
 - [ ] **IaC: migration 017** — create `supplier_ledger` table. Schema: `id SERIAL PK, transaction_date DATE NOT NULL, voucher_no VARCHAR(50) NOT NULL, account_name VARCHAR(200) NOT NULL, category VARCHAR(10) NOT NULL, sub_category VARCHAR(100) NOT NULL, amount NUMERIC(15,4) NOT NULL, in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ`. Partial unique index: `CREATE UNIQUE INDEX ON supplier_ledger (transaction_date, voucher_no, account_name, category, sub_category) WHERE out_z IS NULL`. Apply via psql/SSM before running etl_supplier_ledger. Requires migration 016 (supplier_accounts) to be applied first.
