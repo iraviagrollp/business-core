@@ -145,6 +145,12 @@ FIELD_CATALOG_SALES = {
             "type": "currency",
             "ops": _AGG_OPS,
         },
+        {
+            "key": "net_sales_current_month",
+            "label": "Net customer sales — current month to date (₹)",
+            "type": "currency",
+            "ops": _AGG_OPS,
+        },
     ],
     "match_types": ["all", "any"],
     "frequencies": ["daily", "weekly", "monthly"],
@@ -184,6 +190,12 @@ FIELD_CATALOG_SALE_RETURNS = {
             "type": "currency",
             "ops": _AGG_OPS,
         },
+        {
+            "key": "sale_returns_current_month",
+            "label": "Customer sale returns — current month to date (₹)",
+            "type": "currency",
+            "ops": _AGG_OPS,
+        },
     ],
     "match_types": ["all", "any"],
     "frequencies": ["daily", "weekly", "monthly"],
@@ -212,7 +224,7 @@ _VALID_OPS: set[str] = {"gt", "gte", "lt", "lte", "eq", "between"}
 _RECEIPT_SUBCATEGORIES: set[str] = {"Bank Receipt", "Cash Receipt"}
 
 # Window suffixes in display order
-_WINDOW_SUFFIXES = ["prev_day", "prev_week", "last_month", "prev_quarter", "fy"]
+_WINDOW_SUFFIXES = ["prev_day", "prev_week", "last_month", "prev_quarter", "fy", "current_month"]
 
 # Aggregate field name per category per window suffix
 _WINDOW_TO_FIELD: dict[str, dict[str, str]] = {
@@ -321,6 +333,9 @@ def compute_window_dates(run_date: date) -> dict[str, tuple[date, date]]:
     fy            — current fiscal year to date: April 1 of the FY containing
                     run_date, through yesterday. May be an empty range (start > end)
                     if run_date is April 1 itself.
+    current_month — current calendar month to date: first day of run_date's month
+                    through yesterday. May be an empty range (start > end) if
+                    run_date is the 1st of the month (no completed day yet this month).
     """
     yesterday = run_date - timedelta(days=1)
 
@@ -353,12 +368,18 @@ def compute_window_dates(run_date: date) -> dict[str, tuple[date, date]]:
     fy_start = date(fy_start_year, 4, 1)
     fy_end   = yesterday
 
+    # current_month: first day of current calendar month through yesterday (MTD).
+    # If run_date is the 1st, current_month_start == run_date > yesterday → empty range.
+    current_month_start = run_date.replace(day=1)
+    current_month_end   = yesterday
+
     return {
-        "prev_day":     (yesterday,       yesterday),
-        "prev_week":    (prev_week_start,  prev_week_end),
-        "last_month":   (last_month_start, last_month_end),
-        "prev_quarter": (prev_q_start,     prev_q_end),
-        "fy":           (fy_start,         fy_end),
+        "prev_day":      (yesterday,            yesterday),
+        "prev_week":     (prev_week_start,      prev_week_end),
+        "last_month":    (last_month_start,     last_month_end),
+        "prev_quarter":  (prev_q_start,         prev_q_end),
+        "fy":            (fy_start,             fy_end),
+        "current_month": (current_month_start,  current_month_end),
     }
 
 
