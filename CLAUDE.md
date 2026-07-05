@@ -81,6 +81,14 @@ business-core/
         ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
         ├── monthly_sales.py  ← copy of shared module (byte-identical to api/monthly_sales.py)
         ├── monthly_sales_pdf.py ← PDF renderer using reportlab (evaluator-only; not in api package)
+        │                        Restyled 2026-07-05: dark-green #1a3c2b headers (white text), #f0f0f0
+        │                        total rows, #fafafa zebra, DD-Mon-YYYY dates, IAL logo top-left
+        │                        (ial-logo.png bundled in this dir; graceful fallback if absent),
+        │                        IRAVI AGRO LIFE LLP centered bold, date/value-note right, centered
+        │                        bold underlined SALES ANALYSIS / MONTH ONLY section headings,
+        │                        Kukatpally footer (two lines), compact 7pt / 1cm margins → single A4 page.
+        ├── ial-logo.png      ← bundled logo asset (copy of iravi-ui/public/ial-logo.png); ships in
+        │                        the archive_file zip; no IaC change required
         └── requirements.txt  ← psycopg2-binary==2.9.9 + reportlab==4.2.2 (boto3 from runtime)
 ```
 
@@ -1051,6 +1059,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [x] alerts response contract fix (2026-06-24) — `recipients` in all alert responses (`GET /alerts`, `GET /alerts/{id}`, `POST /alerts`, `PUT /alerts/{id}`) is now a flat array of email-address strings `["a@x.com"]` instead of objects `[{id, channel, address}]`; both serialization sites fixed (`_fetch_alert_with_children` and `_handle_alerts_list`); `_insert_alert_children` request handling unchanged
 - [x] alerts_eval.py shared module (lambda/api/alerts_eval.py + copy in lambda/alerts_evaluator/alerts_eval.py) — FIFO aging, condition matching, field catalog, validate_alert(), is_alert_due_today()
 - [x] alerts_evaluator Lambda (lambda/alerts_evaluator/handler.py + requirements.txt) — EventBridge-triggered nightly evaluator: load due alerts → evaluate balances → send SES HTML email → write alert_runs; one alert failing does not abort others
+- [x] alerts_evaluator monthly_sales_pdf.py restyled (2026-07-05) — renderer now matches iravi-ui Reports PDF: dark-green #1a3c2b headers with white text; #f0f0f0 GRAND TOTAL/Total rows; #fafafa zebra; DD-Mon-YYYY dates (datetime.strptime('%Y-%m-%d').strftime('%d-%b-%Y')); IAL logo bundled as ial-logo.png (ial-logo.png copied from iravi-ui/public, ships in archive_file zip, loads via os.path.dirname(__file__) with try/except fallback — never crashes); IRAVI AGRO LIFE LLP centered bold large; date + (Value In Lakhs) top-right; SALES ANALYSIS and {MONTH} MONTH ONLY centered bold underlined section headings; Kukatpally two-line footer (Reg. Address: Flat No: 102, BVR Plaza… Shanthi Nagar, Kukatpally, Hyderabad, Telangana 500072 + computer-generated note); compact 7pt font + 1cm margins + 2pt cell padding → single A4 portrait page; analysis and month-only tables narrower (70%/45% width) and centered with hAlign='CENTER'; old blue #1a5276 header and Guntur footer removed
 - [x] alerts days_since_last_receipt field (2026-06-24) — new evaluable field in both alerts_eval.py copies; NULL last_receipt_date → sentinel 10**9 (flags never-paid customers); field catalog updated; validate_alert() accepts it as valid condition field; _customer_matches() extended; evaluate_balances() returns days_since_last_receipt in matched rows; email table adds Days Since Receipt column (sentinel displayed as "Never")
 - [x] alerts schedule_time field (2026-06-24) — `schedule_time TIME` column added to `alerts` table by IaC migration 014; API accepts/returns as HH:MM string (e.g. "14:30"); defaults to "11:00" if omitted on create; validated by _validate_schedule_time() regex; _alert_row_to_dict() normalises psycopg2 timedelta/time → HH:MM; CREATE and UPDATE SQL updated; _ALERT_SELECT updated
 - [x] alerts_evaluator 15-minute gating logic (2026-06-24) — evaluator now runs every 15 min (IaC changes cron to rate(15 minutes)); per-alert three-gate check: (1) due today, (2) current IST HH:MM >= schedule_time, (3) no alert_runs row with status sent|no_match for today (IST); failed runs may retry; _already_sent_today() uses AT TIME ZONE SQL to convert run_at UTC→IST date; _load_active_alerts() reads schedule_time column
