@@ -79,7 +79,9 @@ business-core/
     └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
         ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
         ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
-        └── requirements.txt  ← psycopg2-binary==2.9.9 (boto3 from runtime)
+        ├── monthly_sales.py  ← copy of shared module (byte-identical to api/monthly_sales.py)
+        ├── monthly_sales_pdf.py ← PDF renderer using reportlab (evaluator-only; not in api package)
+        └── requirements.txt  ← psycopg2-binary==2.9.9 + reportlab==4.2.2 (boto3 from runtime)
 ```
 
 ---
@@ -124,7 +126,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
-| alerts_evaluator | Python 3.12 | psycopg2-binary (boto3/ses from runtime) |
+| alerts_evaluator | Python 3.12 | psycopg2-binary, reportlab (boto3/ses from runtime) |
 
 ---
 
@@ -984,11 +986,19 @@ All existing gating is unchanged (due-today, time-reached, success-dedupe, 5/day
 - `balances` → `evaluate_balances()` → HTML customer-table email (unchanged path)
   - Subject: `[IRAVI Alert] <alert_name> — <date>`
   - `alert_runs.matched` = count of matched customers
-- `sales` / `sale_returns` → `evaluate_aggregate()` → metrics-summary email if `matched=True`
-  - Subject: `[IRAVI Alert] Sales — <date>` or `[IRAVI Alert] Sale Returns — <date>`
-  - Email: two HTML tables — Conditions (field label, op, threshold, actual, breached?) + Window Metrics (metric label, value ₹)
+- `sales` → `evaluate_aggregate()` → **PDF attachment email** if `matched=True` (wired 2026-07-05)
+  - Subject: `IRAVI — Daily Net Sales Report — <DD Mon YYYY>`
+  - Body: minimal HTML paragraph "Attached is the Daily Net Sales Report" + "do not reply" footer. No Conditions table, no Window Metrics table.
+  - Attachment: `IAL_Daily_Net_Sales_<DD-Mon-YYYY>.pdf` — built by calling `monthly_sales.compute_monthly_sales(conn, current_month_YYYY-MM)` then `monthly_sales_pdf.render_monthly_sales_pdf(data)`.
+  - Sent via `_send_ses_email_with_pdf()` (SES `SendRawEmail` with MIME multipart).
+  - `alert_runs.matched` = 1 if fired, 0 if not; PDF build/send wrapped in the same per-alert try/except so failures are recorded as `status='failed'` and do not abort other alerts.
+- `sale_returns` → `evaluate_aggregate()` → metrics-summary email if `matched=True` (unchanged path)
+  - Subject: `[IRAVI Alert] Sale Returns — <date>`
+  - Email: two HTML tables — Conditions + Window Metrics
   - `alert_runs.matched` = 1 if fired, 0 if not
   - `status` = `sent` if fired, `no_match` if conditions did not fire, `failed` on exception
+
+**`_send_ses_email_with_pdf(subject, recipients, html_body, pdf_bytes, pdf_filename)`** — stdlib MIME only (`email.mime.multipart.MIMEMultipart` + `MIMEText(html_body,'html')` + `MIMEApplication(pdf_bytes, _subtype='pdf')` with `Content-Disposition: attachment; filename=…`); sends via `ses.send_raw_email(Source, Destinations, RawMessage)`. No new AWS dependency — reuses the existing `ses` client.
 
 `_send_ses_email` signature changed from `(alert_name, recipients, html_body, today)` to `(subject, recipients, html_body)` — subject is now built by the caller.
 
@@ -1025,6 +1035,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] alerts_evaluator — sales-alert PDF email path (2026-07-05): `category=='sales'` fires `_send_ses_email_with_pdf` (SES SendRawEmail) with a minimal "Attached is the Daily Net Sales Report" HTML body (no Conditions/Window-Metrics tables) and `IAL_Daily_Net_Sales_<DD-Mon-YYYY>.pdf` attachment built from `monthly_sales.compute_monthly_sales + monthly_sales_pdf.render_monthly_sales_pdf`; `sale_returns` path unchanged (metrics email, no attachment); `_send_ses_email_with_pdf` uses stdlib MIME only; reportlab==4.2.2 added to alerts_evaluator/requirements.txt; monthly_sales.py + monthly_sales_pdf.py imports wired at top of evaluator handler.
+- [x] api Lambda — `_handle_monthly_sales` refactored (2026-07-05): now delegates to `monthly_sales.compute_monthly_sales(conn, month_str)` (cache-aside + `_response` wrapper unchanged); inline SQL removed; endpoint JSON shape unchanged; API and PDF share one implementation.
 - [x] api Lambda — `GET /reports/monthly-sales` endpoint (2026-07-05): state-wise net customer sales for one calendar month; ?month=YYYY-MM (default current IST month); branch→state mapping (Guntur C & F=andhra, Auto Nagar=telangana; others excluded + logged); all calendar days returned with 0.0 fill; as_on_date=min(today IST, last day of month); FY label (Apr→Mar); analysis block includes up_to_prev_month (FY-start→prev-month-end, empty for April), prev_month_label (%b abbreviated), as_on_date copy of grand_total; unmapped_branches collected; raw rupees 2dp; Redis key `iravi:reports:monthly_sales:{month}` TTL _LEDGER_TTL; cleared by POST /admin/cache/flush. No new DB table/column needed. IaC: needs API Gateway route GET /reports/monthly-sales + app_screens seed for reports.monthly_sales; UI: needs client method + page + screen key.
 - [x] alerts `current_month` window + fields (2026-07-05): added `current_month` to `_WINDOW_SUFFIXES` and `compute_window_dates` (start=first day of current month, end=yesterday; empty range if run_date is 1st); added `net_sales_current_month` to FIELD_CATALOG_SALES and `sale_returns_current_month` to FIELD_CATALOG_SALE_RETURNS; window resolution via suffix-endswith (same mechanism as all other windows); `validate_alert` auto-accepts new keys via catalog-driven _VALID_FIELDS_BY_CATEGORY; `_WINDOW_TO_FIELD` auto-includes via _WINDOW_SUFFIXES comprehension; both alerts_eval.py copies synced (byte-identical). No IaC/DB change needed.
 

@@ -41,11 +41,16 @@ import json
 import logging
 import os
 from datetime import date, datetime, timezone, timedelta
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import boto3
 import psycopg2
 
 import alerts_eval
+import monthly_sales
+import monthly_sales_pdf
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -280,6 +285,42 @@ def _send_ses_email(subject: str, recipients: list[str], html_body: str):
     )
 
 
+def _send_ses_email_with_pdf(
+    subject: str,
+    recipients: list[str],
+    html_body: str,
+    pdf_bytes: bytes,
+    pdf_filename: str,
+):
+    """Send an HTML email with a PDF attachment via SES SendRawEmail.
+
+    Uses stdlib MIME classes so no extra dependency is needed beyond what is
+    already in the Lambda runtime.  The pdf_bytes are attached as
+    application/pdf with Content-Disposition: attachment.
+    """
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"] = _SENDER_EMAIL
+    msg["To"] = ", ".join(recipients)
+
+    # HTML body part
+    html_part = MIMEText(html_body, "html", "utf-8")
+    msg.attach(html_part)
+
+    # PDF attachment part
+    pdf_part = MIMEApplication(pdf_bytes, _subtype="pdf")
+    pdf_part.add_header(
+        "Content-Disposition", "attachment", filename=pdf_filename
+    )
+    msg.attach(pdf_part)
+
+    ses.send_raw_email(
+        Source=_SENDER_EMAIL,
+        Destinations=recipients,
+        RawMessage={"Data": msg.as_string()},
+    )
+
+
 def _render_metrics_email(
     alert_name: str, category: str, today: date, result: dict
 ) -> str:
@@ -478,10 +519,39 @@ def lambda_handler(event, context):
                 # ── Aggregate sales / sale_returns evaluation ─────────────────
                 agg = alerts_eval.evaluate_aggregate(conn, alert=alert, today=today)
                 if agg["matched"]:
-                    cat_label = "Sales" if category == "sales" else "Sale Returns"
-                    html_body = _render_metrics_email(alert_name, category, today, agg)
-                    subject   = f"[IRAVI Alert] {cat_label} — {today.strftime('%d %b %Y')}"
-                    _send_ses_email(subject, alert["recipients"], html_body)
+                    date_display = today.strftime('%d %b %Y')
+                    if category == "sales":
+                        # Sales alerts: attach the Monthly Sales PDF; minimal body (no tables).
+                        subject = f"IRAVI — Daily Net Sales Report — {date_display}"
+                        html_body = (
+                            "<!DOCTYPE html>"
+                            "<html><head><meta charset=\"UTF-8\"></head>"
+                            "<body style=\"font-family:Arial,sans-serif;color:#333;max-width:700px;margin:0 auto\">"
+                            f"<p style=\"font-size:15px\">Attached is the Daily Net Sales Report for <strong>{date_display}</strong>.</p>"
+                            "<p style=\"margin-top:20px;font-size:11px;color:#888\">"
+                            "This is an automated message from the IRAVI Dashboard. Please do not reply to this email."
+                            "</p>"
+                            "</body></html>"
+                        )
+                        # Current month in IST (YYYY-MM) for the PDF
+                        current_month_str = today.strftime('%Y-%m')
+                        sales_data = monthly_sales.compute_monthly_sales(conn, current_month_str)
+                        pdf_bytes  = monthly_sales_pdf.render_monthly_sales_pdf(sales_data)
+                        pdf_filename = f"IAL_Daily_Net_Sales_{today.strftime('%d-%b-%Y')}.pdf"
+                        _send_ses_email_with_pdf(
+                            subject,
+                            alert["recipients"],
+                            html_body,
+                            pdf_bytes,
+                            pdf_filename,
+                        )
+                    else:
+                        # sale_returns (and any future aggregate categories): metrics email, no attachment.
+                        cat_label = "Sale Returns"
+                        html_body = _render_metrics_email(alert_name, category, today, agg)
+                        subject   = f"[IRAVI Alert] {cat_label} — {date_display}"
+                        _send_ses_email(subject, alert["recipients"], html_body)
+
                     status        = "sent"
                     matched_count = 1  # 1 = the aggregate alert fired
                     logger.info("Alert id=%s (%s) sent to %d recipients",

@@ -1372,7 +1372,8 @@ def _handle_supplier_balances_fy(fy_count_raw: str):
 def _handle_monthly_sales(month_raw: str):
     """GET /reports/monthly-sales?month=YYYY-MM
 
-    State-wise net customer sales for one calendar month.
+    Delegates computation to monthly_sales.compute_monthly_sales() so the API
+    and the alerts-evaluator PDF share one implementation.
 
     State mapping by branch:
       'Guntur C & F' → andhra
@@ -1382,8 +1383,7 @@ def _handle_monthly_sales(month_raw: str):
     Returns raw rupees (float, 2 dp). The UI converts to lakhs.
     Cache key: iravi:reports:monthly_sales:{month}  TTL: _LEDGER_TTL
     """
-    import calendar as _calendar
-    from datetime import date as _date, timedelta as _timedelta
+    from datetime import timedelta as _timedelta
 
     # Today in IST (UTC+5:30)
     _IST = timezone(_timedelta(hours=5, minutes=30))
@@ -1393,10 +1393,8 @@ def _handle_monthly_sales(month_raw: str):
     month_str = (month_raw or '').strip()
     try:
         parsed_month = datetime.strptime(month_str, '%Y-%m')
-        year, mon = parsed_month.year, parsed_month.month
         month_str = parsed_month.strftime('%Y-%m')   # normalise (strips any trailing chars)
     except (ValueError, AttributeError):
-        year, mon = today_ist.year, today_ist.month
         month_str = today_ist.strftime('%Y-%m')
 
     cache_key = f'iravi:reports:monthly_sales:{month_str}'
@@ -1405,159 +1403,15 @@ def _handle_monthly_sales(month_raw: str):
     if cached:
         return _response(200, json.loads(cached))
 
-    # Calendar helpers for the selected month
-    last_day = _calendar.monthrange(year, mon)[1]
-    month_start = _date(year, mon, 1)
-    month_end = _date(year, mon, last_day)
-
-    # as_on_date = min(today_ist, last calendar day of the selected month)
-    as_on_date = min(today_ist, month_end)
-
-    # FY label: "YYYY-YY" for the FY containing the selected month (Apr → Mar).
-    fy_start_year = year if mon >= 4 else year - 1
-    fy_label = f'{fy_start_year}-{str(fy_start_year + 1)[2:]}'   # e.g. "2026-27"
-
-    # month_label: e.g. "JUNE 2026"
-    month_label = _date(year, mon, 1).strftime('%B %Y').upper()
-
-    # Branch → state mapping (any other branch is unmapped)
-    _BRANCH_STATE = {
-        'Guntur C & F': 'andhra',
-        'Auto Nagar':   'telangana',
-    }
-
-    # Previous-month info (for analysis block)
-    prev_mon = mon - 1 if mon > 1 else 12
-    prev_yr  = year if mon > 1 else year - 1
-    prev_month_label = _date(prev_yr, prev_mon, 1).strftime('%b')  # e.g. "May"
-
-    # FY start and prev-month-end for the analysis.up_to_prev_month range
-    fy_start            = _date(fy_start_year, 4, 1)
-    prev_month_end_date = month_start - _timedelta(days=1)  # last day of previous month
-
-    # ── DB queries ─────────────────────────────────────────────────────────────
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            # Main query: net sales aggregated by (purchase_date, branch) for the month
-            cur.execute("""
-                SELECT
-                    purchase_date,
-                    branch,
-                    ROUND(
-                        COALESCE(SUM(av) FILTER (WHERE sales_return = 'N'), 0) -
-                        COALESCE(SUM(av) FILTER (WHERE sales_return = 'Y'), 0)
-                    , 2) AS net_sales
-                FROM sales
-                WHERE out_z IS NULL
-                  AND purchase_date BETWEEN %(month_start)s AND %(month_end)s
-                  AND UPPER(party) IN (SELECT UPPER(customer_name) FROM customer_details)
-                  AND party NOT ILIKE '%%iravi%%'
-                GROUP BY purchase_date, branch
-                ORDER BY purchase_date
-            """, {'month_start': month_start, 'month_end': month_end})
-            db_rows = cur.fetchall()
-
-            # FY-to-prev-month query for analysis.up_to_prev_month.
-            # If the selected month is April, prev_month_end_date < fy_start → skip (zeros).
-            if prev_month_end_date >= fy_start:
-                cur.execute("""
-                    SELECT
-                        branch,
-                        ROUND(
-                            COALESCE(SUM(av) FILTER (WHERE sales_return = 'N'), 0) -
-                            COALESCE(SUM(av) FILTER (WHERE sales_return = 'Y'), 0)
-                        , 2) AS net_sales
-                    FROM sales
-                    WHERE out_z IS NULL
-                      AND purchase_date BETWEEN %(fy_start)s AND %(prev_end)s
-                      AND UPPER(party) IN (SELECT UPPER(customer_name) FROM customer_details)
-                      AND party NOT ILIKE '%%iravi%%'
-                    GROUP BY branch
-                """, {'fy_start': fy_start, 'prev_end': prev_month_end_date})
-                utp_rows = cur.fetchall()
-            else:
-                utp_rows = []
+        payload = monthly_sales.compute_monthly_sales(conn, month_str)
     finally:
         conn.close()
 
-    # ── Build daily map (all zeros; SQL provides data only for days with activity) ──
-    days_map: dict = {
-        _date(year, mon, d).isoformat(): {'andhra': 0.0, 'telangana': 0.0}
-        for d in range(1, last_day + 1)
-    }
-    unmapped_branches: set = set()
-
-    for purchase_date, branch, net_sales in db_rows:
-        state = _BRANCH_STATE.get(branch)
-        if state is None:
-            unmapped_branches.add(branch)
-            logger.warning('monthly_sales: unmapped branch %r — excluded from totals', branch)
-            continue
-        date_str = purchase_date.isoformat()
-        if date_str in days_map:
-            days_map[date_str][state] = round(days_map[date_str][state] + float(net_sales), 2)
-
-    # Ordered days list (all calendar days of the month, including future ones)
-    days = []
-    for d in range(1, last_day + 1):
-        date_str = _date(year, mon, d).isoformat()
-        entry = days_map[date_str]
-        a, t = entry['andhra'], entry['telangana']
-        days.append({
-            'date':      date_str,
-            'andhra':    a,
-            'telangana': t,
-            'total':     round(a + t, 2),
-        })
-
-    # grand_total: sum across all days (future days are 0.0)
-    grand_a = round(sum(day['andhra']    for day in days), 2)
-    grand_t = round(sum(day['telangana'] for day in days), 2)
-    grand_total = {
-        'andhra':    grand_a,
-        'telangana': grand_t,
-        'total':     round(grand_a + grand_t, 2),
-    }
-
-    # analysis.up_to_prev_month: FY-start through end of previous month
-    utp_a, utp_t = 0.0, 0.0
-    for branch, net_sales in utp_rows:
-        state = _BRANCH_STATE.get(branch)
-        if state is None:
-            unmapped_branches.add(branch)
-            continue
-        if state == 'andhra':
-            utp_a = round(utp_a + float(net_sales), 2)
-        else:
-            utp_t = round(utp_t + float(net_sales), 2)
-
-    payload = {
-        'month':       month_str,
-        'month_label': month_label,
-        'fy_label':    fy_label,
-        'as_on_date':  as_on_date.isoformat(),
-        'days':        days,
-        'grand_total': grand_total,
-        'analysis': {
-            'prev_month_label': prev_month_label,
-            'up_to_prev_month': {
-                'andhra':    utp_a,
-                'telangana': utp_t,
-                'total':     round(utp_a + utp_t, 2),
-            },
-            'as_on_date': {
-                'andhra':    grand_a,
-                'telangana': grand_t,
-                'total':     round(grand_a + grand_t, 2),
-            },
-        },
-        'unmapped_branches': sorted(unmapped_branches),
-    }
-
     r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
     logger.info('Monthly sales cached: month=%s as_on=%s grand=%.2f',
-                month_str, as_on_date, grand_total['total'])
+                month_str, payload['as_on_date'], payload['grand_total']['total'])
     return _response(200, payload)
 
 
