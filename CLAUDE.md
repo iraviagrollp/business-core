@@ -73,12 +73,35 @@ business-core/
     │   └── requirements.txt
     ├── api/                  ← API: dashboard reads + POST /notify + RBAC auth/admin + alerts admin API [COMPLETE]
     │   ├── handler.py        ← routing, data endpoints, /auth/* + /admin/* + /alerts/* handlers
+    │   │                        _handle_customer_balances_fy refactored (2026-07-06): now delegates to
+    │   │                        customer_balances_fy.compute_customer_balances_fy (cache-aside unchanged;
+    │   │                        endpoint JSON shape unchanged)
+    │   │                        _handle_supplier_balances_fy refactored (2026-07-06): now delegates to
+    │   │                        supplier_balances_fy.compute_supplier_balances_fy (cache-aside unchanged;
+    │   │                        endpoint JSON shape unchanged; no code/credit_notes fields)
     │   ├── auth.py           ← PBKDF2 password hashing + HS256 JWT (stdlib only)
     │   ├── alerts_eval.py    ← SHARED: balances evaluation + FIFO aging + field catalog + validation
+    │   │                        Added 2026-07-06: FIELD_CATALOG_CUSTOMER_BALANCES_FY (fields=[], not
+    │   │                        branch-scoped, accepts 0 conditions) + registered in FIELD_CATALOGS
+    │   │                        Added 2026-07-06: FIELD_CATALOG_SUPPLIER_BALANCES_FY (fields=[], not
+    │   │                        branch-scoped, accepts 0 conditions) + registered in FIELD_CATALOGS
+    │   ├── customer_balances_fy.py ← SHARED: compute_customer_balances_fy(conn, fy_count) → dict
+    │   │                        Extracted from _handle_customer_balances_fy; byte-identical copy in
+    │   │                        alerts_evaluator/. (added 2026-07-06)
+    │   ├── supplier_balances_fy.py ← SHARED: compute_supplier_balances_fy(conn, fy_count) → dict
+    │   │                        Extracted from _handle_supplier_balances_fy; byte-identical copy in
+    │   │                        alerts_evaluator/. No code field; no credit_notes field.
+    │   │                        From-beginning (fy_count='all') used by alert evaluator PDF path.
+    │   │                        (added 2026-07-06)
     │   └── requirements.txt
     └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
         ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
+        │                        Added 2026-07-06: customer_balances_fy branch (always fires → PDF attachment)
+        │                        Added 2026-07-06: supplier_balances_fy branch (always fires → PDF attachment;
+        │                        no code/credit_notes; supplier footer legend differs from customer)
         ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
+        │                        Added 2026-07-06: FIELD_CATALOG_CUSTOMER_BALANCES_FY + FIELD_CATALOGS entry
+        │                        Added 2026-07-06: FIELD_CATALOG_SUPPLIER_BALANCES_FY + FIELD_CATALOGS entry
         ├── monthly_sales.py  ← copy of shared module (byte-identical to api/monthly_sales.py)
         ├── monthly_sales_pdf.py ← PDF renderer using reportlab (evaluator-only; not in api package)
         │                        Restyled 2026-07-05: dark-green #1a3c2b headers (white text), #f0f0f0
@@ -87,6 +110,41 @@ business-core/
         │                        IRAVI AGRO LIFE LLP centered bold, date/value-note right, centered
         │                        bold underlined SALES ANALYSIS / MONTH ONLY section headings,
         │                        Kukatpally footer (two lines), compact 7pt / 1cm margins → single A4 page.
+        │                        Bug-fixed 2026-07-06: _FOOTER_LINE2 "₹" (U+20B9) replaced with "Rs."
+        │                        (Helvetica/WinAnsiEncoding cannot encode U+20B9; canvas._escape raises
+        │                        KeyError: 8377 for chars outside Latin-1 when called in certain paths).
+        │                        SimpleDocTemplate title em-dash "—" also replaced with ASCII "-".
+        ├── customer_balances_fy.py ← SHARED: byte-identical copy of api/customer_balances_fy.py
+        │                        compute_customer_balances_fy(conn, fy_count) → dict
+        │                        (added 2026-07-06)
+        ├── customer_balances_fy_pdf.py ← PDF renderer for Customer Balances (FY), landscape A4
+        │                        render_customer_balances_fy_pdf(data) → bytes
+        │                        Uses DejaVuSans TTFont (via pdf_fonts.register_fonts()) so ₹/— render
+        │                        without KeyError. Two-row header (repeatRows=2), #1a3c2b headers,
+        │                        #f0f0f0 TOTAL row, always-visible Credit Notes column.
+        │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
+        │                        (added 2026-07-06)
+        ├── supplier_balances_fy.py ← SHARED: byte-identical copy of api/supplier_balances_fy.py
+        │                        compute_supplier_balances_fy(conn, fy_count) → dict
+        │                        No code field; no credit_notes field. Sort by party name ascending.
+        │                        (added 2026-07-06)
+        ├── supplier_balances_fy_pdf.py ← PDF renderer for Supplier Balances (FY), landscape A4
+        │                        render_supplier_balances_fy_pdf(data) → bytes
+        │                        Uses DejaVuSans TTFont (via pdf_fonts.register_fonts()) so ₹/— render
+        │                        without KeyError. Two-row header (repeatRows=2), #1a3c2b headers,
+        │                        #f0f0f0 TOTAL row. No Code column; no Credit Notes column (3 sub-cols
+        │                        per FY: Debit/Credit/Balance). Supplier footer legend:
+        │                        'Dr = Debit (payable); Cr = Credit (advance/overpayment).'
+        │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
+        │                        (added 2026-07-06)
+        ├── pdf_fonts.py      ← SHARED: idempotent register_fonts() — registers DejaVuSans and
+        │                        DejaVuSans-Bold with reportlab pdfmetrics; falls back to Helvetica
+        │                        with warning on failure. Fixes ₹ (U+20B9) + — (U+2014) KeyError
+        │                        that crashes Helvetica-based doc.build() on Lambda.
+        │                        Reused by both Customer and Supplier Balances (FY) PDF renderers.
+        │                        (added 2026-07-06)
+        ├── DejaVuSans.ttf    ← bundled Unicode TTF (738 KB); source: matplotlib mpl-data/fonts/ttf
+        ├── DejaVuSans-Bold.ttf ← bundled Unicode TTF-Bold (688 KB); same source
         ├── ial-logo.png      ← bundled logo asset (copy of iravi-ui/public/ial-logo.png); ships in
         │                        the archive_file zip; no IaC change required
         └── requirements.txt  ← psycopg2-binary==2.9.9 + reportlab==4.2.2 (boto3 from runtime)
@@ -821,6 +879,8 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);
 | `balances` | Per-customer outstanding balance evaluation (FIFO aging) | No |
 | `sales` | Aggregate net customer sales over time windows | Yes |
 | `sale_returns` | Aggregate customer sale returns over time windows | Yes |
+| `customer_balances_fy` | Scheduled Customer Balances (FY) PDF report — always fires, no conditions | No |
+| `supplier_balances_fy` | Scheduled Supplier Balances (FY) PDF report — always fires, no conditions | No |
 
 ### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
 
@@ -867,6 +927,27 @@ All routes use `_require_admin()` (recomputes `is_admin` from DB; rejects non-ad
 **`?category=sale_returns`** (parallel to `sales`, labels "Customer sale returns — …"):
 - Keys: `sale_returns_prev_day`, `sale_returns_prev_week`, `sale_returns_last_month`, `sale_returns_prev_quarter`, `sale_returns_fy`, `sale_returns_current_month`
 - Same type/ops/match_types/frequencies/branch_scoped structure as `sales`.
+
+**`?category=customer_balances_fy`** (added 2026-07-06):
+```json
+{"category":"customer_balances_fy","fields":[],"match_types":["all","any"],"frequencies":["daily","weekly","monthly"]}
+```
+- `fields` is empty — no conditions are configurable; the alert always fires on schedule.
+- Not `branch_scoped` — no branch filter applied.
+- `validate_alert` accepts `conditions: []` for this category (same as `sales`/`sale_returns`).
+
+**`?category=supplier_balances_fy`** (added 2026-07-06):
+```json
+{"category":"supplier_balances_fy","fields":[],"match_types":["all","any"],"frequencies":["daily","weekly","monthly"]}
+```
+- `fields` is empty — no conditions are configurable; the alert always fires on schedule.
+- Not `branch_scoped` — no branch filter applied.
+- `validate_alert` accepts `conditions: []` for this category.
+- Evaluator: calls `compute_supplier_balances_fy(conn, 'all')` → `render_supplier_balances_fy_pdf(data)`.
+  Subject: `"IRAVI — Supplier Balances (FY) — DD Mon YYYY"`.
+  Filename: `IAL_Supplier_Balances_FY_DD-Mon-YYYY.pdf`.
+  PDF: landscape A4, DejaVuSans, NO Code column, NO Credit Notes column (3 sub-cols per FY:
+  Debit/Credit/Balance). Footer legend: 'Dr = Debit (payable); Cr = Credit (advance/overpayment).'
 
 ### Time windows (IST, relative to run_date = today)
 
@@ -994,6 +1075,16 @@ All existing gating is unchanged (due-today, time-reached, success-dedupe, 5/day
 - `balances` → `evaluate_balances()` → HTML customer-table email (unchanged path)
   - Subject: `[IRAVI Alert] <alert_name> — <date>`
   - `alert_runs.matched` = count of matched customers
+- `customer_balances_fy` → **always fires** (unconditional) → PDF attachment email (added 2026-07-06)
+  - Calls `customer_balances_fy.compute_customer_balances_fy(conn, 'all')` (from-beginning, all FYs,
+    with credit notes) then `customer_balances_fy_pdf.render_customer_balances_fy_pdf(data)`.
+  - Uses DejaVuSans TTFont (bundled, registered via `pdf_fonts.register_fonts()`) so ₹/— render.
+  - Subject: `IRAVI — Customer Balances (FY) — <DD Mon YYYY>`
+  - Body: `"Attached is the Customer Balances (FY) report."` (minimal HTML).
+  - Attachment: `IAL_Customer_Balances_FY_<DD-Mon-YYYY>.pdf`
+  - Sent via `_send_ses_email_with_pdf()`.
+  - `alert_runs.matched` = 1 (always); `status` = `sent` or `failed`.
+  - Does NOT call `evaluate_aggregate()` — has no conditions.
 - `sales` → `evaluate_aggregate()` → **PDF attachment email** if `matched=True` (wired 2026-07-05)
   - Subject: `IRAVI — Daily Net Sales Report — <DD Mon YYYY>`
   - Body: minimal HTML paragraph "Attached is the Daily Net Sales Report" + "do not reply" footer. No Conditions table, no Window Metrics table.
@@ -1042,6 +1133,41 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] Customer Balances (FY) alert — daily PDF email (2026-07-06, Slice 1 of 2):
+  - **Shared font infra:** `lambda/alerts_evaluator/pdf_fonts.py` — `register_fonts()` registers
+    DejaVuSans + DejaVuSans-Bold (bundled TTFs from matplotlib; 738 KB + 688 KB) fixing the
+    ₹ (U+20B9) / — (U+2014) `KeyError` that crashes Helvetica-based `doc.build()` on Lambda.
+    Idempotent; try/except falls back to Helvetica with warning. Reused by upcoming Supplier slice.
+  - **Shared compute:** `lambda/api/customer_balances_fy.py` (and byte-identical copy in
+    `lambda/alerts_evaluator/`) — `compute_customer_balances_fy(conn, fy_count) -> dict` extracts
+    all SQL/aggregation from `_handle_customer_balances_fy`; per-voucher netting, credit-note split,
+    opening balances, party sort by code — all preserved. `GET /reports/customer-balances-fy` JSON
+    is unchanged (cache-aside + `_response` wrapper remain in handler.py as thin delegate).
+  - **PDF renderer:** `lambda/alerts_evaluator/customer_balances_fy_pdf.py` —
+    `render_customer_balances_fy_pdf(data) -> bytes`; landscape A4, 1cm margins, DejaVuSans,
+    two-row header (`repeatRows=2`), 4 sub-cols per FY (Debit/Credit/Credit Notes/Balance),
+    always includes credit notes (from-beginning), Indian-grouped rupee format (₹12,34,567.00),
+    Dr/Cr balance suffixes, — for zero, #1a3c2b header / #f0f0f0 TOTAL / #fafafa zebra,
+    Kukatpally footer every page. Smoke test: 256718 bytes; DejaVuSans font embedded in PDF.
+  - **Alert category:** `customer_balances_fy` added to `FIELD_CATALOG_CUSTOMER_BALANCES_FY` and
+    `FIELD_CATALOGS` in `alerts_eval.py` (both copies); `fields=[]`, not branch-scoped, accepts
+    `conditions: []`; `validate_alert` already handles zero-condition non-balances categories.
+  - **Evaluator branch:** `category == 'customer_balances_fy'` in `alerts_evaluator/handler.py`
+    always fires; computes `fy_count='all'`, builds PDF, sends via `_send_ses_email_with_pdf`;
+    subject `"IRAVI — Customer Balances (FY) — <DD Mon YYYY>"`; body `"Attached is the Customer
+    Balances (FY) report."`; filename `IAL_Customer_Balances_FY_<DD-Mon-YYYY>.pdf`;
+    `alert_runs.matched=1, status='sent'`; keeps existing per-alert try/except gating.
+    Does NOT touch balances/sales/sale_returns branches.
+  - **py_compile clean:** all 8 new/changed files.
+  - **Byte-identical:** `api/customer_balances_fy.py` == `alerts_evaluator/customer_balances_fy.py`;
+    `api/alerts_eval.py` == `alerts_evaluator/alerts_eval.py`.
+  - **No IaC change needed:** `customer_balances_fy` is a free-text category; reportlab layer and
+    `/alerts` routes already exist. DejaVuSans TTFs ship in the `archive_file` zip without
+    any IaC change (same pattern as `ial-logo.png`).
+  - Supplier Balances (FY) alert is a separate upcoming slice; it will reuse `pdf_fonts.py`.
+
+- [x] monthly_sales_pdf.py — ASCII-safety fix (2026-07-06): replaced `₹` (U+20B9) in `_FOOTER_LINE2` with `Rs.` (root cause of `sales` alert failures recorded as `status='failed'`; `canvas._escape` raises `KeyError: 8377` for any char outside Latin-1 when invoked without prior `unicode2T1` pre-conversion). Also replaced the em-dash `—` (U+2014) in the `SimpleDocTemplate title` with an ASCII hyphen `-` for the same safety reason. Footer text now reads "Values are in Lakhs (1 Lakh = Rs. 1,00,000)". `py_compile` clean. No IaC or UI change required.
 
 - [x] alerts_evaluator — sales-alert PDF email path (2026-07-05): `category=='sales'` fires `_send_ses_email_with_pdf` (SES SendRawEmail) with a minimal "Attached is the Daily Net Sales Report" HTML body (no Conditions/Window-Metrics tables) and `IAL_Daily_Net_Sales_<DD-Mon-YYYY>.pdf` attachment built from `monthly_sales.compute_monthly_sales + monthly_sales_pdf.render_monthly_sales_pdf`; `sale_returns` path unchanged (metrics email, no attachment); `_send_ses_email_with_pdf` uses stdlib MIME only; reportlab==4.2.2 added to alerts_evaluator/requirements.txt; monthly_sales.py + monthly_sales_pdf.py imports wired at top of evaluator handler.
 - [x] api Lambda — `_handle_monthly_sales` refactored (2026-07-05): now delegates to `monthly_sales.compute_monthly_sales(conn, month_str)` (cache-aside + `_response` wrapper unchanged); inline SQL removed; endpoint JSON shape unchanged; API and PDF share one implementation.

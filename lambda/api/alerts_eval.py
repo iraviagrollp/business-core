@@ -202,11 +202,27 @@ FIELD_CATALOG_SALE_RETURNS = {
     "branch_scoped": True,
 }
 
+FIELD_CATALOG_CUSTOMER_BALANCES_FY = {
+    "category":    "customer_balances_fy",
+    "fields":      [],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+}
+
+FIELD_CATALOG_SUPPLIER_BALANCES_FY = {
+    "category":    "supplier_balances_fy",
+    "fields":      [],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+}
+
 # Master catalog lookup by category
 FIELD_CATALOGS: dict[str, dict] = {
-    "balances":     FIELD_CATALOG,
-    "sales":        FIELD_CATALOG_SALES,
-    "sale_returns": FIELD_CATALOG_SALE_RETURNS,
+    "balances":             FIELD_CATALOG,
+    "sales":                FIELD_CATALOG_SALES,
+    "sale_returns":         FIELD_CATALOG_SALE_RETURNS,
+    "customer_balances_fy": FIELD_CATALOG_CUSTOMER_BALANCES_FY,
+    "supplier_balances_fy": FIELD_CATALOG_SUPPLIER_BALANCES_FY,
 }
 
 _VALID_CATEGORIES: set[str] = set(FIELD_CATALOGS.keys())
@@ -730,10 +746,16 @@ def validate_alert(body: dict) -> None:
     Validate the body of a POST /alerts or PUT /alerts/{id} request.
     Raises ValidationError with a descriptive message on the first problem found.
 
-    Accepts category in {'balances', 'sales', 'sale_returns'}.
+    Accepts category in {'balances', 'sales', 'sale_returns', 'customer_balances_fy',
+                          'supplier_balances_fy'}.
     Validates conditions' field keys against the per-category field catalog.
     branch is optional for all categories; for sales/sale_returns it defaults to
     'ALL' (all branches) when absent or null.
+
+    customer_balances_fy / supplier_balances_fy:
+      Zero conditions are accepted (unconditional; always fires on schedule).
+      Not branch-scoped — branch is accepted and stored but not used in evaluation.
+      Fields list is empty so no condition field validation is ever applied.
     """
     name = (body.get("name") or "").strip()
     if not name:

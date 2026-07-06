@@ -49,7 +49,7 @@ _FOOTER_LINE1 = (
     "Shanthi Nagar, Kukatpally, Hyderabad, Telangana 500072"
 )
 _FOOTER_LINE2 = (
-    "This report is computer-generated. Values are in Lakhs (1 Lakh = ₹1,00,000). "
+    "This report is computer-generated. Values are in Lakhs (1 Lakh = Rs. 1,00,000). "
     "AP = Andhra Pradesh; TS = Telangana."
 )
 
@@ -156,7 +156,7 @@ def render_monthly_sales_pdf(data: dict) -> bytes:
         rightMargin=_MARGIN,
         topMargin=0.8 * cm,
         bottomMargin=1.4 * cm,      # footer draws at 0.4–0.7 cm; 1.4 cm leaves clearance
-        title=f"IAL Monthly Sales — {data['month_label']}",
+        title=f"IAL Monthly Sales - {data['month_label']}",
         author="IRAVI AGRO LIFE LLP",
     )
 
