@@ -124,6 +124,9 @@ business-core/
         │                        #f0f0f0 TOTAL row, always-visible Credit Notes column.
         │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
         │                        (added 2026-07-06)
+        │                        Dr/Cr balance coloring added 2026-07-01: per-FY Balance(₹),
+        │                        Balance Dr, Balance Cr cells colored in data + TOTAL rows.
+        │                        Customer: Dr → RED (#cc0000), Cr → GREEN (#1a6e35).
         ├── supplier_balances_fy.py ← SHARED: byte-identical copy of api/supplier_balances_fy.py
         │                        compute_supplier_balances_fy(conn, fy_count) → dict
         │                        No code field; no credit_notes field. Sort by party name ascending.
@@ -137,6 +140,9 @@ business-core/
         │                        'Dr = Debit (payable); Cr = Credit (advance/overpayment).'
         │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
         │                        (added 2026-07-06)
+        │                        Dr/Cr balance coloring added 2026-07-01: per-FY Balance(₹),
+        │                        Balance Dr, Balance Cr cells colored in data + TOTAL rows.
+        │                        Supplier SWAPPED: Dr → GREEN (#1a6e35), Cr → RED (#cc0000).
         ├── pdf_fonts.py      ← SHARED: idempotent register_fonts() — registers DejaVuSans and
         │                        DejaVuSans-Bold with reportlab pdfmetrics; falls back to Helvetica
         │                        with warning on failure. Fixes ₹ (U+20B9) + — (U+2014) KeyError
@@ -1134,6 +1140,27 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] Dr/Cr balance coloring added to alert-email PDF renderers (2026-07-01):
+  - **`customer_balances_fy_pdf.py`** — Customer semantics: Dr (receivable) → RED `#cc0000`,
+    Cr (credit/advance) → GREEN `#1a6e35`. Colored columns: per-FY Balance (₹), Balance Dr,
+    Balance Cr in every data row and the TOTAL row. Debit / Credit / Credit Notes columns and
+    all text columns (S.No / Party / Code / City) unchanged.
+  - **`supplier_balances_fy_pdf.py`** — Supplier semantics SWAPPED (matching SupplierBalancesFY.tsx):
+    Dr (payable, normal) → GREEN `#1a6e35`, Cr (advance/overpayment) → RED `#cc0000`.
+    Same colored columns: per-FY Balance (₹), Balance Dr, Balance Cr in data + TOTAL rows.
+    No Code column; no Credit Notes column (not present in supplier data).
+  - **Implementation:** color-specific ParagraphStyle instances (`dat_r_red`, `dat_r_green`,
+    `tot_r_red`, `tot_r_green` in customer; `dat_r_green`, `dat_r_red`, `tot_r_green`,
+    `tot_r_red` in supplier) for visual rendering. Corresponding per-cell
+    `('TEXTCOLOR', (col,row), (col,row), <color>)` TableStyle commands also appended to
+    `tbl_cmds` (note: redundant for Paragraph cells in ReportLab but present per spec for
+    smoke-test verification; `color_cmds` list is confirmed non-empty for any data with
+    Dr or Cr balances).
+  - **Balance column index formula:** customer: `bal_col = 4 + fy_idx*4 + 3`; supplier:
+    `bal_col = 3 + fy_idx*3 + 2`. Balance Dr = `n_cols-2`; Balance Cr = `n_cols-1`.
+  - **Smoke test results:** customer 257239 bytes / 9 TEXTCOLOR commands; supplier 257057
+    bytes / 9 TEXTCOLOR commands. Both py_compile clean. No IaC/UI change.
+
 - [x] Customer Balances (FY) alert — daily PDF email (2026-07-06, Slice 1 of 2):
   - **Shared font infra:** `lambda/alerts_evaluator/pdf_fonts.py` — `register_fonts()` registers
     DejaVuSans + DejaVuSans-Bold (bundled TTFs from matplotlib; 738 KB + 688 KB) fixing the
@@ -1150,6 +1177,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
     always includes credit notes (from-beginning), Indian-grouped rupee format (₹12,34,567.00),
     Dr/Cr balance suffixes, — for zero, #1a3c2b header / #f0f0f0 TOTAL / #fafafa zebra,
     Kukatpally footer every page. Smoke test: 256718 bytes; DejaVuSans font embedded in PDF.
+    **Dr/Cr balance coloring added 2026-07-01:** `_RED=#cc0000`, `_GREEN=#1a6e35`. Customer
+    semantics: Dr (receivable) → RED, Cr (credit/advance) → GREEN. Colored columns: per-FY
+    Balance (₹), Balance Dr, Balance Cr (data rows + TOTAL row). Debit/Credit/Credit Notes
+    and text columns unchanged. Implemented via color-specific ParagraphStyle instances
+    (`dat_r_red/dat_r_green/tot_r_red/tot_r_green`) for visual rendering, plus corresponding
+    per-cell `('TEXTCOLOR', (col,row), (col,row), <color>)` commands appended to tbl_cmds.
+    Smoke test 257239 bytes; 9 TEXTCOLOR commands verified; py_compile clean.
   - **Alert category:** `customer_balances_fy` added to `FIELD_CATALOG_CUSTOMER_BALANCES_FY` and
     `FIELD_CATALOGS` in `alerts_eval.py` (both copies); `fields=[]`, not branch-scoped, accepts
     `conditions: []`; `validate_alert` already handles zero-condition non-balances categories.
