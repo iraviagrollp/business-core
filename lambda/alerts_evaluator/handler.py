@@ -49,14 +49,24 @@ import boto3
 import psycopg2
 
 import alerts_eval
+import customer_balances_fy as _cbfy
+import customer_balances_fy_pdf as _cbfy_pdf
+import supplier_balances_fy as _sbfy
+import supplier_balances_fy_pdf as _sbfy_pdf
 import monthly_sales
 import monthly_sales_pdf
+import pdf_fonts
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 secrets = boto3.client("secretsmanager")
 ses = boto3.client("ses")
+
+# Register Unicode TTF fonts once at module load so ₹ / — render correctly in
+# all PDF paths (customer_balances_fy_pdf and any future PDF renderers).
+# pdf_fonts.register_fonts() is idempotent — safe to call multiple times.
+pdf_fonts.register_fonts()
 
 _SENDER_EMAIL = os.environ.get("ALERTS_SENDER_EMAIL", "")
 
@@ -514,6 +524,86 @@ def lambda_handler(event, context):
                 else:
                     status = "no_match"
                     logger.info("Alert id=%s (balances): no customers matched", alert_id)
+
+            elif category == "customer_balances_fy":
+                # ── Customer Balances (FY) report — always fires ──────────────
+                # Unconditional: the alert fires on every scheduled run.
+                # Builds the full FY report (from beginning, all FYs, with credit
+                # notes) and attaches it as a PDF to the SES email.
+                date_display = today.strftime('%d %b %Y')
+                data_cbfy    = _cbfy.compute_customer_balances_fy(conn, 'all')
+                pdf_bytes    = _cbfy_pdf.render_customer_balances_fy_pdf(data_cbfy)
+                pdf_filename = f"IAL_Customer_Balances_FY_{today.strftime('%d-%b-%Y')}.pdf"
+                subject      = (
+                    f"IRAVI — Customer Balances (FY) — {date_display}"
+                )
+                html_body = (
+                    '<!DOCTYPE html>'
+                    '<html><head><meta charset="UTF-8"></head>'
+                    '<body style="font-family:Arial,sans-serif;color:#333;'
+                    'max-width:700px;margin:0 auto">'
+                    f'<p style="font-size:15px">Attached is the Customer Balances (FY) '
+                    f'report for <strong>{date_display}</strong>.</p>'
+                    '<p style="margin-top:20px;font-size:11px;color:#888">'
+                    'This is an automated message from the IRAVI Dashboard. '
+                    'Please do not reply to this email.'
+                    '</p>'
+                    '</body></html>'
+                )
+                _send_ses_email_with_pdf(
+                    subject,
+                    alert["recipients"],
+                    html_body,
+                    pdf_bytes,
+                    pdf_filename,
+                )
+                status        = "sent"
+                matched_count = 1
+                logger.info(
+                    "Alert id=%s (customer_balances_fy) sent to %d recipients — "
+                    "PDF %s (%d bytes)",
+                    alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                )
+
+            elif category == "supplier_balances_fy":
+                # ── Supplier Balances (FY) report — always fires ──────────────
+                # Unconditional: the alert fires on every scheduled run.
+                # Builds the full FY report (from beginning, all FYs, no credit
+                # notes, no code column) and attaches it as a PDF to the SES email.
+                date_display = today.strftime('%d %b %Y')
+                data_sbfy    = _sbfy.compute_supplier_balances_fy(conn, 'all')
+                pdf_bytes    = _sbfy_pdf.render_supplier_balances_fy_pdf(data_sbfy)
+                pdf_filename = f"IAL_Supplier_Balances_FY_{today.strftime('%d-%b-%Y')}.pdf"
+                subject      = (
+                    f"IRAVI — Supplier Balances (FY) — {date_display}"
+                )
+                html_body = (
+                    '<!DOCTYPE html>'
+                    '<html><head><meta charset="UTF-8"></head>'
+                    '<body style="font-family:Arial,sans-serif;color:#333;'
+                    'max-width:700px;margin:0 auto">'
+                    f'<p style="font-size:15px">Attached is the Supplier Balances (FY) '
+                    f'report for <strong>{date_display}</strong>.</p>'
+                    '<p style="margin-top:20px;font-size:11px;color:#888">'
+                    'This is an automated message from the IRAVI Dashboard. '
+                    'Please do not reply to this email.'
+                    '</p>'
+                    '</body></html>'
+                )
+                _send_ses_email_with_pdf(
+                    subject,
+                    alert["recipients"],
+                    html_body,
+                    pdf_bytes,
+                    pdf_filename,
+                )
+                status        = "sent"
+                matched_count = 1
+                logger.info(
+                    "Alert id=%s (supplier_balances_fy) sent to %d recipients — "
+                    "PDF %s (%d bytes)",
+                    alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                )
 
             else:
                 # ── Aggregate sales / sale_returns evaluation ─────────────────
