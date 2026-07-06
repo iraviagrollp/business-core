@@ -22,6 +22,14 @@ Design
 - Balance / Balance Dr / Balance Cr: Rs... Dr / Rs... Cr / -- .
 - TOTAL row: #f0f0f0 background, bold.
 - Header rows: #1a3c2b (dark green) background, white text.
+- Balance coloring (matching reports-section UI — SWAPPED vs customer):
+    Supplier semantics — Dr → GREEN (#1a6e35), Cr → RED (#cc0000).
+    Applied to: per-FY Balance (₹), Balance Dr, Balance Cr columns (data + TOTAL rows).
+    Debit / Credit columns and text columns are uncolored.
+    Implemented via color-specific ParagraphStyle instances (ensures visual rendering)
+    plus corresponding TEXTCOLOR TableStyle commands (satisfies spec requirement;
+    note: TableStyle TEXTCOLOR is redundant for Paragraph cells but present for
+    smoke-test / spec compliance).
 - Footer every page: registered address + generated-by note (drawn directly on
   canvas so it appears on every page, even partial pages).
   Supplier legend: 'Dr = Debit (payable); Cr = Credit (advance/overpayment).'
@@ -55,6 +63,12 @@ _HEADER_BG   = colors.HexColor('#1a3c2b')   # brand dark green
 _TOTAL_BG    = colors.HexColor('#f0f0f0')   # light grey TOTAL row
 _ALT_BG      = colors.HexColor('#fafafa')   # subtle zebra stripe
 _CELL_BORDER = colors.HexColor('#cccccc')
+
+# Supplier semantics are SWAPPED vs customer:
+#   Dr (payable) → GREEN  — a liability owed to the supplier is the normal state
+#   Cr (advance/overpayment) → RED — unexpected credit warrants attention
+_RED   = colors.HexColor('#cc0000')   # Cr balance — supplier advance/overpayment
+_GREEN = colors.HexColor('#1a6e35')   # Dr balance — supplier payable (normal)
 
 _PAGE_W, _PAGE_H = landscape(A4)           # 841.89 x 595.27 pt
 _MARGIN = 1.0 * cm
@@ -188,9 +202,18 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
     dat_c = _ps('SBFYDatC', 'DejaVuSans', 6, TA_CENTER)
     dat_r = _ps('SBFYDatR', 'DejaVuSans', 6, TA_RIGHT)
 
+    # Color-specific data-row styles for balance columns
+    # Supplier: Dr → GREEN (payable, normal), Cr → RED (advance/overpayment)
+    dat_r_green = _ps('SBFYDatRGreen', 'DejaVuSans',      6, TA_RIGHT, color=_GREEN)
+    dat_r_red   = _ps('SBFYDatRRed',   'DejaVuSans',      6, TA_RIGHT, color=_RED)
+
     tot_l = _ps('SBFYTotL', 'DejaVuSans-Bold', 6, TA_LEFT)
     tot_c = _ps('SBFYTotC', 'DejaVuSans-Bold', 6, TA_CENTER)
     tot_r = _ps('SBFYTotR', 'DejaVuSans-Bold', 6, TA_RIGHT)
+
+    # Color-specific TOTAL-row styles for balance columns
+    tot_r_green = _ps('SBFYTotRGreen', 'DejaVuSans-Bold', 6, TA_RIGHT, color=_GREEN)
+    tot_r_red   = _ps('SBFYTotRRed',   'DejaVuSans-Bold', 6, TA_RIGHT, color=_RED)
 
     # -- Letterhead (3-column header table) ------------------------------------
     today_str = _date.today().strftime('%d-%m-%Y')
@@ -291,24 +314,55 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
 
     # -- Build data rows -------------------------------------------------------
     table_rows: list = [row0, row1]
+    # per-cell TEXTCOLOR commands for balance columns only (spec requirement;
+    # visual color is also set via color-specific ParagraphStyle instances above
+    # because ReportLab ignores TableStyle TEXTCOLOR for Paragraph cells)
+    color_cmds: list = []
 
     for idx, row in enumerate(rows):
+        tbl_row = 2 + idx               # 2 header rows precede data rows
         fy_map = {p['fy']: p for p in row['per_fy']}
         dr: list = [
             Paragraph(str(idx + 1),           dat_c),
             Paragraph(row['party'],            dat_l),
             Paragraph(row['city'] or '—', dat_l),
         ]
-        for fy in fys:
+        for fy_idx, fy in enumerate(fys):
+            # Balance (₹) is the 3rd sub-col (index 2) within each FY group.
+            # FY group for fy_idx starts at col 3 + fy_idx * 3.
+            bal_col = 3 + fy_idx * 3 + 2
             p = fy_map.get(fy)
             if p:
+                bal = p['balance']
                 dr.append(Paragraph(_amt(p['debit']),   dat_r))
                 dr.append(Paragraph(_amt(p['credit']),  dat_r))
-                dr.append(Paragraph(_bal(p['balance']), dat_r))
+                # Balance (₹): supplier SWAPPED — Dr → GREEN, Cr → RED
+                if bal > 0:    # Dr (payable, normal) → GREEN
+                    dr.append(Paragraph(_bal(bal), dat_r_green))
+                    color_cmds.append(
+                        ('TEXTCOLOR', (bal_col, tbl_row), (bal_col, tbl_row), _GREEN))
+                elif bal < 0:  # Cr (advance/overpayment) → RED
+                    dr.append(Paragraph(_bal(bal), dat_r_red))
+                    color_cmds.append(
+                        ('TEXTCOLOR', (bal_col, tbl_row), (bal_col, tbl_row), _RED))
+                else:
+                    dr.append(Paragraph(_bal(bal), dat_r))
             else:
                 dr.extend([Paragraph('—', dat_r)] * 3)
-        dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r))
-        dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r))
+        # Balance Dr column (n_cols - 2): Dr → GREEN (supplier payable)
+        if row['balance_dr'] > 0:
+            dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r_green))
+            color_cmds.append(
+                ('TEXTCOLOR', (n_cols - 2, tbl_row), (n_cols - 2, tbl_row), _GREEN))
+        else:
+            dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r))
+        # Balance Cr column (n_cols - 1): Cr → RED (supplier advance/overpayment)
+        if row['balance_cr'] < 0:
+            dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r_red))
+            color_cmds.append(
+                ('TEXTCOLOR', (n_cols - 1, tbl_row), (n_cols - 1, tbl_row), _RED))
+        else:
+            dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r))
         table_rows.append(dr)
 
     # TOTAL row
@@ -321,16 +375,48 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
     for fy in fys:
         p = tot_fy_map.get(fy)
         if p:
+            bal = p['balance']
             total_row.append(Paragraph(_amt(p['debit']),   tot_r))
             total_row.append(Paragraph(_amt(p['credit']),  tot_r))
-            total_row.append(Paragraph(_bal(p['balance']), tot_r))
+            # Supplier SWAPPED: Dr → GREEN, Cr → RED
+            if bal > 0:
+                total_row.append(Paragraph(_bal(bal), tot_r_green))
+            elif bal < 0:
+                total_row.append(Paragraph(_bal(bal), tot_r_red))
+            else:
+                total_row.append(Paragraph(_bal(bal), tot_r))
         else:
             total_row.extend([Paragraph('—', tot_r)] * 3)
-    total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r))
-    total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r))
+    if totals['balance_dr'] > 0:
+        total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r_green))
+    else:
+        total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r))
+    if totals['balance_cr'] < 0:
+        total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r_red))
+    else:
+        total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r))
     table_rows.append(total_row)
 
     total_row_idx = len(table_rows) - 1   # 0-based
+
+    # TOTAL row TEXTCOLOR commands for balance columns (supplier: Dr→GREEN, Cr→RED)
+    for fy_idx, fy in enumerate(fys):
+        bal_col = 3 + fy_idx * 3 + 2
+        p = tot_fy_map.get(fy)
+        if p:
+            bal = p['balance']
+            if bal > 0:
+                color_cmds.append(
+                    ('TEXTCOLOR', (bal_col, total_row_idx), (bal_col, total_row_idx), _GREEN))
+            elif bal < 0:
+                color_cmds.append(
+                    ('TEXTCOLOR', (bal_col, total_row_idx), (bal_col, total_row_idx), _RED))
+    if totals['balance_dr'] > 0:
+        color_cmds.append(
+            ('TEXTCOLOR', (n_cols - 2, total_row_idx), (n_cols - 2, total_row_idx), _GREEN))
+    if totals['balance_cr'] < 0:
+        color_cmds.append(
+            ('TEXTCOLOR', (n_cols - 1, total_row_idx), (n_cols - 1, total_row_idx), _RED))
 
     # -- Table style -----------------------------------------------------------
     tbl_cmds: list = span_cmds + [
@@ -346,7 +432,7 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
         ('LEFTPADDING',   (0, 0), (-1, -1), 2),
         ('RIGHTPADDING',  (0, 0), (-1, -1), 2),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-    ]
+    ] + color_cmds
 
     # Zebra stripe on alternate data rows (starting from the first data row = index 2)
     for i in range(2, total_row_idx):

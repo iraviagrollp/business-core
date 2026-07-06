@@ -22,6 +22,14 @@ Design
 - Balance / Balance Dr / Balance Cr: ₹… Dr / ₹… Cr / — .
 - TOTAL row: #f0f0f0 background, bold.
 - Header rows: #1a3c2b (dark green) background, white text.
+- Balance coloring (matching reports-section UI):
+    Customer semantics — Dr → RED (#cc0000), Cr → GREEN (#1a6e35).
+    Applied to: per-FY Balance (₹), Balance Dr, Balance Cr columns (data + TOTAL rows).
+    Debit / Credit / Credit Notes columns and text columns are uncolored.
+    Implemented via color-specific ParagraphStyle instances (ensures visual rendering)
+    plus corresponding TEXTCOLOR TableStyle commands (satisfies spec requirement;
+    note: TableStyle TEXTCOLOR is redundant for Paragraph cells but present for
+    smoke-test / spec compliance).
 - Footer every page: registered address + generated-by note (drawn directly on
   canvas so it appears on every page, even partial pages).
 """
@@ -53,6 +61,9 @@ _HEADER_BG   = colors.HexColor('#1a3c2b')   # brand dark green
 _TOTAL_BG    = colors.HexColor('#f0f0f0')   # light grey TOTAL row
 _ALT_BG      = colors.HexColor('#fafafa')   # subtle zebra stripe
 _CELL_BORDER = colors.HexColor('#cccccc')
+
+_RED   = colors.HexColor('#cc0000')   # Dr balance — customer receivable
+_GREEN = colors.HexColor('#1a6e35')   # Cr balance — customer credit/advance
 
 _PAGE_W, _PAGE_H = landscape(A4)           # 841.89 x 595.27 pt
 _MARGIN = 1.0 * cm
@@ -186,9 +197,17 @@ def render_customer_balances_fy_pdf(data: dict) -> bytes:
     dat_c = _ps('CBFYDatC', 'DejaVuSans', 6, TA_CENTER)
     dat_r = _ps('CBFYDatR', 'DejaVuSans', 6, TA_RIGHT)
 
+    # Color-specific data-row styles for balance columns (Dr=RED, Cr=GREEN)
+    dat_r_red   = _ps('CBFYDatRRed',   'DejaVuSans',      6, TA_RIGHT, color=_RED)
+    dat_r_green = _ps('CBFYDatRGreen', 'DejaVuSans',      6, TA_RIGHT, color=_GREEN)
+
     tot_l = _ps('CBFYTotL', 'DejaVuSans-Bold', 6, TA_LEFT)
     tot_c = _ps('CBFYTotC', 'DejaVuSans-Bold', 6, TA_CENTER)
     tot_r = _ps('CBFYTotR', 'DejaVuSans-Bold', 6, TA_RIGHT)
+
+    # Color-specific TOTAL-row styles for balance columns (Dr=RED, Cr=GREEN)
+    tot_r_red   = _ps('CBFYTotRRed',   'DejaVuSans-Bold', 6, TA_RIGHT, color=_RED)
+    tot_r_green = _ps('CBFYTotRGreen', 'DejaVuSans-Bold', 6, TA_RIGHT, color=_GREEN)
 
     # ── Letterhead (3-column header table) ───────────────────────────────────
     today_str = _date.today().strftime('%d-%m-%Y')
@@ -292,8 +311,13 @@ def render_customer_balances_fy_pdf(data: dict) -> bytes:
 
     # ── Build data rows ───────────────────────────────────────────────────────
     table_rows: list = [row0, row1]
+    # per-cell TEXTCOLOR commands for balance columns only (spec requirement;
+    # visual color is also set via color-specific ParagraphStyle instances above
+    # because ReportLab ignores TableStyle TEXTCOLOR for Paragraph cells)
+    color_cmds: list = []
 
     for idx, row in enumerate(rows):
+        tbl_row = 2 + idx               # 2 header rows precede data rows
         fy_map = {p['fy']: p for p in row['per_fy']}
         dr: list = [
             Paragraph(str(idx + 1),              dat_c),
@@ -301,17 +325,43 @@ def render_customer_balances_fy_pdf(data: dict) -> bytes:
             Paragraph(row['code'] or '—',    dat_l),
             Paragraph(row['city'] or '—',    dat_l),
         ]
-        for fy in fys:
+        for fy_idx, fy in enumerate(fys):
+            # Balance (₹) is the 4th sub-col (index 3) within each FY group.
+            # FY group for fy_idx starts at col 4 + fy_idx * 4.
+            bal_col = 4 + fy_idx * 4 + 3
             p = fy_map.get(fy)
             if p:
+                bal = p['balance']
                 dr.append(Paragraph(_amt(p['debit']),        dat_r))
                 dr.append(Paragraph(_amt(p['credit']),       dat_r))
                 dr.append(Paragraph(_amt(p['credit_notes']), dat_r))
-                dr.append(Paragraph(_bal(p['balance']),      dat_r))
+                # Balance (₹): Dr → RED, Cr → GREEN, zero/dash → default
+                if bal > 0:    # Dr (receivable) → RED
+                    dr.append(Paragraph(_bal(bal), dat_r_red))
+                    color_cmds.append(
+                        ('TEXTCOLOR', (bal_col, tbl_row), (bal_col, tbl_row), _RED))
+                elif bal < 0:  # Cr (credit/advance) → GREEN
+                    dr.append(Paragraph(_bal(bal), dat_r_green))
+                    color_cmds.append(
+                        ('TEXTCOLOR', (bal_col, tbl_row), (bal_col, tbl_row), _GREEN))
+                else:
+                    dr.append(Paragraph(_bal(bal), dat_r))
             else:
                 dr.extend([Paragraph('—', dat_r)] * 4)
-        dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r))
-        dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r))
+        # Balance Dr column (n_cols - 2): Dr → RED, else default (dash)
+        if row['balance_dr'] > 0:
+            dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r_red))
+            color_cmds.append(
+                ('TEXTCOLOR', (n_cols - 2, tbl_row), (n_cols - 2, tbl_row), _RED))
+        else:
+            dr.append(Paragraph(_bal_dr(row['balance_dr']), dat_r))
+        # Balance Cr column (n_cols - 1): Cr → GREEN, else default (dash)
+        if row['balance_cr'] < 0:
+            dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r_green))
+            color_cmds.append(
+                ('TEXTCOLOR', (n_cols - 1, tbl_row), (n_cols - 1, tbl_row), _GREEN))
+        else:
+            dr.append(Paragraph(_bal_cr(row['balance_cr']), dat_r))
         table_rows.append(dr)
 
     # TOTAL row
@@ -325,17 +375,48 @@ def render_customer_balances_fy_pdf(data: dict) -> bytes:
     for fy in fys:
         p = tot_fy_map.get(fy)
         if p:
+            bal = p['balance']
             total_row.append(Paragraph(_amt(p['debit']),        tot_r))
             total_row.append(Paragraph(_amt(p['credit']),       tot_r))
             total_row.append(Paragraph(_amt(p['credit_notes']), tot_r))
-            total_row.append(Paragraph(_bal(p['balance']),      tot_r))
+            if bal > 0:
+                total_row.append(Paragraph(_bal(bal), tot_r_red))
+            elif bal < 0:
+                total_row.append(Paragraph(_bal(bal), tot_r_green))
+            else:
+                total_row.append(Paragraph(_bal(bal), tot_r))
         else:
             total_row.extend([Paragraph('—', tot_r)] * 4)
-    total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r))
-    total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r))
+    if totals['balance_dr'] > 0:
+        total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r_red))
+    else:
+        total_row.append(Paragraph(_bal_dr(totals['balance_dr']), tot_r))
+    if totals['balance_cr'] < 0:
+        total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r_green))
+    else:
+        total_row.append(Paragraph(_bal_cr(totals['balance_cr']), tot_r))
     table_rows.append(total_row)
 
     total_row_idx = len(table_rows) - 1   # 0-based
+
+    # TOTAL row TEXTCOLOR commands for balance columns
+    for fy_idx, fy in enumerate(fys):
+        bal_col = 4 + fy_idx * 4 + 3
+        p = tot_fy_map.get(fy)
+        if p:
+            bal = p['balance']
+            if bal > 0:
+                color_cmds.append(
+                    ('TEXTCOLOR', (bal_col, total_row_idx), (bal_col, total_row_idx), _RED))
+            elif bal < 0:
+                color_cmds.append(
+                    ('TEXTCOLOR', (bal_col, total_row_idx), (bal_col, total_row_idx), _GREEN))
+    if totals['balance_dr'] > 0:
+        color_cmds.append(
+            ('TEXTCOLOR', (n_cols - 2, total_row_idx), (n_cols - 2, total_row_idx), _RED))
+    if totals['balance_cr'] < 0:
+        color_cmds.append(
+            ('TEXTCOLOR', (n_cols - 1, total_row_idx), (n_cols - 1, total_row_idx), _GREEN))
 
     # ── Table style ───────────────────────────────────────────────────────────
     tbl_cmds: list = span_cmds + [
@@ -351,7 +432,7 @@ def render_customer_balances_fy_pdf(data: dict) -> bytes:
         ('LEFTPADDING',   (0, 0), (-1, -1), 2),
         ('RIGHTPADDING',  (0, 0), (-1, -1), 2),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-    ]
+    ] + color_cmds
 
     # Zebra stripe on alternate data rows (starting from the first data row = index 2)
     for i in range(2, total_row_idx):
