@@ -114,6 +114,13 @@ business-core/
         │                        (Helvetica/WinAnsiEncoding cannot encode U+20B9; canvas._escape raises
         │                        KeyError: 8377 for chars outside Latin-1 when called in certain paths).
         │                        SimpleDocTemplate title em-dash "—" also replaced with ASCII "-".
+        │                        Rebranded 2026-07-11: new layout — DAILY NET SALES (DATE|AP|TS|SUB
+        │                        TOTAL, PROJECTIONS row, DD-MM-YYYY dates, dark-green G. TOTAL band,
+        │                        EXCESS/SHORT row) + ANNUAL POSITION & CUMULATIVE SALES (two-row
+        │                        spanning header, AP/TS/SUB TOT) + side-by-side MONTH ONLY /
+        │                        CUMULATIVE small tables. Consumes the new targets/YoY keys added to
+        │                        monthly_sales.compute_monthly_sales() the same day. See "api —
+        │                        GET /reports/monthly-sales" section for the full field list.
         ├── customer_balances_fy.py ← SHARED: byte-identical copy of api/customer_balances_fy.py
         │                        compute_customer_balances_fy(conn, fy_count) → dict
         │                        (added 2026-07-06)
@@ -661,7 +668,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /sales` | — | Stub (returns empty array) |
 | `GET /reports/customer-balances-fy` | `iravi:reports:customer_balances_fy:{fy_count}` | Complete |
 | `GET /reports/supplier-balances-fy` | `iravi:reports:supplier_balances_fy:{fy_count}` | Complete |
-| `GET /reports/monthly-sales` | `iravi:reports:monthly_sales:{month}` | Complete |
+| `GET /reports/monthly-sales` | `iravi:reports:monthly_sales:v2:{month}` | Complete (v2 payload — targets + YoY, 2026-07-11) |
 | `GET /ledger/statement` | `iravi:ledger:statement:{account}:{from}:{to}` | Complete |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
@@ -858,11 +865,63 @@ Empty-data case returns `{'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balan
 }
 ```
 
-**Redis key:** `iravi:reports:monthly_sales:{month}` (e.g. `iravi:reports:monthly_sales:2026-06`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush`.
+**Redis key:** `iravi:reports:monthly_sales:v2:{month}` (e.g. `iravi:reports:monthly_sales:v2:2026-06`). TTL: `_LEDGER_TTL` (1 hour). Cleared by `POST /admin/cache/flush`. Bumped `v2` on 2026-07-11 when the targets/YoY keys below were added, so stale old-shape cache entries never collide with the new payload shape.
 
 **RBAC screen key (IaC + UI must register):** `reports.monthly_sales`
 
-**IaC requirements:** API Gateway route `GET /reports/monthly-sales` + CORS in `lambda_api.tf`; `app_screens` seed migration to insert `reports.monthly_sales`. No new DB table or column needed — reads from existing `sales` and `customer_details` tables.
+**IaC requirements:** API Gateway route `GET /reports/monthly-sales` + CORS in `lambda_api.tf`; `app_screens` seed migration to insert `reports.monthly_sales`. No new DB table or column needed for the base payload — reads from existing `sales` and `customer_details` tables. The targets/YoY extension (below) additionally reads `monthly_sale_targets` (already created by the `/config/monthly-targets` admin endpoint, migration TBD by IaC — see "What Is Built").
+
+---
+
+### Targets / year-over-year extension (added 2026-07-11)
+
+`compute_monthly_sales` (both `lambda/api/monthly_sales.py` and the byte-identical
+`lambda/alerts_evaluator/monthly_sales.py`) now also returns, alongside all the keys
+above:
+
+- **`projections`** `{andhra, telangana, total}` — the current month's target from
+  `monthly_sale_targets` (state `AP`/`TG`, `month`/`yr` match), converted from lakhs
+  to raw rupees (`× 100000`). `0.0` if no row / table absent.
+- **`excess_short`** `{andhra, telangana, total}` — `grand_total − projections`, per state.
+- **`targets_available`** `bool` — `False` (with all target/projection figures forced to
+  `0.0`) if `monthly_sale_targets` does not exist yet (`to_regclass` check) — degrades
+  gracefully, never raises.
+- **`annual_position`** — `{prev_fy_label, cur_fy_label, prev_month_label_full,
+  actual_sales_prev_fy, annual_target_cur_fy, upto_prev_month: {prev_fy, cur_fy, diff,
+  growth_pct}}`. `actual_sales_prev_fy` = previous FY's full annual actual net sales
+  (Apr 1 → Mar 31). `annual_target_cur_fy` = current FY's summed monthly targets
+  (`monthly_sale_targets` rows Apr–Mar). `upto_prev_month.cur_fy` is the same value
+  as `analysis.up_to_prev_month`. `growth_pct` is `None` when the prior-year figure is
+  zero (avoids divide-by-zero), else `round((cur-prev)/prev*100, 2)`.
+- **`month_only`** — `{month_name, prev_fy, cur_fy, diff}` — same calendar month,
+  prior FY vs current FY (`cur_fy` == `grand_total`).
+- **`cumulative_as_on`** — `{month_abbr, prev_fy_label, cur_fy_label, prev_fy_upto,
+  cur_fy_as_on, diff}` — cumulative FY-to-date as of the report month: prior FY
+  (FY-start → same month-end last year) vs current FY (`up_to_prev_month + grand_total`,
+  i.e. FY-start through the as-on date of the selected month).
+
+All new money fields are raw rupees, 2 dp, same convention as the rest of the payload.
+Implemented via a shared helper `_net_sales_by_state(cur, start_date, end_date,
+unmapped_branches)` that reuses the existing branch→state net-sales query across every
+new date range (adds unmapped branches to the same shared set already used by the base
+computation). Four extra queries (prevFY same-month, prevFY up-to-prev-month, prevFY
+cumulative, prevFY full-annual) plus up to two targets queries — acceptable given the
+1-hour Redis TTL.
+
+**`monthly_sales_pdf.py` rebrand (2026-07-11):** `render_monthly_sales_pdf` restructured
+to: (1) letterhead (bold company name, subtitle, date/lakhs-note — unchanged structure);
+(2) **DAILY NET SALES** table (`DATE | AP | TS | SUB TOTAL`) with a shaded PROJECTIONS
+row, 31 `DD-MM-YYYY` day rows (future blank, zero `-`, negative in parens), a dark-green
+**G. TOTAL** band, and a shaded **EXCESS / SHORT** row (leading-minus negatives);
+(3) **ANNUAL POSITION & CUMULATIVE SALES (UP TO {prev_month_label_full})** — two-row
+spanning header (`STATE | Actual Sales {prevFY} | Annual Target {curFY} | UP TO
+{prevMonth}` spanning `{prevFY}|{curFY}|DIFF|GROWTH %`), rows AP/TS/shaded SUB TOT;
+(4) two side-by-side small tables — `"{MONTH} MONTH ONLY"` and `"CUMULATIVE — UP TO /
+AS ON DATE"`, each `STATE | col | col | DIFF`, rows AP/TS/SUB TOT. All money in lakhs
+(raw/100000) 2dp with Indian-style thousands grouping; `_HEADER_COLOR`/
+`_TOTAL_BG_COLOR`/`_ALT_ROW_COLOR`/logo/`_draw_footer` unchanged. Verified by rendering
+a PDF from a mocked payload and visually inspecting the rasterized page (reportlab +
+PyMuPDF, scratch-only, not added to `requirements.txt`).
 
 ---
 
@@ -1149,6 +1208,27 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] `compute_monthly_sales` extended with targets/YoY comparison data + `monthly_sales_pdf.py`
+  rebranded (2026-07-11): both byte-identical copies (`lambda/api/monthly_sales.py`,
+  `lambda/alerts_evaluator/monthly_sales.py`) now additionally return `projections`,
+  `excess_short`, `targets_available`, `annual_position`, `month_only`, `cumulative_as_on`
+  (all existing keys unchanged) — reads `monthly_sale_targets` (see the `/config/monthly-targets`
+  entry below), degrades gracefully (`targets_available=False`, all-zero projections) if that
+  table doesn't exist yet via `to_regclass`. New shared helper `_net_sales_by_state(cur,
+  start_date, end_date, unmapped_branches)`. Full field docs in "api — GET /reports/monthly-sales
+  → Targets / year-over-year extension". `lambda/alerts_evaluator/monthly_sales_pdf.py`
+  rewritten to the new DAILY NET SALES / ANNUAL POSITION & CUMULATIVE SALES / MONTH ONLY +
+  CUMULATIVE side-by-side layout (see file-tree note above). `lambda/api/handler.py` Redis
+  cache key bumped `iravi:reports:monthly_sales:{month}` → `iravi:reports:monthly_sales:v2:{month}`
+  (read + write) so the new payload shape never collides with a stale cached old-shape entry.
+  Verified: `python -m py_compile` clean on all four files; the two `monthly_sales.py` copies
+  confirmed byte-identical via `filecmp.cmp`; `compute_monthly_sales` exercised against a mocked
+  psycopg2 connection/cursor (no real DB needed) with no exceptions; `render_monthly_sales_pdf`
+  rendered against that mocked payload and the output page visually inspected (reportlab +
+  PyMuPDF installed to the session scratchpad only, not added to any `requirements.txt`).
+  **UI needed:** no UI change requested this task — `MonthlySales.tsx` still consumes the
+  original key subset; new keys are additive and optional for the UI to adopt later.
 
 - [x] api Lambda — `GET|POST /config/monthly-targets` endpoints (2026-07-11, admin-only): new
   `monthly_sale_targets` table (unitemporal milestoning; natural key `(state, month, yr)`) —
