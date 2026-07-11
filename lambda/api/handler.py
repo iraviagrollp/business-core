@@ -110,6 +110,13 @@ def lambda_handler(event, context):
     if path == '/supplier-ledger':
         params = event.get('queryStringParameters') or {}
         return _handle_supplier_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
+    if path == '/supplier-ledger/statement':
+        params = event.get('queryStringParameters') or {}
+        return _handle_supplier_ledger_statement(
+            params.get('account_name', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
     if path == '/suppliers/details':
         return _handle_supplier_details()
     if path == '/sales':
@@ -403,6 +410,103 @@ def _handle_supplier_ledger_data(from_date: str, to_date: str):
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Supplier ledger data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
+
+
+def _handle_supplier_ledger_statement(account_name: str, from_date: str, to_date: str):
+    """Per-voucher account statement for one supplier over a date range.
+
+    Exact mirror of _handle_ledger_statement on the supplier_ledger table:
+    opening balance = Σ(Db − Cr) strictly before from_date; period rows grouped
+    by voucher with the two sides netted (roundoff/GST absorbed); running balance
+    is Σ(Db − Cr). Sign convention is the raw ledger one (Db positive), identical
+    to the customer statement; the UI applies the supplier Dr/Cr color swap.
+    """
+    if not account_name or not from_date or not to_date:
+        return _response(400, {'error': 'account_name, from_date, and to_date are required'})
+
+    cache_key = f'iravi:supplier_ledger:statement:{account_name}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Opening balance: all transactions strictly before from_date
+            cur.execute("""
+                SELECT COALESCE(
+                    SUM(CASE WHEN category = 'Db' THEN amount ELSE -amount END), 0
+                )
+                FROM supplier_ledger
+                WHERE out_z IS NULL
+                  AND account_name = %(account_name)s
+                  AND transaction_date < %(from_date)s
+            """, {'account_name': account_name, 'from_date': from_date})
+            opening_balance = float(cur.fetchone()[0])
+
+            # Period transactions grouped by voucher, determine primary sub_category
+            cur.execute("""
+                SELECT
+                    transaction_date,
+                    voucher_no,
+                    MAX(CASE WHEN sub_category NOT IN ('CGST', 'SGST', 'IGST', 'Roundoff')
+                        THEN sub_category END) AS primary_type,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'Db'), 0) AS debit,
+                    COALESCE(SUM(amount) FILTER (WHERE category = 'Cr'), 0) AS credit
+                FROM supplier_ledger
+                WHERE out_z IS NULL
+                  AND account_name = %(account_name)s
+                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
+                GROUP BY transaction_date, voucher_no
+                ORDER BY transaction_date ASC, voucher_no ASC
+            """, {'account_name': account_name, 'from_date': from_date, 'to_date': to_date})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    total_debit = 0.0
+    total_credit = 0.0
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        raw_debit = float(row['debit'])
+        raw_credit = float(row['credit'])
+        # Net the two sides so roundoff/GST sub-components are absorbed into the
+        # voucher they belong to.  The voucher shows on only one side; the running
+        # balance is numerically unchanged because net = raw_debit − raw_credit.
+        net = raw_debit - raw_credit
+        if net >= 0:
+            debit, credit = net, 0.0
+        else:
+            debit, credit = 0.0, -net
+        total_debit += debit
+        total_credit += credit
+        rows.append({
+            'transaction_date': row['transaction_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'transaction_type': row['primary_type'],
+            'debit': round(debit, 2),
+            'credit': round(credit, 2),
+        })
+
+    closing_balance = round(opening_balance + total_debit - total_credit, 2)
+
+    payload = {
+        'account_name': account_name,
+        'from_date': from_date,
+        'to_date': to_date,
+        'opening_balance': round(opening_balance, 2),
+        'rows': rows,
+        'total_debit': round(total_debit, 2),
+        'total_credit': round(total_credit, 2),
+        'closing_balance': closing_balance,
+    }
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Supplier ledger statement cached: account=%s %s→%s rows=%d',
+                account_name, from_date, to_date, len(rows))
+    return _response(200, payload)
 
 
 def _handle_supplier_details():
