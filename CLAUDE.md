@@ -165,12 +165,22 @@ Lambdas are packaged by Terraform using the `archive_file` data source — no se
 Terraform configs live in:
 ```
 D:\Projects\Iravi\IaC\terraform\environments\production\
+├── lambda_etl_sales.tf                      ← etl_sales + the SHARED S3 bucket notification (fans out by prefix; also enables EventBridge)
 ├── lambda_etl_stocks.tf
-├── lambda_etl_sales.tf
 ├── lambda_etl_customer_ledger.tf
 ├── lambda_etl_customer_accounts.tf
+├── lambda_etl_appendix_b_x11.tf
+├── lambda_etl_appendix_b_x11_purchase.tf
+├── lambda_etl_appendix_b_x11_purchase_return.tf
+├── lambda_etl_appendix_b_x11_sale.tf
+├── lambda_etl_appendix_b_x11_sale_return.tf
+├── lambda_etl_supplier_accounts.tf
+├── lambda_etl_supplier_ledger.tf            ← EventBridge trigger on raw/Ledger (read-only S3)
+├── lambda_whatsapp_notifier.tf
+├── lambda_alerts_evaluator.tf               ← EventBridge rate(15m); reportlab layer; SES send
 ├── lambda_redis_updater.tf
-└── lambda_api.tf
+├── lambda_api.tf                            ← + /reports/* routes, /alerts* routes, POST /admin/cache/flush
+└── ses.tf                                   ← SES domain identity + DKIM for alert emails
 ```
 
 Deploy via the GitHub Actions pipeline (merge to main → apply runs automatically).
@@ -1140,6 +1150,26 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] api Lambda — `GET|POST /config/monthly-targets` endpoints (2026-07-11, admin-only): new
+  `monthly_sale_targets` table (unitemporal milestoning; natural key `(state, month, yr)`) —
+  `id BIGSERIAL PK, state VARCHAR(10), month SMALLINT, yr SMALLINT, target_lakhs NUMERIC(14,2),
+  in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ`. `_route_config(event, method, path)`
+  dispatches `/config/monthly-targets`; wired into `lambda_handler` via a new `path.startswith('/config/')`
+  prefix block (mirrors the `/alerts` block, placed before the `if method != 'GET'` guard so it can
+  serve both verbs). `_handle_config_monthly_targets_get` — `?yr=YYYY`; `years` = distinct active `yr`
+  values DESC; `yr` = query param, else most recent year, else `datetime.now().year`; `rows` = active
+  rows for that `yr` ordered by `state, month`, `target_lakhs` cast to float.
+  `_handle_config_monthly_targets_post` — validates `state in ('AP','TG')`, `month` int 1-12, `yr` int
+  2000-2100, `target_lakhs` numeric ≥ 0 (400 on bad input); milestoning upsert
+  (`UPDATE ... SET out_z=NOW() WHERE state/month/yr AND out_z IS NULL` then `INSERT`) in one
+  transaction. Both handlers call `_require_admin(event, cur)` first inside the cursor block, same
+  pattern as the other `/admin/*` and `/alerts*` handlers. Uncached (no Redis), matching the alerts
+  handlers. `python -m py_compile handler.py` clean.
+  **IaC needed:** DB migration to create `monthly_sale_targets` (schema above, partial unique index
+  on `(state, month, yr) WHERE out_z IS NULL`); API Gateway routes `GET /config/monthly-targets` +
+  `POST /config/monthly-targets` + CORS in `lambda_api.tf`; optional `app_screens` seed row if this
+  becomes a gated UI screen. **UI needed:** client method(s) + admin config page once IaC routes exist.
+
 - [x] Dr/Cr balance coloring added to alert-email PDF renderers (2026-07-01):
   - **`customer_balances_fy_pdf.py`** — Customer semantics: Dr (receivable) → RED `#cc0000`,
     Cr (credit/advance) → GREEN `#1a6e35`. Colored columns: per-FY Balance (₹), Balance Dr,
@@ -1266,6 +1296,16 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+> **Reconciliation note (2026-07-11): all of it is LIVE on AWS.** Every code deliverable below is
+> deployed — migrations `010`–`019` are applied to RDS; the supplier/alerts/SES Terraform is applied;
+> `lambda_api.tf` serves the `/reports/*`, `/alerts*`, and `POST /admin/cache/flush` routes; and the UI
+> pages (`MonthlySales.tsx`, `CustomerBalancesFY.tsx`, `SupplierBalancesFY.tsx`, `Alerts/*`) +
+> `api.reports`/`api.alerts` clients are shipped on Amplify. The one-time data ops noted below
+> (re-ingest, cleanup SQL, `POST /admin/cache/flush`) have been run as part of that rollout. The only
+> genuinely-remaining build backlog is **etl_sales** (handler still a stub) + its **`_update_sales_cache()`**,
+> the future **Cognito** authoriser, and **whatsapp_notifier phase 2** (pending WhatsApp Business approval).
+> The per-item boxes below are retained as a historical record of what was built and how it was deployed.
+
 - [ ] **IaC: API Gateway route GET /reports/monthly-sales** — add `GET /reports/monthly-sales` route + CORS allow-method in `lambda_api.tf`; add `app_screens` seed migration row for `reports.monthly_sales` (screen_key, label, sort_order). No new Lambda, layer, or DB migration needed — existing `sales` and `customer_details` tables are used.
 - [ ] **UI slice for /reports/monthly-sales** — add `getMonthlySales(month?: string)` client method in `src/api/client.ts` with typed response shape matching the JSON contract; add Monthly Sales report page + wire RBAC screen key `reports.monthly_sales` in the UI router.
 - [ ] **No IaC/DB change needed for alert fields** — `net_sales_current_month` and `sale_returns_current_month` are served by the existing `GET /alerts/fields` route; no new API Gateway route, no new DB migration, no new Lambda layer. The `current_month` window SQL uses existing date-range FILTER clauses within `_query_aggregate_metrics` — same pattern as all other windows.
@@ -1289,7 +1329,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 - [ ] **Flush report cache after deploy** — `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` AND `iravi:ledger:statement:*` entries; required after the `code` field was added, after the `credit_notes` split (2026-06-23), and after the per-voucher netting fix (2026-06-23); no re-ingest needed
 - [ ] **IaC slice for `/reports/customer-balances-fy`** — add API Gateway route `GET /reports/customer-balances-fy` + CORS allow-method in `lambda_api.tf` (iravi-dashboard-iac)
 - [ ] **UI slice for `/reports/customer-balances-fy`** — add `getCustomerBalancesFy(fyCount)` client method in `src/api/client.ts`; add RBAC screen key `reports.customer_balances_fy` to `app_screens` (IaC migration) and wire the screen in the UI router
-- [ ] **Run DB migrations** — apply `003`, `004`, `005`, `006`, `007`, `008` migrations via bastion SSM port-forward
+- [ ] **Run DB migrations** — apply `003`–`019` migrations via bastion SSM port-forward (all written; includes RBAC 009, customer_code 011, alerts 013–015, supplier_accounts 016, supplier_ledger 017, and report screen seeds 010/018/019)
 - [ ] **whatsapp_notifier phase 2** — once WhatsApp Business approved: add `iravi/dashboard/whatsapp` secret (bearer_token, phone_number_id), add DB + Secrets Manager IAM to Lambda, implement `_send_whatsapp()` in handler
 - [ ] **RE-INGEST customer_ledger after Account Group filter change (2026-06-27)** — the new filter selects by col[10] instead of `customer_details` membership, so previously-dropped customer rows are now included. The Ledger All Accounts file must be re-uploaded to S3 `raw/` to pick up the change. Note: this affects ALL consumers of `customer_ledger` (Customer Balances FY report, ledger statement, alerts balances evaluation, `iravi:ledger:range` redis key) — previously-missing customers will appear everywhere after re-ingest. Flush Redis (`POST /admin/cache/flush`) after re-ingest.
 - [x] **Add Terraform resource** — `lambda_etl_appendix_b_x11.tf` + S3 trigger on `raw/Barcodes` in `lambda_etl_sales.tf` + layer build step in `terraform.yml`

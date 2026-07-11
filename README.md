@@ -29,9 +29,12 @@ business-core/
     ├── etl_appendix_b_x11_purchase_return/ ← ETL: AppendixPurReturn → stock_ledger + purchases (Y) [COMPLETE]
     ├── etl_appendix_b_x11_sale/          ← ETL: AppendixSale → stock_ledger + sales (N) [COMPLETE]
     ├── etl_appendix_b_x11_sale_return/   ← ETL: AppendixRetSales → stock_ledger + sales (Y) [COMPLETE]
+    ├── etl_supplier_accounts/            ← ETL: Supplier Accounts Export → supplier_accounts (unitemporal) [COMPLETE]
+    ├── etl_supplier_ledger/              ← ETL: Ledger All Accounts (supplier rows) → supplier_ledger [COMPLETE]
     ├── whatsapp_notifier/                ← S3 notifications/pending → processed; WhatsApp send phase 2 [PHASE 1]
     ├── redis_updater/                    ← Cache: RDS → ElastiCache Redis (EventBridge-triggered)
-    └── api/                              ← API: dashboard reads via API Gateway + POST /notify
+    ├── alerts_evaluator/                 ← EventBridge rate(15m): evaluate due alerts → SES email (+PDF) [COMPLETE]
+    └── api/                              ← API: dashboard reads + POST /notify + RBAC auth/admin + /alerts + /reports/*
 ```
 
 Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.py` / `run_local.py` for `etl_stocks`, `sample_data/` for `etl_sales`).
@@ -51,9 +54,12 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 | `etl_appendix_b_x11_purchase_return` | S3 `raw/AppendixPurReturn*.xlsx` | → `stock_ledger` (Out) + `purchases` (Y) | Complete |
 | `etl_appendix_b_x11_sale` | S3 `raw/AppendixSale*.xlsx` | → `stock_ledger` (Out) + `sales` (N) | Complete |
 | `etl_appendix_b_x11_sale_return` | S3 `raw/AppendixRetSales*.xlsx` | → `stock_ledger` (In) + `sales` (Y) | Complete |
+| `etl_supplier_accounts` | S3 `raw/Supplier*.xlsx` | Supplier accounts → `supplier_accounts` (unitemporal) | Complete |
+| `etl_supplier_ledger` | EventBridge `raw/Ledger*.xlsx` (read-only S3) | Ledger supplier rows → `supplier_ledger` (unitemporal) | Complete |
 | `whatsapp_notifier` | S3 `notifications/pending/*` | Move to `processed/`; send WhatsApp (phase 2) | Phase 1 |
 | `redis_updater` | EventBridge (ETL success events) | Pull RDS → write Redis cache | Stocks + ledger done |
-| `api` | API Gateway HTTP v2 | Cache-aside JSON responses + `POST /notify` + RBAC `/auth/*` & `/admin/*` | Data + RBAC done |
+| `alerts_evaluator` | EventBridge `rate(15 min)` | Evaluate due alerts → send SES email (Monthly Sales / FY reports as PDF) | Complete |
+| `api` | API Gateway HTTP v2 | Cache-aside reads + `POST /notify` + RBAC `/auth/*` & `/admin/*` + `/alerts*` + `/reports/*` | Complete |
 
 > **RBAC:** `api/auth.py` (stdlib PBKDF2 + HS256 JWT, key in Secrets Manager `iravi/dashboard/jwt`) backs `POST /auth/login`, `GET /auth/me`, and the admin role/user management endpoints (`/admin/roles`, `/admin/users`, `/admin/screens`). Login + `/admin/*` are enforced server-side; the data endpoints are UI-only gated for now (backlog: per-route authorization).
 
@@ -70,8 +76,11 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 | etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_customer_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11 (×5) | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | whatsapp_notifier | Python 3.12 | boto3 (+ requests in phase 2) |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
+| alerts_evaluator | Python 3.12 | psycopg2-binary, reportlab (boto3/SES from runtime) |
 | api | Python 3.12 | psycopg2-binary, redis, boto3 |
 
 > `api` and `redis_updater` share the `api_deps` Lambda layer (linux-wheel psycopg2-binary + redis-py). All dependency layers are built by the GitHub Actions workflow before `terraform plan/apply`.
@@ -100,6 +109,7 @@ Terraform configs live in `D:\Projects\Iravi\IaC\terraform\environments\producti
 | `REDIS_HOST` | Terraform | redis_updater, api |
 | `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
 | `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | Terraform | api (first-login admin bootstrap) |
+| `ALERTS_SENDER_EMAIL` | Terraform | alerts_evaluator (verified SES sender address) |
 
 ---
 
@@ -113,6 +123,8 @@ Terraform configs live in `D:\Projects\Iravi\IaC\terraform\environments\producti
 | `iravi:ledger:data:{from}:{to}` | api (cache-aside) | 1h | `LedgerRow[]` |
 | `iravi:sales:*`, `iravi:purchases:summary:*` | api (cache-aside) | 15 min | meta / list / summary results |
 | `iravi:reports:customer_balances_fy:{fy_count}` | api (cache-aside) | 1h | `{fys, rows, totals}` — customer balances FY report |
+| `iravi:reports:supplier_balances_fy:{fy_count}` | api (cache-aside) | 1h | `{fys, rows, totals}` — supplier balances FY report |
+| `iravi:reports:monthly_sales:{month}` | api (cache-aside) | 1h | state-wise net customer sales for one calendar month |
 
 > Keys written on a cache miss by the `api` Lambda are populated on demand; keys written by `redis_updater` are refreshed nightly after the ETL success events.
 
@@ -139,6 +151,12 @@ Terraform configs live in `D:\Projects\Iravi\IaC\terraform\environments\producti
 | `GET` | `/customers/names` | — | Sorted list of customer names |
 | `GET` | `/customers/details` | — | `[{customer_name, city}]` |
 | `GET` | `/reports/customer-balances-fy` | `fy_count=all\|2\|3\|4` | Per-customer multi-FY roll-forward from `customer_ledger` |
+| `GET` | `/reports/supplier-balances-fy` | `fy_count=all\|2\|3\|4` | Per-supplier multi-FY roll-forward from `supplier_ledger` |
+| `GET` | `/reports/monthly-sales` | `month=YYYY-MM` | State-wise net customer sales for one calendar month |
+| `GET\|POST` | `/alerts` | — | List / create alerts (admin only) |
+| `GET` | `/alerts/fields` | `category` | Field catalog for the alert builder (admin only) |
+| `GET\|PUT\|DELETE` | `/alerts/{id}` | — | Read / update / delete an alert (admin only) |
+| `POST` | `/alerts/{id}/test` | — | Dry-run evaluate an alert now, no email sent (admin only) |
 | `POST` | `/notify` | — | Queue a PDF notification to `notifications/pending/` |
 | `POST` | `/auth/login` | — | Authenticate; return JWT + user info |
 | `GET` | `/auth/me` | — | Re-read caller's role + screens |

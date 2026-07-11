@@ -73,6 +73,13 @@ def lambda_handler(event, context):
         except auth.AuthError as exc:
             return _response(exc.status, {'error': exc.message})
 
+    # Monthly Sale Targets config — admin-only GET + POST.
+    if path.startswith('/config/'):
+        try:
+            return _route_config(event, method, path)
+        except auth.AuthError as exc:
+            return _response(exc.status, {'error': exc.message})
+
     if method == 'POST' and path == '/notify':
         return _handle_notify(event.get('body') or '')
 
@@ -1045,6 +1052,118 @@ def _handle_notify(body_str: str) -> dict:
     )
     logger.info('Notification queued: %s → s3://%s/%s', customer_name, _DATA_BUCKET, s3_key)
     return _response(200, {'key': s3_key, 'message': 'Notification queued'})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — Monthly Sale Targets (admin-only)
+#
+# Table monthly_sale_targets (unitemporal milestoning), natural key (state, month, yr):
+#   id BIGSERIAL PK, state VARCHAR(10), month SMALLINT, yr SMALLINT,
+#   target_lakhs NUMERIC(14,2), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _route_config(event, method, path):
+    if path == '/config/monthly-targets':
+        if method == 'GET':
+            return _handle_config_monthly_targets_get(event)
+        if method == 'POST':
+            return _handle_config_monthly_targets_post(event)
+        return _response(405, {'error': 'Method not allowed'})
+    return _response(404, {'error': 'Not found'})
+
+
+def _handle_config_monthly_targets_get(event):
+    """GET /config/monthly-targets?yr=YYYY — admin-only.
+
+    years = all distinct yr from active rows (out_z IS NULL), ordered DESC.
+    yr = query param if provided, else most recent year in years, else current
+    calendar year.
+    rows = active rows for that yr, ordered by state, month.
+    """
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+
+            cur.execute("""
+                SELECT DISTINCT yr FROM monthly_sale_targets
+                WHERE out_z IS NULL
+                ORDER BY yr DESC
+            """)
+            years = [r[0] for r in cur.fetchall()]
+
+            params = event.get('queryStringParameters') or {}
+            yr_raw = (params.get('yr') or '').strip()
+            yr = None
+            if yr_raw:
+                try:
+                    yr = int(yr_raw)
+                except (ValueError, TypeError):
+                    yr = None
+            if yr is None:
+                yr = years[0] if years else datetime.now().year
+
+            cur.execute("""
+                SELECT state, month, yr, target_lakhs
+                FROM monthly_sale_targets
+                WHERE out_z IS NULL AND yr = %s
+                ORDER BY state, month
+            """, (yr,))
+            rows = [
+                {'state': r[0], 'month': r[1], 'yr': r[2], 'target_lakhs': float(r[3])}
+                for r in cur.fetchall()
+            ]
+    finally:
+        conn.close()
+    return _response(200, {'yr': yr, 'years': years, 'rows': rows})
+
+
+def _handle_config_monthly_targets_post(event):
+    """POST /config/monthly-targets — admin-only; milestoning upsert on (state, month, yr)."""
+    body = _json_body(event)
+
+    state = (body.get('state') or '').strip().upper()
+    if state not in ('AP', 'TG'):
+        return _response(400, {'error': "state must be 'AP' or 'TG'"})
+
+    try:
+        month = int(body.get('month'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'month must be an integer 1-12'})
+    if month < 1 or month > 12:
+        return _response(400, {'error': 'month must be an integer 1-12'})
+
+    try:
+        yr = int(body.get('yr'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'yr must be an integer'})
+    if yr < 2000 or yr > 2100:
+        return _response(400, {'error': 'yr must be between 2000 and 2100'})
+
+    try:
+        target_lakhs = float(body.get('target_lakhs'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'target_lakhs must be numeric'})
+    if target_lakhs < 0:
+        return _response(400, {'error': 'target_lakhs must be >= 0'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                UPDATE monthly_sale_targets
+                SET out_z = NOW()
+                WHERE state = %s AND month = %s AND yr = %s AND out_z IS NULL
+            """, (state, month, yr))
+            cur.execute("""
+                INSERT INTO monthly_sale_targets (state, month, yr, target_lakhs)
+                VALUES (%s, %s, %s, %s)
+            """, (state, month, yr, target_lakhs))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'state': state, 'month': month, 'yr': yr, 'target_lakhs': target_lakhs})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
