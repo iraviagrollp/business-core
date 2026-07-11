@@ -803,6 +803,40 @@ Empty-data case returns `{'fys': [], 'rows': [], 'totals': {'per_fy': [], 'balan
 
 ---
 
+## api — Supplier Aging endpoints (GET /supplier-ledger, /supplier-ledger/range, /suppliers/details)
+
+**Added 2026-07-11.** Three read endpoints that feed the UI's client-side **Supplier
+Balances (aging)** screen — the supplier-side counterpart to the customer aging screen,
+which consumes `/ledger`, `/ledger/range`, and `/customers/details`. The FY report
+(`/reports/supplier-balances-fy`) aggregates by FY and cannot drive date-bucketed aging,
+so these expose the raw `supplier_ledger` transactions instead.
+
+| Route | Source | Redis key | Handler |
+|---|---|---|---|
+| `GET /supplier-ledger/range` | `supplier_ledger` MIN/MAX `transaction_date` | `iravi:supplier_ledger:range` (24h) | `_handle_supplier_ledger_range` |
+| `GET /supplier-ledger?from_date=&to_date=` | `supplier_ledger` rows in range | `iravi:supplier_ledger:data:{from}:{to}` (1h) | `_handle_supplier_ledger_data` |
+| `GET /suppliers/details` | `supplier_accounts` (name, city) | `iravi:suppliers:details` (15m) | `_handle_supplier_details` |
+
+- Exact mirrors of `_handle_ledger_range` / `_handle_ledger_data` / `_handle_customer_details`
+  on the supplier tables. Same row shape (`transaction_date, voucher_no, account_name,
+  category, sub_category, amount`) so the browser aging engine is a near-clone of the customer one.
+- Both ledger endpoints filter `out_z IS NULL AND LOWER(account_name) NOT LIKE '%%iravi%%'`
+  (the ETL already excludes IRAVI; the filter is belt-and-suspenders). `/suppliers/details`
+  filters `out_z IS NULL` (supplier_accounts is milestoned).
+- **No redis_updater step** pre-populates `iravi:supplier_ledger:range` (unlike the customer
+  range, which redis_updater writes on `ETLCustomerLedgerSuccess`), so its first read always
+  falls through to RDS then caches.
+- **Aging semantics (client-side, in iravi-ui):** ages the **credit** side (unpaid purchase
+  invoices = payables), `net = Σ Cr − Σ Db`, tracks the last Bank/Cash **Payment** — the
+  inverse of the customer screen (which ages Db and tracks receipts). No server-side change
+  needed for that; the endpoints just serve raw rows.
+
+**IaC:** API Gateway routes `GET /supplier-ledger`, `GET /supplier-ledger/range`,
+`GET /suppliers/details` + CORS (all covered by the existing GET CORS block); RBAC screen
+seed `supplier_balances` (migration 020). Cleared by `POST /admin/cache/flush`.
+
+---
+
 ## api — GET /reports/monthly-sales
 
 **Route:** `GET /reports/monthly-sales?month=YYYY-MM`

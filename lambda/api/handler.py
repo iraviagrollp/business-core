@@ -105,6 +105,13 @@ def lambda_handler(event, context):
     if path == '/ledger':
         params = event.get('queryStringParameters') or {}
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
+    if path == '/supplier-ledger/range':
+        return _handle_supplier_ledger_range()
+    if path == '/supplier-ledger':
+        params = event.get('queryStringParameters') or {}
+        return _handle_supplier_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
+    if path == '/suppliers/details':
+        return _handle_supplier_details()
     if path == '/sales':
         return _response(200, {'data': []})
     if path == '/appendix-b/meta':
@@ -312,6 +319,117 @@ def _handle_ledger_data(from_date: str, to_date: str):
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Ledger data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
+
+
+def _handle_supplier_ledger_range():
+    """Min/max transaction_date across supplier_ledger (open rows only).
+
+    Mirror of _handle_ledger_range on the supplier_ledger table. Unlike the
+    customer range there is no redis_updater step that pre-populates this key,
+    so a cache miss always falls through to RDS and then caches the result.
+    """
+    cache_key = 'iravi:supplier_ledger:range'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MIN(transaction_date), MAX(transaction_date)
+                FROM supplier_ledger
+                WHERE out_z IS NULL
+                  AND LOWER(account_name) NOT LIKE '%%iravi%%'
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    if min_date:
+        r.set(cache_key, json.dumps(payload), ex=_REDIS_TTL)
+    return _response(200, payload)
+
+
+def _handle_supplier_ledger_data(from_date: str, to_date: str):
+    """Raw supplier_ledger transaction rows in a date range (for AP aging).
+
+    Mirror of _handle_ledger_data on the supplier_ledger table. Returns the same
+    row shape (transaction_date, voucher_no, account_name, category, sub_category,
+    amount) so the client-side aging engine can bucket credits by transaction_date.
+    """
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:supplier_ledger:data:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT transaction_date, voucher_no, account_name, category, sub_category, amount
+                FROM supplier_ledger
+                WHERE out_z IS NULL
+                  AND LOWER(account_name) NOT LIKE '%%iravi%%'
+                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
+                ORDER BY transaction_date, account_name, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'transaction_date': row['transaction_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'account_name': row['account_name'],
+            'category': row['category'],
+            'sub_category': row['sub_category'],
+            'amount': float(row['amount']),
+        })
+
+    r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
+    logger.info('Supplier ledger data cached: key=%s rows=%d', cache_key, len(rows))
+    return _response(200, rows)
+
+
+def _handle_supplier_details():
+    """Supplier name + city lookup from supplier_accounts (open rows only).
+
+    Mirror of _handle_customer_details on the supplier_accounts table. Keyed on
+    supplier_name so the UI can join a city onto each aged supplier balance.
+    """
+    r = _get_redis()
+    cached = r.get('iravi:suppliers:details')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, city FROM supplier_accounts
+                WHERE out_z IS NULL
+                ORDER BY name
+            """)
+            details = [{'supplier_name': row[0], 'city': row[1]} for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+    r.set('iravi:suppliers:details', json.dumps(details), ex=_SALES_TTL)
+    return _response(200, details)
 
 
 def _handle_ledger_outstanding(to_date: str):
