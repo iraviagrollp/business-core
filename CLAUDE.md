@@ -816,6 +816,7 @@ so these expose the raw `supplier_ledger` transactions instead.
 | `GET /supplier-ledger/range` | `supplier_ledger` MIN/MAX `transaction_date` | `iravi:supplier_ledger:range` (24h) | `_handle_supplier_ledger_range` |
 | `GET /supplier-ledger?from_date=&to_date=` | `supplier_ledger` rows in range | `iravi:supplier_ledger:data:{from}:{to}` (1h) | `_handle_supplier_ledger_data` |
 | `GET /suppliers/details` | `supplier_accounts` (name, city) | `iravi:suppliers:details` (15m) | `_handle_supplier_details` |
+| `GET /supplier-ledger/statement?account_name=&from_date=&to_date=` | `supplier_ledger` (one account) | `iravi:supplier_ledger:statement:{acct}:{from}:{to}` (1h) | `_handle_supplier_ledger_statement` |
 
 - Exact mirrors of `_handle_ledger_range` / `_handle_ledger_data` / `_handle_customer_details`
   on the supplier tables. Same row shape (`transaction_date, voucher_no, account_name,
@@ -831,9 +832,18 @@ so these expose the raw `supplier_ledger` transactions instead.
   inverse of the customer screen (which ages Db and tracks receipts). No server-side change
   needed for that; the endpoints just serve raw rows.
 
+`_handle_supplier_ledger_statement` is an exact mirror of `_handle_ledger_statement`
+(customer) on `supplier_ledger`: opening balance = Σ(Db − Cr) before `from_date`;
+period rows grouped by voucher with the two sides netted (roundoff/GST absorbed);
+running balance = Σ(Db − Cr). Same raw-ledger sign convention (Db positive) and same
+response shape as `/ledger/statement` — the UI applies the supplier Dr/Cr **color swap**
+(Dr green, Cr red) and drops the customer statement's "bank particulars for payment" block.
+It feeds the Reports → **Supplier Ledger** statement screen.
+
 **IaC:** API Gateway routes `GET /supplier-ledger`, `GET /supplier-ledger/range`,
-`GET /suppliers/details` + CORS (all covered by the existing GET CORS block); RBAC screen
-seed `supplier_balances` (migration 020). Cleared by `POST /admin/cache/flush`.
+`GET /supplier-ledger/statement`, `GET /suppliers/details` + CORS (all covered by the
+existing GET CORS block); RBAC screen seeds `supplier_balances` (migration 020) and
+`reports.supplier_ledger_statement` (migration 021). Cleared by `POST /admin/cache/flush`.
 
 ---
 
