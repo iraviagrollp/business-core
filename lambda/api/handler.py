@@ -983,7 +983,9 @@ def _handle_monthly_sales(month_raw: str):
       anything else  → excluded from totals; name collected into unmapped_branches
 
     Returns raw rupees (float, 2 dp). The UI converts to lakhs.
-    Cache key: iravi:reports:monthly_sales:{month}  TTL: _LEDGER_TTL
+    Cache key: iravi:reports:monthly_sales:v2:{month}  TTL: _LEDGER_TTL
+    (v2 — bumped 2026-07-11 when targets/YoY comparison keys were added to the
+    payload shape, so stale old-shape cache entries never collide with it.)
     """
     from datetime import timedelta as _timedelta
 
@@ -999,7 +1001,7 @@ def _handle_monthly_sales(month_raw: str):
     except (ValueError, AttributeError):
         month_str = today_ist.strftime('%Y-%m')
 
-    cache_key = f'iravi:reports:monthly_sales:{month_str}'
+    cache_key = f'iravi:reports:monthly_sales:v2:{month_str}'
     r = _get_redis()
     cached = r.get(cache_key)
     if cached:
