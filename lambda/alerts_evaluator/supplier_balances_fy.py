@@ -110,11 +110,15 @@ def compute_supplier_balances_fy(conn, fy_count) -> dict:
     # -- 2. City lookup from supplier_accounts ---------------------------------
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT UPPER(name), city FROM supplier_accounts
+            SELECT UPPER(name), city FROM supplier_accounts WHERE out_z IS NULL
         """)
         city_map: dict = {}
         for upper_name, city in cur.fetchall():
             city_map[upper_name] = city
+
+        # Active supplier-master names (UPPER(name), out_z IS NULL) — only
+        # parties present here are included in the report output below.
+        active_supplier_names: set = set(city_map.keys())
 
         # -- 3. Opening balances (only when cutoff_date is set) ----------------
         opening_by_party: dict = {}
@@ -203,6 +207,11 @@ def compute_supplier_balances_fy(conn, fy_count) -> dict:
     total_balance_cr = 0.0
 
     for party in sorted(all_parties, key=lambda p: (p.upper(), p)):
+        if party.upper() not in active_supplier_names:
+            # Not present as an active (out_z IS NULL) row in supplier_accounts
+            # — drop from the report entirely, before any totals accumulate.
+            continue
+
         opening = round(opening_by_party.get(party, 0.0), 2)
         running = opening
         per_fy  = []

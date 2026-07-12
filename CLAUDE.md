@@ -93,6 +93,14 @@ business-core/
     │   │                        alerts_evaluator/. No code field; no credit_notes field.
     │   │                        From-beginning (fy_count='all') used by alert evaluator PDF path.
     │   │                        (added 2026-07-06)
+    │   │                        Active-supplier-only filter (2026-07-12): rows now restricted to
+    │   │                        parties present as active (out_z IS NULL) rows in supplier_accounts
+    │   │                        — `active_supplier_names = set(city_map.keys())`, party skipped via
+    │   │                        early `continue` (before totals accumulate) if
+    │   │                        `party.upper() not in active_supplier_names`. Exact UPPER(name) match,
+    │   │                        no fuzzy matching. Fixed alerts_evaluator's city_map query in the same
+    │   │                        change — it was missing `WHERE out_z IS NULL` (api/ copy had it; the
+    │   │                        two files were not byte-identical before this fix).
     │   └── requirements.txt
     └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
         ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
@@ -138,6 +146,8 @@ business-core/
         │                        compute_supplier_balances_fy(conn, fy_count) → dict
         │                        No code field; no credit_notes field. Sort by party name ascending.
         │                        (added 2026-07-06)
+        │                        Active-supplier-only filter (2026-07-12) — see api/supplier_balances_fy.py
+        │                        entry above; identical change applied here to keep both byte-identical.
         ├── supplier_balances_fy_pdf.py ← PDF renderer for Supplier Balances (FY), landscape A4
         │                        render_supplier_balances_fy_pdf(data) → bytes
         │                        Uses DejaVuSans TTFont (via pdf_fonts.register_fonts()) so ₹/— render
@@ -790,6 +800,8 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 **Per-voucher netting:** rows are grouped by `(account_name, voucher_no, fy_label)`. `net = sum(Db rows) − sum(Cr rows)`. `net > 0 → debit += net`; `net < 0 → credit += -net`; `net == 0 → nothing`. Running balance per FY: `running = round(running + debit − credit, 2)`.
 
 **Zero-activity skip:** parties (suppliers) with zero opening AND all-zero debit/credit across every shown FY are excluded from the response.
+
+**Active-supplier-master filter (added 2026-07-12):** a party is included ONLY IF it exists as an active (`out_z IS NULL`) row in `supplier_accounts` — exact match on `UPPER(account_name) == UPPER(name)`, no fuzzy/substring matching. Implemented as `active_supplier_names = set(city_map.keys())` (the city lookup query already selects `UPPER(name) WHERE out_z IS NULL`, so its keys are exactly the active-master name set) and an early `continue` at the top of the per-party loop — this runs BEFORE `totals_per_fy`/`total_balance_dr`/`total_balance_cr` accumulate, so totals reflect only included parties. Ledger queries (`supplier_ledger WHERE out_z IS NULL AND account_name NOT LIKE '%iravi%'`) are unchanged; only output inclusion is affected. Does not apply to `customer_balances_fy.py` (customer report is unchanged).
 
 **Response shape:**
 ```jsonc
