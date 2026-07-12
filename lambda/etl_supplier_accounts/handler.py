@@ -63,7 +63,6 @@ def _process(bucket: str, key: str, filename: str):
     conn = _get_db_conn()
     try:
         _upsert(conn, rows)
-        conn.commit()
         logger.info('Upserted %d rows into supplier_accounts', len(rows))
     finally:
         conn.close()
@@ -133,8 +132,22 @@ def _upsert(conn, rows: list[dict]):
 
     Natural key = name.  Partial unique index on (name) WHERE out_z IS NULL
     ensures at most one active row per supplier name at any time.
-    All rows are written in a single transaction (committed by the caller).
+
+    Each export is treated as the authoritative full snapshot: after the
+    per-row close+insert loop, any still-active row whose name is NOT present
+    in this file is retired (closed) so it disappears from the UI.
+
+    Empty-file guard: if rows is empty, skip the upsert loop AND the retire
+    step entirely (a corrupt/empty export must never wipe the whole table).
+
+    Commits once at the end, only when rows were actually processed.
     """
+    if not rows:
+        logger.warning(
+            'supplier accounts: 0 rows parsed — skipping upsert/retire to avoid wiping the table'
+        )
+        return
+
     with conn.cursor() as cur:
         for row in rows:
             cur.execute(
@@ -153,3 +166,16 @@ def _upsert(conn, rows: list[dict]):
                 """,
                 (row['name'], row['gst'], row['gst_valid'], row['city'], row['state']),
             )
+
+        names = [row['name'] for row in rows]
+        cur.execute(
+            """
+            UPDATE supplier_accounts
+               SET out_z = NOW()
+             WHERE out_z IS NULL
+               AND NOT (name = ANY(%s))
+            """,
+            (names,),
+        )
+
+    conn.commit()

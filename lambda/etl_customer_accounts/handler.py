@@ -69,7 +69,6 @@ def _process(bucket: str, key: str, filename: str):
     conn = _get_db_conn()
     try:
         _upsert(conn, rows)
-        conn.commit()
         logger.info('Upserted %d rows into customer_details', len(rows))
     finally:
         conn.close()
@@ -197,22 +196,61 @@ def _parse(src_path: str) -> list[dict]:
 
 
 def _upsert(conn, rows: list[dict]):
+    """Uni-temporal milestoning: close existing active row then insert fresh row.
+
+    Natural key = customer_name.  Partial unique index
+    uix_customer_details_active ON customer_details (customer_name)
+    WHERE out_z IS NULL ensures at most one active row per customer at any
+    time. `id`, `in_z`, `out_z` are handled by column defaults — never set
+    explicitly here.
+
+    Each export is treated as the authoritative full snapshot: after the
+    per-row close+insert loop, any still-active row whose customer_name is
+    NOT present in this file is retired (closed) so it disappears from the
+    UI. Names passed to the retire step are exactly the uppercased values
+    produced by _parse(), so the match is exact.
+
+    Empty-file guard: if rows is empty, skip the upsert loop AND the retire
+    step entirely (a corrupt/empty export must never wipe the whole table).
+
+    Commits once at the end, only when rows were actually processed.
+    """
+    if not rows:
+        logger.warning(
+            'customer accounts: 0 rows parsed — skipping upsert/retire to avoid wiping the table'
+        )
+        return
+
     with conn.cursor() as cur:
         for row in rows:
+            cur.execute(
+                """
+                UPDATE customer_details
+                   SET out_z = NOW()
+                 WHERE customer_name = %s
+                   AND out_z IS NULL
+                """,
+                (row['customer_name'],),
+            )
             cur.execute(
                 """
                 INSERT INTO customer_details
                     (customer_name, district, city, state, pin, mobile_no, customer_code)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (customer_name) DO UPDATE SET
-                    district      = EXCLUDED.district,
-                    city          = EXCLUDED.city,
-                    state         = EXCLUDED.state,
-                    pin           = EXCLUDED.pin,
-                    mobile_no     = EXCLUDED.mobile_no,
-                    customer_code = EXCLUDED.customer_code,
-                    updated_at    = NOW()
                 """,
                 (row['customer_name'], row['district'], row['city'],
                  row['state'], row['pin'], row['mobile_no'], row['customer_code']),
             )
+
+        names = [row['customer_name'] for row in rows]
+        cur.execute(
+            """
+            UPDATE customer_details
+               SET out_z = NOW()
+             WHERE out_z IS NULL
+               AND NOT (customer_name = ANY(%s))
+            """,
+            (names,),
+        )
+
+    conn.commit()
