@@ -12,6 +12,7 @@ import alerts_eval
 import customer_balances_fy as _cbfy
 import supplier_balances_fy as _sbfy
 import monthly_sales
+import monthly_collection
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -155,6 +156,9 @@ def lambda_handler(event, context):
     if path == '/reports/monthly-sales':
         params = event.get('queryStringParameters') or {}
         return _handle_monthly_sales(params.get('month', ''))
+    if path == '/reports/monthly-collection':
+        params = event.get('queryStringParameters') or {}
+        return _handle_monthly_collection(params.get('month', ''))
 
     return _response(404, {'error': 'Not found'})
 
@@ -1241,6 +1245,53 @@ def _handle_monthly_sales(month_raw: str):
     return _response(200, payload)
 
 
+def _handle_monthly_collection(month_raw: str):
+    """GET /reports/monthly-collection?month=YYYY-MM
+
+    Delegates computation to monthly_collection.compute_monthly_collection().
+    Mirrors _handle_monthly_sales exactly, but over 4 states (AP/TS/TN/OR)
+    sourced from customer_ledger Bank/Cash Receipt credits.
+
+    State mapping by customer_details.state:
+      'AP' → ap, 'TG' → ts, 'TN' → tn, 'OR' → or
+      NULL / unrecognized → excluded from totals; accumulated into
+      unmapped_collections_total
+
+    Returns raw rupees (float, 2 dp). The UI converts to lakhs.
+    Cache key: iravi:reports:monthly_collection:v1:{month}  TTL: _LEDGER_TTL
+    """
+    from datetime import timedelta as _timedelta
+
+    # Today in IST (UTC+5:30)
+    _IST = timezone(_timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(_IST).date()
+
+    # Parse ?month=YYYY-MM; fall back to current IST month on absent/invalid input.
+    month_str = (month_raw or '').strip()
+    try:
+        parsed_month = datetime.strptime(month_str, '%Y-%m')
+        month_str = parsed_month.strftime('%Y-%m')   # normalise (strips any trailing chars)
+    except (ValueError, AttributeError):
+        month_str = today_ist.strftime('%Y-%m')
+
+    cache_key = f'iravi:reports:monthly_collection:v1:{month_str}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        payload = monthly_collection.compute_monthly_collection(conn, month_str)
+    finally:
+        conn.close()
+
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Monthly collection cached: month=%s as_on=%s grand=%.2f',
+                month_str, payload['as_on_date'], payload['grand_total']['total'])
+    return _response(200, payload)
+
+
 def _handle_notify(body_str: str) -> dict:
     import base64
 
@@ -1292,6 +1343,12 @@ def _route_config(event, method, path):
             return _handle_config_monthly_targets_get(event)
         if method == 'POST':
             return _handle_config_monthly_targets_post(event)
+        return _response(405, {'error': 'Method not allowed'})
+    if path == '/config/monthly-collection-targets':
+        if method == 'GET':
+            return _handle_config_monthly_collection_targets_get(event)
+        if method == 'POST':
+            return _handle_config_monthly_collection_targets_post(event)
         return _response(405, {'error': 'Method not allowed'})
     return _response(404, {'error': 'Not found'})
 
@@ -1382,6 +1439,108 @@ def _handle_config_monthly_targets_post(event):
             """, (state, month, yr))
             cur.execute("""
                 INSERT INTO monthly_sale_targets (state, month, yr, target_lakhs)
+                VALUES (%s, %s, %s, %s)
+            """, (state, month, yr, target_lakhs))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'state': state, 'month': month, 'yr': yr, 'target_lakhs': target_lakhs})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — Monthly Collection Targets (admin-only)
+#
+# Table monthly_collection_targets (unitemporal milestoning), natural key (state, month, yr):
+#   id BIGSERIAL PK, state VARCHAR(10), month SMALLINT, yr SMALLINT,
+#   target_lakhs NUMERIC(14,2), in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _handle_config_monthly_collection_targets_get(event):
+    """GET /config/monthly-collection-targets?yr=YYYY — admin-only.
+
+    years = all distinct yr from active rows (out_z IS NULL), ordered DESC.
+    yr = query param if provided, else most recent year in years, else current
+    calendar year.
+    rows = active rows for that yr, ordered by state, month.
+    """
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+
+            cur.execute("""
+                SELECT DISTINCT yr FROM monthly_collection_targets
+                WHERE out_z IS NULL
+                ORDER BY yr DESC
+            """)
+            years = [r[0] for r in cur.fetchall()]
+
+            params = event.get('queryStringParameters') or {}
+            yr_raw = (params.get('yr') or '').strip()
+            yr = None
+            if yr_raw:
+                try:
+                    yr = int(yr_raw)
+                except (ValueError, TypeError):
+                    yr = None
+            if yr is None:
+                yr = years[0] if years else datetime.now().year
+
+            cur.execute("""
+                SELECT state, month, yr, target_lakhs
+                FROM monthly_collection_targets
+                WHERE out_z IS NULL AND yr = %s
+                ORDER BY state, month
+            """, (yr,))
+            rows = [
+                {'state': r[0], 'month': r[1], 'yr': r[2], 'target_lakhs': float(r[3])}
+                for r in cur.fetchall()
+            ]
+    finally:
+        conn.close()
+    return _response(200, {'yr': yr, 'years': years, 'rows': rows})
+
+
+def _handle_config_monthly_collection_targets_post(event):
+    """POST /config/monthly-collection-targets — admin-only; milestoning upsert on (state, month, yr)."""
+    body = _json_body(event)
+
+    state = (body.get('state') or '').strip().upper()
+    if state not in ('AP', 'TS', 'TN', 'OR'):
+        return _response(400, {'error': "state must be one of 'AP', 'TS', 'TN', 'OR'"})
+
+    try:
+        month = int(body.get('month'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'month must be an integer 1-12'})
+    if month < 1 or month > 12:
+        return _response(400, {'error': 'month must be an integer 1-12'})
+
+    try:
+        yr = int(body.get('yr'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'yr must be an integer'})
+    if yr < 2000 or yr > 2100:
+        return _response(400, {'error': 'yr must be between 2000 and 2100'})
+
+    try:
+        target_lakhs = float(body.get('target_lakhs'))
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'target_lakhs must be numeric'})
+    if target_lakhs < 0:
+        return _response(400, {'error': 'target_lakhs must be >= 0'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                UPDATE monthly_collection_targets
+                SET out_z = NOW()
+                WHERE state = %s AND month = %s AND yr = %s AND out_z IS NULL
+            """, (state, month, yr))
+            cur.execute("""
+                INSERT INTO monthly_collection_targets (state, month, yr, target_lakhs)
                 VALUES (%s, %s, %s, %s)
             """, (state, month, yr, target_lakhs))
             conn.commit()

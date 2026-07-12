@@ -26,6 +26,12 @@ _FILE_PREFIX = 'Customer Accounts Export File'
 _STATE_MAP = {
     '37-Andhra Pradesh': 'AP',
     '36-Telangana': 'TG',
+    # FLAG: GST-code pattern assumed from the AP/TG entries above — NOT yet
+    # verified against a real Customer Accounts export. Confirm the exact
+    # "<code>-<StateName>" string FUSIL emits for Tamil Nadu / Odisha before
+    # relying on these in production (2026-07-12).
+    '33-Tamil Nadu': 'TN',
+    '21-Odisha':     'OR',
 }
 
 
