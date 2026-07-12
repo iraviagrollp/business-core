@@ -1077,7 +1077,7 @@ def _handle_customer_names():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute('SELECT DISTINCT customer_name FROM customer_details ORDER BY customer_name')
+            cur.execute('SELECT DISTINCT customer_name FROM customer_details WHERE out_z IS NULL ORDER BY customer_name')
             names = [row[0] for row in cur.fetchall()]
     finally:
         conn.close()
@@ -1095,7 +1095,7 @@ def _handle_customer_details():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute('SELECT customer_name, city FROM customer_details ORDER BY customer_name')
+            cur.execute('SELECT customer_name, city FROM customer_details WHERE out_z IS NULL ORDER BY customer_name')
             details = [{'customer_name': row[0], 'city': row[1]} for row in cur.fetchall()]
     finally:
         conn.close()

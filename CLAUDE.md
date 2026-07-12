@@ -360,11 +360,26 @@ No customer is lost relative to the previous behaviour; the union strictly adds 
 - `mobile_no` — numeric values cast to string; string values stripped of whitespace; last 10 digits used if > 10
 - `customer_code` — cast to string and stripped; blank/None stored as NULL; looked up by uppercased name from the `General` sheet; if no match the customer row is still inserted with `customer_code = NULL`
 
-**Upsert strategy:** `INSERT ... ON CONFLICT (customer_name) DO UPDATE SET ...` — simple dimension upsert, no milestoning. `updated_at` refreshed on each update.
+**Upsert strategy (changed 2026-07-12): uni-temporal milestoning (close-then-insert), replacing the previous `ON CONFLICT` dimension upsert.**
+Natural key = `customer_name`. Partial unique index `uix_customer_details_active ON customer_details (customer_name) WHERE out_z IS NULL` (IaC migration TBD, same migration that added `id BIGSERIAL`/`in_z`/`out_z` to `customer_details`) ensures at most one active row per customer at any time. For each parsed row:
+```sql
+UPDATE customer_details SET out_z = NOW() WHERE customer_name = %s AND out_z IS NULL;
+INSERT INTO customer_details (customer_name, district, city, state, pin, mobile_no, customer_code)
+VALUES (%s,%s,%s,%s,%s,%s,%s);
+```
+`id`, `in_z`, `out_z` are handled by column defaults — never set explicitly.
 
-**Target table:** `customer_details` — `(customer_name, district, city, state, pin, mobile_no, customer_code, updated_at)`
+**Retire-absent (full-snapshot semantics, added 2026-07-12):** each export is treated as the authoritative full customer list. After the per-row close+insert loop, any still-active row whose `customer_name` is NOT present in this file's parsed name list is retired:
+```sql
+UPDATE customer_details SET out_z = NOW() WHERE out_z IS NULL AND NOT (customer_name = ANY(%s));
+```
+Names passed are exactly the uppercased values produced by `_parse()`. Freshly-inserted rows for present names have `out_z IS NULL` and ARE in the list, so they survive; only truly-absent names get closed — they disappear from `/customers/names` and `/customers/details` (both now filter `WHERE out_z IS NULL`) and from the Customer Balances (FY) city lookup going forward, without losing their historical ledger rows.
 
-**Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. Apply migration before running this Lambda. Re-running the ETL on any existing file will backfill `customer_code` for all existing rows via the `ON CONFLICT DO UPDATE` clause.
+**Empty-file guard (added 2026-07-12):** if `rows` is empty, the upsert loop AND the retire step are both skipped — a warning is logged (`"customer accounts: 0 rows parsed — skipping upsert/retire to avoid wiping the table"`) and the function returns. This prevents a corrupt/empty export from closing every customer. `conn.commit()` is called once at the end, only when rows were processed.
+
+**Target table:** `customer_details` — `(id, customer_name, district, city, state, pin, mobile_no, customer_code, in_z, out_z)`
+
+**Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. The milestoning columns (`id BIGSERIAL`, `in_z`, `out_z`) and the partial unique index `uix_customer_details_active` are added by a separate IaC migration (2026-07-12) — must be applied before deploying this handler version.
 
 **Re-ingest required after 2026-06-27 deploy:** the `Customer Accounts Export File*.xlsx` must be re-uploaded to S3 `raw/` so the updated Lambda can insert General-only customers and backfill codes for existing rows. After re-ingest, run `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries from Redis.
 
@@ -396,7 +411,16 @@ For each parsed row:
 UPDATE supplier_accounts SET out_z = NOW() WHERE name = %s AND out_z IS NULL;
 INSERT INTO supplier_accounts (name, gst, gst_valid, city, state) VALUES (%s,%s,%s,%s,%s);
 ```
-All rows written in a single DB transaction; committed once after the loop.
+
+**Retire-absent (full-snapshot semantics, added 2026-07-12):** each export is treated as the authoritative full supplier list. After the per-row close+insert loop, any still-active row whose `name` is NOT present in this file's parsed name list is retired:
+```sql
+UPDATE supplier_accounts SET out_z = NOW() WHERE out_z IS NULL AND NOT (name = ANY(%s));
+```
+Freshly-inserted rows for present names have `out_z IS NULL` and ARE in the list, so they survive; only truly-absent names get closed — they disappear from the Supplier Balances (FY) city lookup (`api/supplier_balances_fy.py` now filters `WHERE out_z IS NULL`) going forward.
+
+**Empty-file guard (added 2026-07-12):** if `rows` is empty, the upsert loop AND the retire step are both skipped — a warning is logged (`"supplier accounts: 0 rows parsed — skipping upsert/retire to avoid wiping the table"`) and the function returns. This prevents a corrupt/empty export from closing every supplier.
+
+All rows written in a single DB transaction; committed once at the end, only when rows were processed.
 
 **On success:** archives source to `processed/raw/`. No EventBridge event (supplier master data; no redis cache step required).
 
@@ -746,7 +770,7 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 **Query param:** identical semantics to `GET /reports/customer-balances-fy` — `fy_count=all` (default) shows all FYs with zero opening; integer values show the most recent N FYs with a brought-forward opening.
 
-**Source tables:** `supplier_ledger` (`out_z IS NULL`, `LOWER(account_name) NOT LIKE '%%iravi%%'`) and `supplier_accounts` (city lookup only — `SELECT UPPER(name), city FROM supplier_accounts`).
+**Source tables:** `supplier_ledger` (`out_z IS NULL`, `LOWER(account_name) NOT LIKE '%%iravi%%'`) and `supplier_accounts` (city lookup only — `SELECT UPPER(name), city FROM supplier_accounts WHERE out_z IS NULL`, added 2026-07-12 so retired suppliers' cities are never used).
 
 **Key differences from customer-balances-fy:**
 
@@ -1253,6 +1277,46 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] Retire-absent (full-snapshot) semantics + empty-file guard for `etl_supplier_accounts`
+  and `etl_customer_accounts`, plus active-only filters downstream (2026-07-12):
+  - `lambda/etl_supplier_accounts/handler.py` — `_upsert()` keeps the existing per-row
+    close-then-insert loop, then adds a retire step after the loop (same transaction):
+    `UPDATE supplier_accounts SET out_z = NOW() WHERE out_z IS NULL AND NOT (name = ANY(%s))`
+    with the list of names parsed from the current file. Empty-file guard: if `rows` is empty,
+    the upsert loop AND retire step are both skipped (warning logged, function returns) —
+    a corrupt/empty export can never wipe the table. `conn.commit()` moved inside `_upsert`,
+    called once at the end only when rows were processed (`_process()` no longer commits).
+  - `lambda/etl_customer_accounts/handler.py` — `_upsert()` converted from
+    `INSERT ... ON CONFLICT (customer_name) DO UPDATE SET ...` (simple dimension upsert) to
+    uni-temporal close-then-insert milestoning, mirroring supplier_accounts: `UPDATE
+    customer_details SET out_z = NOW() WHERE customer_name = %s AND out_z IS NULL` then
+    `INSERT INTO customer_details (customer_name, district, city, state, pin, mobile_no,
+    customer_code) VALUES (...)` — `id`/`in_z`/`out_z` left to column defaults. Same
+    retire-absent step and empty-file guard as supplier_accounts, keyed on `customer_name`.
+    All parsing (`_build_code_lookup`, `_build_delivery_lookup`, `_parse`), the filename
+    guard, and the IRAVI/blank filtering are unchanged.
+  - `lambda/api/handler.py` — `/customers/names` and `_handle_customer_details` (backing
+    `/customers/details`) both add `WHERE out_z IS NULL` so retired customers stop appearing
+    in UI pickers/tickers. Other `party IN (SELECT ... FROM customer_details)` subqueries
+    (monthly_sales, reports, etc.) intentionally left unfiltered — historical sales/state
+    totals must still resolve retired customers' names via their closed rows.
+  - `lambda/api/supplier_balances_fy.py` — city lookup `SELECT UPPER(name), city FROM
+    supplier_accounts` gets `WHERE out_z IS NULL` so retired suppliers' cities are never used.
+  - Verified: `python -m py_compile` clean on all four files; both `_upsert` guards confirmed
+    to skip DB writes entirely when `rows` is empty; `ON CONFLICT` fully removed from
+    `etl_customer_accounts/handler.py`.
+  - **IaC needed:** migration adding `in_z TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+    `out_z TIMESTAMPTZ`, `id BIGSERIAL PK`, and partial unique index
+    `uix_customer_details_active ON customer_details (customer_name) WHERE out_z IS NULL`
+    to `customer_details` — must be applied before deploying this handler version (handled
+    separately by the IaC agent). `supplier_accounts` already has these columns/index
+    (migration 016) — no further IaC change needed there.
+  - **Re-ingest required once the migration lands:** re-upload `Customer Accounts Export
+    File*.xlsx` and `Supplier Accounts Export File*.xlsx` to S3 `raw/` so the milestoning
+    upsert + retire-absent logic actually runs against the new schema; then
+    `POST /admin/cache/flush` to clear any stale `iravi:customers:*` /
+    `iravi:reports:supplier_balances_fy:*` Redis entries.
+
 - [x] `compute_monthly_sales` extended with targets/YoY comparison data + `monthly_sales_pdf.py`
   rebranded (2026-07-11): both byte-identical copies (`lambda/api/monthly_sales.py`,
   `lambda/alerts_evaluator/monthly_sales.py`) now additionally return `projections`,
@@ -1430,6 +1494,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 > the future **Cognito** authoriser, and **whatsapp_notifier phase 2** (pending WhatsApp Business approval).
 > The per-item boxes below are retained as a historical record of what was built and how it was deployed.
 
+- [ ] **IaC: `customer_details` milestoning migration (2026-07-12)** — add `in_z TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `out_z TIMESTAMPTZ`, `id BIGSERIAL PK` (replacing whatever the current PK is), and partial unique index `uix_customer_details_active ON customer_details (customer_name) WHERE out_z IS NULL` to `customer_details`. Must be applied via psql/SSM BEFORE re-deploying `etl_customer_accounts` (its `_upsert` now writes `in_z`/`out_z`-aware milestoning rows and no longer uses `ON CONFLICT`) and BEFORE the API's `/customers/names` / `/customers/details` `WHERE out_z IS NULL` filters will return anything (they'll error/return nothing on the old schema). `supplier_accounts` already has this shape (migration 016) — no equivalent migration needed there.
+- [ ] **RE-INGEST after `customer_details` milestoning migration lands** — re-upload `Customer Accounts Export File*.xlsx` and `Supplier Accounts Export File*.xlsx` to S3 `raw/` so the retire-absent logic actually closes rows for customers/suppliers no longer in the export; then `POST /admin/cache/flush` to clear `iravi:customers:*` and `iravi:reports:supplier_balances_fy:*` Redis entries.
 - [ ] **IaC: API Gateway route GET /reports/monthly-sales** — add `GET /reports/monthly-sales` route + CORS allow-method in `lambda_api.tf`; add `app_screens` seed migration row for `reports.monthly_sales` (screen_key, label, sort_order). No new Lambda, layer, or DB migration needed — existing `sales` and `customer_details` tables are used.
 - [ ] **UI slice for /reports/monthly-sales** — add `getMonthlySales(month?: string)` client method in `src/api/client.ts` with typed response shape matching the JSON contract; add Monthly Sales report page + wire RBAC screen key `reports.monthly_sales` in the UI router.
 - [ ] **No IaC/DB change needed for alert fields** — `net_sales_current_month` and `sale_returns_current_month` are served by the existing `GET /alerts/fields` route; no new API Gateway route, no new DB migration, no new Lambda layer. The `current_month` window SQL uses existing date-range FILTER clauses within `_query_aggregate_metrics` — same pattern as all other windows.

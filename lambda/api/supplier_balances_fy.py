@@ -110,7 +110,7 @@ def compute_supplier_balances_fy(conn, fy_count) -> dict:
     # -- 2. City lookup from supplier_accounts ---------------------------------
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT UPPER(name), city FROM supplier_accounts
+            SELECT UPPER(name), city FROM supplier_accounts WHERE out_z IS NULL
         """)
         city_map: dict = {}
         for upper_name, city in cur.fetchall():
