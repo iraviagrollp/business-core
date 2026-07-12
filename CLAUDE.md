@@ -1289,6 +1289,29 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] Monthly Collection restricted to the two operating regions AP + TG (2026-07-12):
+  IRAVI operates only in Andhra Pradesh and Telangana, so `monthly_collection.py` was
+  reduced from FOUR states (AP/TS/TN/OR) to TWO (AP, TG→ts) — now mirroring
+  `monthly_sales.py`'s 2-region shape exactly. `_STATE_TO_BUCKET` = `{'AP':'ap','TG':'ts'}`,
+  `_TARGET_STATE_TO_BUCKET` = `{'AP':'ap','TS':'ts'}`; `_pack4`→`_pack` (`{ap,ts,total}`);
+  `_collections_by_state` returns `{ap,ts}`; targets queries filter `state IN ('AP','TS')`.
+  Collections for non-AP/TG customers (e.g. TN/OR), NULL, or unrecognized state now fold
+  into `unmapped_collections_total` (previously TN/OR had their own buckets). Every payload
+  block (`days`, `grand_total`, `projections`, `excess_short`, `annual_position.*`,
+  `month_only.*`, `cumulative_as_on.*`, `upto_prev_month.growth_pct`) is now `{ap,ts,total}`.
+  `handler.py`: Redis cache key bumped `iravi:reports:monthly_collection:v1:{month}` →
+  `:v2:` (payload shape changed, so stale v1 entries never collide);
+  `_handle_config_monthly_collection_targets_post` state validation tightened from
+  `('AP','TS','TN','OR')` → `('AP','TS')`. Verified: `py_compile` clean on both files;
+  `compute_monthly_collection` exercised against a mocked psycopg2 conn — AP/TG bucket into
+  ap/ts, a TN row folds into `unmapped_collections_total`, all blocks are `{ap,ts,total}`,
+  `targets_available=False` degrades gracefully when the table is absent.
+  **UI (iravi-ui):** `MonthlyCollection.tsx` + `CollectionProjections.tsx` trimmed to AP/TS,
+  `client.ts` `CollectionStateTotals`/`MonthlyCollectionDay`/growth_pct types drop `tn`/`or`
+  (tsc clean). **No IaC/DB change** — `monthly_collection_targets` keeps its schema; existing
+  TN/OR target rows are simply never read/written. **Post-deploy:** `POST /admin/cache/flush`
+  to purge any cached v1 collection payloads (v2 key means this is belt-and-suspenders).
+
 - [x] Retire-absent (full-snapshot) semantics + empty-file guard for `etl_supplier_accounts`
   and `etl_customer_accounts`, plus active-only filters downstream (2026-07-12):
   - `lambda/etl_supplier_accounts/handler.py` — `_upsert()` keeps the existing per-row

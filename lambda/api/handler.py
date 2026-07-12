@@ -1249,16 +1249,17 @@ def _handle_monthly_collection(month_raw: str):
     """GET /reports/monthly-collection?month=YYYY-MM
 
     Delegates computation to monthly_collection.compute_monthly_collection().
-    Mirrors _handle_monthly_sales exactly, but over 4 states (AP/TS/TN/OR)
-    sourced from customer_ledger Bank/Cash Receipt credits.
+    Mirrors _handle_monthly_sales exactly — IRAVI operates only in AP and TG, so
+    collections are bucketed into TWO states (AP, TG→ts) sourced from
+    customer_ledger Bank/Cash Receipt credits.
 
     State mapping by customer_details.state:
-      'AP' → ap, 'TG' → ts, 'TN' → tn, 'OR' → or
-      NULL / unrecognized → excluded from totals; accumulated into
-      unmapped_collections_total
+      'AP' → ap, 'TG' → ts
+      other state (e.g. TN/OR) / NULL / unrecognized → excluded from totals;
+      accumulated into unmapped_collections_total
 
     Returns raw rupees (float, 2 dp). The UI converts to lakhs.
-    Cache key: iravi:reports:monthly_collection:v1:{month}  TTL: _LEDGER_TTL
+    Cache key: iravi:reports:monthly_collection:v2:{month}  TTL: _LEDGER_TTL
     """
     from datetime import timedelta as _timedelta
 
@@ -1274,7 +1275,7 @@ def _handle_monthly_collection(month_raw: str):
     except (ValueError, AttributeError):
         month_str = today_ist.strftime('%Y-%m')
 
-    cache_key = f'iravi:reports:monthly_collection:v1:{month_str}'
+    cache_key = f'iravi:reports:monthly_collection:v2:{month_str}'
     r = _get_redis()
     cached = r.get(cache_key)
     if cached:
@@ -1506,8 +1507,8 @@ def _handle_config_monthly_collection_targets_post(event):
     body = _json_body(event)
 
     state = (body.get('state') or '').strip().upper()
-    if state not in ('AP', 'TS', 'TN', 'OR'):
-        return _response(400, {'error': "state must be one of 'AP', 'TS', 'TN', 'OR'"})
+    if state not in ('AP', 'TS'):
+        return _response(400, {'error': "state must be one of 'AP', 'TS'"})
 
     try:
         month = int(body.get('month'))
