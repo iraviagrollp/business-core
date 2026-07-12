@@ -216,6 +216,13 @@ FIELD_CATALOG_SUPPLIER_BALANCES_FY = {
     "frequencies": ["daily", "weekly", "monthly"],
 }
 
+FIELD_CATALOG_MONTHLY_COLLECTION = {
+    "category":    "monthly_collection",
+    "fields":      [],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+}
+
 # Master catalog lookup by category
 FIELD_CATALOGS: dict[str, dict] = {
     "balances":             FIELD_CATALOG,
@@ -223,6 +230,7 @@ FIELD_CATALOGS: dict[str, dict] = {
     "sale_returns":         FIELD_CATALOG_SALE_RETURNS,
     "customer_balances_fy": FIELD_CATALOG_CUSTOMER_BALANCES_FY,
     "supplier_balances_fy": FIELD_CATALOG_SUPPLIER_BALANCES_FY,
+    "monthly_collection":   FIELD_CATALOG_MONTHLY_COLLECTION,
 }
 
 _VALID_CATEGORIES: set[str] = set(FIELD_CATALOGS.keys())

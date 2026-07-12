@@ -107,9 +107,32 @@ business-core/
         │                        Added 2026-07-06: customer_balances_fy branch (always fires → PDF attachment)
         │                        Added 2026-07-06: supplier_balances_fy branch (always fires → PDF attachment;
         │                        no code/credit_notes; supplier footer legend differs from customer)
+        │                        Added 2026-07-12: monthly_collection branch (always fires → PDF
+        │                        attachment; clones the customer_balances_fy/supplier_balances_fy
+        │                        unconditional pattern, NOT the conditional sales pattern — no
+        │                        conditions/threshold logic; computes the CURRENT month via
+        │                        `today.strftime('%Y-%m')` each run, unlike the FY branches which
+        │                        always request 'all')
         ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
         │                        Added 2026-07-06: FIELD_CATALOG_CUSTOMER_BALANCES_FY + FIELD_CATALOGS entry
         │                        Added 2026-07-06: FIELD_CATALOG_SUPPLIER_BALANCES_FY + FIELD_CATALOGS entry
+        │                        Added 2026-07-12: FIELD_CATALOG_MONTHLY_COLLECTION (fields=[], not
+        │                        branch-scoped, accepts 0 conditions) + FIELD_CATALOGS entry —
+        │                        identical addition applied to api/alerts_eval.py to keep both in sync
+        ├── monthly_collection.py ← SHARED: byte-identical copy of api/monthly_collection.py
+        │                        compute_monthly_collection(conn, month_str) → dict (added 2026-07-12;
+        │                        previously api-only per that module's docstring — now also consumed
+        │                        by the monthly_collection alert-PDF path; keep both copies byte-identical)
+        ├── monthly_collection_pdf.py ← PDF renderer for Monthly Collection, portrait A4
+        │                        render_monthly_collection_pdf(data) → bytes. Modeled closely on
+        │                        monthly_sales_pdf.py's 2026-07-11 layout (DAILY NET COLLECTION /
+        │                        ANNUAL POSITION & CUMULATIVE COLLECTION / MONTH ONLY + CUMULATIVE
+        │                        side-by-side tables), but keyed off compute_monthly_collection's
+        │                        'ap'/'ts' bucket names (not monthly_sales's 'andhra'/'telangana') and
+        │                        the 'actual_collections_prev_fy' annual_position sub-key. No ₹ symbol
+        │                        used (Helvetica fonts, "Rs." in footer, same as monthly_sales_pdf.py);
+        │                        calls pdf_fonts.register_fonts() defensively though not required for
+        │                        the current field set. (added 2026-07-12)
         ├── monthly_sales.py  ← copy of shared module (byte-identical to api/monthly_sales.py)
         ├── monthly_sales_pdf.py ← PDF renderer using reportlab (evaluator-only; not in api package)
         │                        Restyled 2026-07-05: dark-green #1a3c2b headers (white text), #f0f0f0
@@ -1288,6 +1311,37 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
+  Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
+  exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no
+  conditions/thresholds. Files: `alerts_evaluator/monthly_collection.py` (byte-identical copy
+  of `api/monthly_collection.py`, `compute_monthly_collection(conn, month_str) -> dict`, no
+  reportlab dependency); `alerts_evaluator/monthly_collection_pdf.py` (NEW —
+  `render_monthly_collection_pdf(data) -> bytes`, portrait A4, modeled on
+  `monthly_sales_pdf.py`'s 2026-07-11 layout but keyed off `ap`/`ts` bucket names and the
+  `actual_collections_prev_fy` annual_position sub-key; COLLECTION wording throughout). Field
+  catalog: `FIELD_CATALOG_MONTHLY_COLLECTION = {category: "monthly_collection", fields: [],
+  match_types: ["all","any"], frequencies: ["daily","weekly","monthly"]}` registered in
+  `FIELD_CATALOGS` in **both** `api/alerts_eval.py` and `alerts_evaluator/alerts_eval.py`
+  (right after `supplier_balances_fy`) — `_VALID_CATEGORIES` / `_VALID_FIELDS_BY_CATEGORY`
+  derive from `FIELD_CATALOGS` automatically, so no other change was needed there; empty
+  conditions pass `validate_alert` for this category (only `balances` requires ≥1 condition).
+  `alerts_evaluator/handler.py`: added `import monthly_collection` / `import
+  monthly_collection_pdf`, and a new `elif category == "monthly_collection":` branch
+  (alongside the `customer_balances_fy` / `supplier_balances_fy` elifs, before the aggregate
+  `else`) that computes the **current** month (`today.strftime('%Y-%m')` — unlike the FY
+  branches, which always request `fy_count='all'`), renders the PDF, and sends via
+  `_send_ses_email_with_pdf` with `status="sent"`, `matched_count=1`. Verified: `py_compile`
+  clean on all four touched/created files; `reportlab` installed locally and
+  `render_monthly_collection_pdf()` smoke-tested against a representative `data` dict
+  (30-day `days[]`, populated `annual_position`/`month_only`/`cumulative_as_on` blocks) —
+  returned non-empty PDF bytes (~217 KB) without error. **No IaC/DB change** — the reportlab
+  layer, fonts, and logo already ship with `alerts_evaluator`; the new `.py` files are
+  auto-included in the `archive_file` deployment zip. UI/IaC follow-up (not done here,
+  out of business-core scope): the AlertBuilder category dropdown and any alert-category
+  labels in `iravi-ui` may need a `monthly_collection` entry to let admins create this alert
+  type from the UI — flag to the `ui` agent if/when this alert type should be exposed there.
 
 - [x] Monthly Collection restricted to the two operating regions AP + TG (2026-07-12):
   IRAVI operates only in Andhra Pradesh and Telangana, so `monthly_collection.py` was

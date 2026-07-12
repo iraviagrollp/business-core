@@ -1,0 +1,507 @@
+"""
+monthly_collection_pdf — evaluator-only PDF renderer for the Monthly Collection report.
+
+Public surface
+--------------
+render_monthly_collection_pdf(data: dict) -> bytes
+    data    : dict returned by monthly_collection.compute_monthly_collection()
+    returns : raw PDF bytes (A4 portrait)
+
+Requires: reportlab (lambda/alerts_evaluator/requirements.txt).
+This module is NOT imported by the api Lambda; the api Lambda has no PDF deps.
+
+Modeled closely on monthly_sales_pdf.py (same section layout / table styling),
+with two differences:
+  1. Bucket keys are 'ap' / 'ts' (monthly_collection.compute_monthly_collection's
+     shape) instead of monthly_sales's 'andhra' / 'telangana'.
+  2. Wording throughout says "COLLECTION" instead of "SALES", and the
+     annual_position sub-key is 'actual_collections_prev_fy' (not
+     'actual_sales_prev_fy').
+
+Design (mirrors monthly_sales_pdf.py's 2026-07-11 rebrand)
+------------------------------------------------------------
+Sections, in order:
+  1. Letterhead — logo left / bold "IRAVI AGRO LIFE LLP" + subtitle centre /
+     "Date: DD-MM-YYYY" + "(Value In Lakhs)" right.
+  2. "DAILY NET COLLECTION" — DATE | AP | TS | SUB TOTAL. PROJECTIONS row
+     (shaded), one row per day (DD-MM-YYYY; future blank; zero '-'; negative
+     in parens), G. TOTAL row (dark-green header band), EXCESS / SHORT row
+     (shaded, leading-minus negatives).
+  3. "ANNUAL POSITION & CUMULATIVE COLLECTION (UP TO {prev_month_label_full})" —
+     two-row header: STATE | Actual Collections {prev_fy} | Annual Target {cur_fy} |
+     UP TO {prev_month_label_full} (spans 4: {prev_fy} | {cur_fy} | DIFF | GROWTH %).
+     Rows AP, TS, bold-shaded SUB TOT.
+  4. Two small side-by-side tables: "{month} MONTH ONLY" and
+     "CUMULATIVE — UP TO / AS ON DATE", each STATE | col | col | DIFF,
+     rows AP / TS / SUB TOT.
+
+All money values are formatted in lakhs (raw / 100 000) to 2 dp with Indian-style
+thousands grouping; '-' for zero/blank.
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import date as _date, datetime
+from io import BytesIO
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+import pdf_fonts
+
+# Register Unicode TTF fonts (idempotent) so ₹ / — never raise a KeyError if
+# introduced later; this module currently avoids both characters (mirrors
+# monthly_sales_pdf.py's "Rs." footer convention) but the call is cheap and safe.
+pdf_fonts.register_fonts()
+
+# ── constants ─────────────────────────────────────────────────────────────────
+_HEADER_COLOR   = colors.HexColor('#1a3c2b')   # dark green — matches iravi-ui brand
+_TOTAL_BG_COLOR = colors.HexColor('#f0f0f0')   # light grey for shaded/total rows
+_ALT_ROW_COLOR  = colors.HexColor('#fafafa')   # subtle zebra stripe on even data rows
+_CELL_BORDER    = colors.HexColor('#cccccc')
+
+_PAGE_W, _PAGE_H = A4                          # 595.27 pt x 841.89 pt (portrait)
+_MARGIN          = 1.0 * cm                    # left and right
+_CONTENT_W       = _PAGE_W - 2 * _MARGIN       # approx 538 pt usable width
+
+# Logo bundled alongside this module; falls back gracefully if absent
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), 'ial-logo.png')
+
+# Footer text — matches monthly_sales_pdf.py's footer convention
+_FOOTER_LINE1 = (
+    "Reg. Address: Flat No: 102, BVR Plaza, H.No.5, 3-112/2, BJP Office Line  "
+    "Shanthi Nagar, Kukatpally, Hyderabad, Telangana 500072"
+)
+_FOOTER_LINE2 = (
+    "This report is computer-generated. Values are in Lakhs (1 Lakh = Rs. 1,00,000). "
+    "AP = Andhra Pradesh; TS = Telangana."
+)
+
+
+# ── formatting helpers ────────────────────────────────────────────────────────
+
+def _indian_group(int_str: str) -> str:
+    """Group an unsigned integer digit string Indian-style (e.g. '1234567' -> '12,34,567')."""
+    if len(int_str) <= 3:
+        return int_str
+    tail = int_str[-3:]
+    head = int_str[:-3]
+    groups: list[str] = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        groups.insert(0, head)
+    return ','.join(groups) + ',' + tail
+
+
+def _lakhs_abs(value: float) -> str:
+    """Format |value| / 100 000 to 2 dp with Indian-style thousands grouping."""
+    lakhs = abs(value) / 100_000
+    formatted = f"{lakhs:.2f}"
+    int_part, dec_part = formatted.split('.')
+    return f"{_indian_group(int_part)}.{dec_part}"
+
+
+def _fmt_date(date_str: str) -> str:
+    """'YYYY-MM-DD' -> 'DD-MM-YYYY', e.g. '01-07-2026'."""
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').strftime('%d-%m-%Y')
+    except ValueError:
+        return date_str
+
+
+def _cell_daily(day_date_str: str, value: float, as_on_date: str) -> str:
+    """Daily-table value cell.
+
+    Rules:
+      day_date_str > as_on_date  ->  ""    (future day — leave blank)
+      value == 0.0               ->  "-"   (no collection on this day)
+      value < 0.0                ->  "(x.xx)"  (negative in parentheses)
+      else                       ->  "x.xx"    (lakhs, 2 dp)
+    """
+    if day_date_str > as_on_date:
+        return ""
+    if value == 0:
+        return "-"
+    s = _lakhs_abs(value)
+    return f"({s})" if value < 0 else s
+
+
+def _cell_plain(value: float) -> str:
+    """Generic lakhs value cell: zero -> '-'; negative -> leading minus."""
+    if value == 0:
+        return "-"
+    s = _lakhs_abs(value)
+    return f"-{s}" if value < 0 else s
+
+
+def _cell_growth(value) -> str:
+    """Growth % cell: None -> '-'; else signed 2 dp number (no % sign)."""
+    if value is None:
+        return "-"
+    return f"-{abs(value):.2f}" if value < 0 else f"{value:.2f}"
+
+
+# ── footer callback ───────────────────────────────────────────────────────────
+
+def _draw_footer(canvas, doc):
+    """Draw the two-line Kukatpally address footer on every page."""
+    canvas.saveState()
+    canvas.setFont("Helvetica", 6.5)
+    canvas.setFillColor(colors.HexColor("#666666"))
+    canvas.drawCentredString(_PAGE_W / 2, 0.70 * cm, _FOOTER_LINE1)
+    canvas.drawCentredString(_PAGE_W / 2, 0.38 * cm, _FOOTER_LINE2)
+    canvas.restoreState()
+
+
+# ── shared style helpers ──────────────────────────────────────────────────────
+
+def _ps(name: str, font: str, size: float, align: int,
+        color=colors.black, leading: float | None = None) -> ParagraphStyle:
+    return ParagraphStyle(
+        name,
+        fontName=font,
+        fontSize=size,
+        alignment=align,
+        leading=leading or (size + 1),
+        textColor=color,
+    )
+
+
+def _base_tbl_cmds() -> list:
+    """Grid / padding / fontsize commands shared by every table in this report."""
+    return [
+        ("FONTSIZE",      (0, 0), (-1, -1), 7),
+        ("GRID",          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]
+
+
+# ── public API ────────────────────────────────────────────────────────────────
+
+def render_monthly_collection_pdf(data: dict) -> bytes:
+    """
+    Render the Monthly Collection report as a PDF and return raw bytes.
+
+    Parameters
+    ----------
+    data : dict returned by monthly_collection.compute_monthly_collection()
+
+    Returns
+    -------
+    bytes : raw PDF content suitable for attaching to an SES email
+    """
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=_MARGIN,
+        rightMargin=_MARGIN,
+        topMargin=0.8 * cm,
+        bottomMargin=1.4 * cm,      # footer draws at 0.4-0.7 cm; 1.4 cm leaves clearance
+        title=f"IAL Monthly Collection - {data['month_label']}",
+        author="IRAVI AGRO LIFE LLP",
+    )
+
+    # ── Paragraph styles ──────────────────────────────────────────────────────
+    company_style = _ps("IALCompany", "Helvetica-Bold", 14, TA_CENTER, leading=16)
+    subtitle_style = _ps("IALSubtitle", "Helvetica-Bold", 7, TA_CENTER, leading=9)
+    right_style = _ps("IALRight", "Helvetica", 7, TA_RIGHT, leading=9)
+    section_style = ParagraphStyle(
+        "IALSection",
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        alignment=TA_CENTER,
+        spaceBefore=8,
+        spaceAfter=3,
+    )
+    sub_section_style = ParagraphStyle(
+        "IALSubSection",
+        fontName="Helvetica-Bold",
+        fontSize=7.5,
+        alignment=TA_CENTER,
+        spaceBefore=2,
+        spaceAfter=2,
+    )
+
+    hdr_c = _ps("IALHdrC", "Helvetica-Bold", 6.5, TA_CENTER, color=colors.white)
+    hdr_l = _ps("IALHdrL", "Helvetica-Bold", 6.5, TA_LEFT,   color=colors.white)
+
+    dat_c = _ps("IALDatC", "Helvetica", 7, TA_CENTER)
+    dat_l = _ps("IALDatL", "Helvetica", 7, TA_LEFT)
+
+    tot_c = _ps("IALTotC", "Helvetica-Bold", 7, TA_CENTER)
+    tot_l = _ps("IALTotL", "Helvetica-Bold", 7, TA_LEFT)
+
+    gtot_c = _ps("IALGTotC", "Helvetica-Bold", 7, TA_CENTER, color=colors.white)
+    gtot_l = _ps("IALGTotL", "Helvetica-Bold", 7, TA_LEFT,   color=colors.white)
+
+    # ── Letterhead: 3-column header table ────────────────────────────────────
+    today_str = _date.today().strftime('%d-%m-%Y')
+
+    # Load logo; on any failure render without it (never crash)
+    try:
+        logo_cell = Image(_LOGO_PATH, width=1.1 * cm, height=1.1 * cm)
+    except Exception:
+        logo_cell = Spacer(1.1 * cm, 1.1 * cm)
+
+    logo_col_w  = 1.3 * cm
+    right_col_w = 2.8 * cm
+    ctr_col_w   = _CONTENT_W - logo_col_w - right_col_w
+
+    hdr_tbl = Table(
+        [[
+            logo_cell,
+            [
+                Paragraph("IRAVI AGRO LIFE LLP", company_style),
+                Paragraph(
+                    f"STATE WISE COLLECTION FOR THE MONTH OF {data['month_label']}",
+                    subtitle_style,
+                ),
+            ],
+            [
+                Paragraph(f"Date: {today_str}", right_style),
+                Paragraph("(Value In Lakhs)", right_style),
+            ],
+        ]],
+        colWidths=[logo_col_w, ctr_col_w, right_col_w],
+    )
+    hdr_tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+
+    elements: list = [hdr_tbl, Spacer(1, 5)]
+
+    # ── Section 2: DAILY NET COLLECTION ──────────────────────────────────────
+    as_on = data["as_on_date"]
+    gt    = data["grand_total"]
+    proj  = data["projections"]
+    es    = data["excess_short"]
+
+    elements.append(Paragraph("DAILY NET COLLECTION", section_style))
+
+    date_col_w  = 2.8 * cm
+    val_col_w   = (_CONTENT_W - date_col_w) / 3
+    daily_col_w = [date_col_w, val_col_w, val_col_w, val_col_w]
+
+    day_rows: list[list] = [[
+        Paragraph("DATE", hdr_c), Paragraph("AP", hdr_c),
+        Paragraph("TS", hdr_c), Paragraph("SUB TOTAL", hdr_c),
+    ]]
+
+    proj_row_idx = len(day_rows)
+    day_rows.append([
+        Paragraph("PROJECTIONS", tot_l),
+        Paragraph(_cell_plain(proj["ap"]), tot_c),
+        Paragraph(_cell_plain(proj["ts"]), tot_c),
+        Paragraph(_cell_plain(proj["total"]), tot_c),
+    ])
+
+    day_start_idx = len(day_rows)
+    for day in data["days"]:
+        d_str = day["date"]
+        day_rows.append([
+            Paragraph(_fmt_date(d_str), dat_c),
+            Paragraph(_cell_daily(d_str, day["ap"], as_on), dat_c),
+            Paragraph(_cell_daily(d_str, day["ts"], as_on), dat_c),
+            Paragraph(_cell_daily(d_str, day["total"], as_on), dat_c),
+        ])
+    day_end_idx = len(day_rows) - 1
+
+    gtotal_row_idx = len(day_rows)
+    day_rows.append([
+        Paragraph("G. TOTAL", gtot_l),
+        Paragraph(_cell_plain(gt["ap"]), gtot_c),
+        Paragraph(_cell_plain(gt["ts"]), gtot_c),
+        Paragraph(_cell_plain(gt["total"]), gtot_c),
+    ])
+
+    es_row_idx = len(day_rows)
+    day_rows.append([
+        Paragraph("EXCESS / SHORT", tot_l),
+        Paragraph(_cell_plain(es["ap"]), tot_c),
+        Paragraph(_cell_plain(es["ts"]), tot_c),
+        Paragraph(_cell_plain(es["total"]), tot_c),
+    ])
+
+    day_cmds = _base_tbl_cmds() + [
+        ("BACKGROUND", (0, 0), (-1, 0), _HEADER_COLOR),
+        ("BACKGROUND", (0, proj_row_idx), (-1, proj_row_idx), _TOTAL_BG_COLOR),
+        ("ROWBACKGROUNDS", (0, day_start_idx), (-1, day_end_idx), [colors.white, _ALT_ROW_COLOR]),
+        ("BACKGROUND", (0, gtotal_row_idx), (-1, gtotal_row_idx), _HEADER_COLOR),
+        ("BACKGROUND", (0, es_row_idx), (-1, es_row_idx), _TOTAL_BG_COLOR),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]
+
+    day_tbl = Table(day_rows, colWidths=daily_col_w, repeatRows=1)
+    day_tbl.setStyle(TableStyle(day_cmds))
+    elements.append(day_tbl)
+
+    # ── Section 3: ANNUAL POSITION & CUMULATIVE COLLECTION ───────────────────
+    ap_data       = data["annual_position"]
+    prev_fy_label = ap_data["prev_fy_label"]
+    cur_fy_label  = ap_data["cur_fy_label"]
+    prev_m_full   = ap_data["prev_month_label_full"]
+    actual_prev   = ap_data["actual_collections_prev_fy"]
+    target_cur    = ap_data["annual_target_cur_fy"]
+    utp           = ap_data["upto_prev_month"]
+
+    elements.append(Paragraph(
+        f"ANNUAL POSITION &amp; CUMULATIVE COLLECTION (UP TO {prev_m_full})", section_style,
+    ))
+
+    state_w = 1.8 * cm
+    ap_val_w = (_CONTENT_W - state_w) / 6
+    ap_col_w = [state_w] + [ap_val_w] * 6
+
+    ap_row0 = [
+        Paragraph("STATE", hdr_c),
+        Paragraph(f"Actual Collections {prev_fy_label}", hdr_c),
+        Paragraph(f"Annual Target {cur_fy_label}", hdr_c),
+        Paragraph(f"UP TO {prev_m_full}", hdr_c),
+        "", "", "",
+    ]
+    ap_row1 = [
+        "", "", "",
+        Paragraph(prev_fy_label, hdr_c),
+        Paragraph(cur_fy_label, hdr_c),
+        Paragraph("DIFF", hdr_c),
+        Paragraph("GROWTH %", hdr_c),
+    ]
+
+    def _ap_data_row(label, actual_v, target_v, utp_prev_v, utp_cur_v, diff_v, growth_v):
+        return [
+            Paragraph(label, tot_l if label == "SUB TOT" else dat_l),
+            Paragraph(_cell_plain(actual_v),  tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(_cell_plain(target_v),  tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(_cell_plain(utp_prev_v), tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(_cell_plain(utp_cur_v),  tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(_cell_plain(diff_v),     tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(_cell_growth(growth_v),  tot_c if label == "SUB TOT" else dat_c),
+        ]
+
+    ap_rows = [ap_row0, ap_row1]
+    ap_rows.append(_ap_data_row(
+        "AP", actual_prev["ap"], target_cur["ap"],
+        utp["prev_fy"]["ap"], utp["cur_fy"]["ap"],
+        utp["diff"]["ap"], utp["growth_pct"]["ap"],
+    ))
+    ap_rows.append(_ap_data_row(
+        "TS", actual_prev["ts"], target_cur["ts"],
+        utp["prev_fy"]["ts"], utp["cur_fy"]["ts"],
+        utp["diff"]["ts"], utp["growth_pct"]["ts"],
+    ))
+    ap_subtot_idx = len(ap_rows)
+    ap_rows.append(_ap_data_row(
+        "SUB TOT", actual_prev["total"], target_cur["total"],
+        utp["prev_fy"]["total"], utp["cur_fy"]["total"],
+        utp["diff"]["total"], utp["growth_pct"]["total"],
+    ))
+
+    ap_cmds = _base_tbl_cmds() + [
+        ("SPAN", (0, 0), (0, 1)),
+        ("SPAN", (1, 0), (1, 1)),
+        ("SPAN", (2, 0), (2, 1)),
+        ("SPAN", (3, 0), (6, 0)),
+        ("BACKGROUND", (0, 0), (-1, 1), _HEADER_COLOR),
+        ("BACKGROUND", (0, ap_subtot_idx), (-1, ap_subtot_idx), _TOTAL_BG_COLOR),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (0, 2), (0, -1), "LEFT"),
+    ]
+
+    ap_tbl = Table(ap_rows, colWidths=ap_col_w, repeatRows=2)
+    ap_tbl.setStyle(TableStyle(ap_cmds))
+    elements.append(ap_tbl)
+
+    # ── Section 4: two small side-by-side tables ─────────────────────────────
+    mo  = data["month_only"]
+    cao = data["cumulative_as_on"]
+
+    def _small_table(header_cells, rows_data, subtot_label="SUB TOT"):
+        n_data_rows = len(rows_data)
+        subtot_row_idx = n_data_rows  # header is row 0
+        tbl_rows = [[Paragraph(h, hdr_c) for h in header_cells]]
+        for i, (label, v0, v1, v2) in enumerate(rows_data):
+            is_tot = (label == subtot_label)
+            style_l = tot_l if is_tot else dat_l
+            style_c = tot_c if is_tot else dat_c
+            tbl_rows.append([
+                Paragraph(label, style_l),
+                Paragraph(_cell_plain(v0), style_c),
+                Paragraph(_cell_plain(v1), style_c),
+                Paragraph(_cell_plain(v2), style_c),
+            ])
+        cmds = _base_tbl_cmds() + [
+            ("BACKGROUND", (0, 0), (-1, 0), _HEADER_COLOR),
+            ("BACKGROUND", (0, subtot_row_idx), (-1, subtot_row_idx), _TOTAL_BG_COLOR),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN", (0, 1), (0, -1), "LEFT"),
+        ]
+        half_w = (_CONTENT_W - 0.4 * cm) / 2
+        st_w   = half_w * 0.28
+        val_w  = (half_w - st_w) / 3
+        tbl = Table(tbl_rows, colWidths=[st_w, val_w, val_w, val_w])
+        tbl.setStyle(TableStyle(cmds))
+        return tbl
+
+    mo_tbl = _small_table(
+        ["STATE", prev_fy_label, cur_fy_label, "DIFF"],
+        [
+            ("AP", mo["prev_fy"]["ap"], mo["cur_fy"]["ap"], mo["diff"]["ap"]),
+            ("TS", mo["prev_fy"]["ts"], mo["cur_fy"]["ts"], mo["diff"]["ts"]),
+            ("SUB TOT", mo["prev_fy"]["total"], mo["cur_fy"]["total"], mo["diff"]["total"]),
+        ],
+    )
+
+    cao_tbl = _small_table(
+        ["STATE", f'UPTO {cao["month_abbr"]} {cao["prev_fy_label"]}',
+         f'AS ON DATE {cao["month_abbr"]} {cao["cur_fy_label"]}', "DIFF"],
+        [
+            ("AP", cao["prev_fy_upto"]["ap"], cao["cur_fy_as_on"]["ap"], cao["diff"]["ap"]),
+            ("TS", cao["prev_fy_upto"]["ts"], cao["cur_fy_as_on"]["ts"], cao["diff"]["ts"]),
+            ("SUB TOT", cao["prev_fy_upto"]["total"], cao["cur_fy_as_on"]["total"], cao["diff"]["total"]),
+        ],
+    )
+
+    mo_heading  = Paragraph(f'{mo["month_name"]} MONTH ONLY', sub_section_style)
+    cao_heading = Paragraph("CUMULATIVE &mdash; UP TO / AS ON DATE", sub_section_style)
+
+    half_col_w = _CONTENT_W / 2
+    outer_tbl = Table(
+        [[[mo_heading, mo_tbl], [cao_heading, cao_tbl]]],
+        colWidths=[half_col_w, half_col_w],
+    )
+    outer_tbl.setStyle(TableStyle([
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(outer_tbl)
+
+    # ── Build PDF with footer on every page ───────────────────────────────────
+    doc.build(elements, onFirstPage=_draw_footer, onLaterPages=_draw_footer)
+    return buffer.getvalue()

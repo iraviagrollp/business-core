@@ -55,6 +55,8 @@ import supplier_balances_fy as _sbfy
 import supplier_balances_fy_pdf as _sbfy_pdf
 import monthly_sales
 import monthly_sales_pdf
+import monthly_collection
+import monthly_collection_pdf
 import pdf_fonts
 
 logger = logging.getLogger()
@@ -601,6 +603,47 @@ def lambda_handler(event, context):
                 matched_count = 1
                 logger.info(
                     "Alert id=%s (supplier_balances_fy) sent to %d recipients — "
+                    "PDF %s (%d bytes)",
+                    alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                )
+
+            elif category == "monthly_collection":
+                # ── Monthly Collection report — always fires ──────────────────
+                # Unconditional: the alert fires on every scheduled run.
+                # Builds the current-month Monthly Collection report and attaches
+                # it as a PDF to the SES email.
+                date_display      = today.strftime('%d %b %Y')
+                current_month_str = today.strftime('%Y-%m')
+                data_mc      = monthly_collection.compute_monthly_collection(conn, current_month_str)
+                pdf_bytes    = monthly_collection_pdf.render_monthly_collection_pdf(data_mc)
+                pdf_filename = f"IAL_Monthly_Collection_{today.strftime('%d-%b-%Y')}.pdf"
+                subject      = (
+                    f"IRAVI — Monthly Collection Report — {date_display}"
+                )
+                html_body = (
+                    '<!DOCTYPE html>'
+                    '<html><head><meta charset="UTF-8"></head>'
+                    '<body style="font-family:Arial,sans-serif;color:#333;'
+                    'max-width:700px;margin:0 auto">'
+                    f'<p style="font-size:15px">Attached is the Monthly Collection '
+                    f'report for <strong>{date_display}</strong>.</p>'
+                    '<p style="margin-top:20px;font-size:11px;color:#888">'
+                    'This is an automated message from the IRAVI Dashboard. '
+                    'Please do not reply to this email.'
+                    '</p>'
+                    '</body></html>'
+                )
+                _send_ses_email_with_pdf(
+                    subject,
+                    alert["recipients"],
+                    html_body,
+                    pdf_bytes,
+                    pdf_filename,
+                )
+                status        = "sent"
+                matched_count = 1
+                logger.info(
+                    "Alert id=%s (monthly_collection) sent to %d recipients — "
                     "PDF %s (%d bytes)",
                     alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
                 )
