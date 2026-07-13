@@ -142,6 +142,11 @@ def lambda_handler(event, context):
 
 
 def _route_data(event, method, path):
+    if path == '/overview':
+        if method == 'GET':
+            return _overview()
+        return _response(405, {'error': 'Method not allowed'})
+
     # Collection roots and their {id} item routes.
     routes = {
         '/technicals': (_technicals_list, _technicals_create),
@@ -310,6 +315,65 @@ def _delete(sql, params):
         return affected
     finally:
         conn.close()
+
+
+# ── Overview (landing-page tiles) ─────────────────────────────────────────────
+
+def _overview():
+    """Aggregate tiles for the Procurement overview landing page.
+
+    Released PDC = cheques whose post-dated date has arrived (pdc_date <= today);
+    upcoming PDC = the single nearest cheque still due (pdc_date >= today), with
+    its supplier company as payee.
+    """
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT COUNT(*) FROM procurement.enquiries')
+            enquiries_count = cur.fetchone()[0]
+
+            cur.execute('SELECT COUNT(*) FROM procurement.pdc')
+            pdc_count = cur.fetchone()[0]
+
+            cur.execute(
+                'SELECT COALESCE(SUM(pdc_amt), 0) FROM procurement.pdc '
+                'WHERE pdc_date IS NOT NULL AND pdc_date <= CURRENT_DATE'
+            )
+            pdc_amount_released = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT p.pdc_date, p.pdc_amt, c.company_name
+                FROM procurement.pdc p
+                LEFT JOIN procurement.supplier_companies c ON c.id = p.supplier_company_id
+                WHERE p.pdc_date IS NOT NULL AND p.pdc_date >= CURRENT_DATE
+                ORDER BY p.pdc_date ASC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            upcoming_pdc = (
+                {'pdc_date': row[0], 'pdc_amt': row[1], 'payee': row[2]} if row else None
+            )
+
+            cur.execute('SELECT COUNT(*) FROM procurement.technicals')
+            technicals_count = cur.fetchone()[0]
+
+            cur.execute('SELECT COUNT(*) FROM procurement.suppliers')
+            suppliers_count = cur.fetchone()[0]
+
+            cur.execute('SELECT COUNT(*) FROM procurement.supplier_companies')
+            companies_count = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    return _response(200, {
+        'enquiries_count': enquiries_count,
+        'pdc_count': pdc_count,
+        'pdc_amount_released': pdc_amount_released,
+        'upcoming_pdc': upcoming_pdc,
+        'technicals_count': technicals_count,
+        'suppliers_count': suppliers_count,
+        'companies_count': companies_count,
+    })
 
 
 # ── Technicals ────────────────────────────────────────────────────────────────
