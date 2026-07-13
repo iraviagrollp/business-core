@@ -1312,6 +1312,25 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **`procurement_api` Lambda — Procurement dashboard CRUD backend (2026-07-13):** new folder
+  `lambda/procurement_api/` powering `procurement.iraviagrolife.com`. Standalone Lambda (its own
+  API Gateway, see IaC `production/procurement/` module) reusing the shared RBAC — `auth.py` is a
+  copy of `api/auth.py` (PBKDF2 + HS256 JWT), and login validates against the SAME `app_users` /
+  `app_roles` / `app_screens` tables using the SAME `JWT_SECRET_ARN`, so users are managed once in
+  the dashboard's Access Control. `POST /auth/login` + `GET /auth/me` are public/token; every other
+  route requires a valid bearer token (any authenticated user — per-screen authz is UI-only, phase 1).
+  CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`,
+  `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc` + `PUT/DELETE /<resource>/{id}`.
+  **No Redis** (low-volume write-heavy config data → straight to RDS). Env: `DB_SECRET_ARN`,
+  `JWT_SECRET_ARN`. `requirements.txt` = psycopg2-binary (reuses the existing `api_deps` layer via
+  IaC — no new CI layer step). ForeignKeyViolation on delete → 409 "in use"; UniqueViolation → 409.
+  Dates/Decimals JSON-serialized via a custom default. `py_compile` clean.
+  DB: migrations `026_create_procurement_schema.sql` (schema + 5 tables), `027_add_procurement_screens.sql`
+  (RBAC screen seeds `procurement.*`), `028_seed_procurement_data.sql` (seed from `IAL Enquiry.xlsx`).
+  UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
+  Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
+  roles in Access Control.
+
 - [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
   Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
   exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no
