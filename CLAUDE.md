@@ -590,9 +590,9 @@ Line-item purchase ledger populated by both `etl_appendix_b_x11_purchase` (`Appe
 
 **Columns:** `purchase_date, voucher_no, branch, party, ref_bill_no, ref_bill_date, product, qty, rate, gross, av, barcodes, narration, purchase_return, in_z, out_z`
 
-**Milestoning natural key / PK:** `(purchase_date, voucher_no, branch, party, product)` — UPDATE closes any open record matching all five, then INSERT adds the new row. `purchase_return` is not part of the key.
+**Milestoning natural key:** `(purchase_date, voucher_no, branch, party, product, COALESCE(barcodes,''))` — UPDATE closes any open record matching all six (barcodes compared via `COALESCE(barcodes,'') = COALESCE(%s,'')`), then INSERT adds the new row. `purchase_return` is not part of the key. **`barcodes` added to the key 2026-07-14** (IaC migration 031) — a single voucher legitimately carries the same product on multiple batch/barcode lines; the previous 5-column key collapsed those into one row (last-writer-wins). Requires a re-ingest of the Appendix purchase files to backfill previously-collapsed rows.
 
-**Target table:** `purchases` (DB migration `007_create_purchases.sql`)
+**Target table:** `purchases` (DB migration `007_create_purchases.sql`; key widened by `031_add_barcodes_to_purchases_sales_key.sql`)
 
 ---
 
@@ -627,9 +627,9 @@ Line-item sales ledger populated by both `etl_appendix_b_x11_sale` (`AppendixSal
 
 **Columns:** `purchase_date, voucher_no, branch, party, ref_bill_no, ref_bill_date, product, qty, rate, gross, av, barcodes, narration, sales_return, in_z, out_z` — same shape as `purchases`, with `purchase_return` renamed to `sales_return`. `narration` is always NULL (no source column).
 
-**Milestoning natural key / PK:** `(purchase_date, voucher_no, branch, party, product)` — UPDATE closes any open record matching all five, then INSERT adds the new row. `sales_return` is not part of the key.
+**Milestoning natural key:** `(purchase_date, voucher_no, branch, party, product, COALESCE(barcodes,''))` — UPDATE closes any open record matching all six (barcodes compared via `COALESCE(barcodes,'') = COALESCE(%s,'')`), then INSERT adds the new row. `sales_return` is not part of the key. **`barcodes` added to the key 2026-07-14** (IaC migration 031) — same fix as `purchases` (batch/barcode lines of the same product on one voucher were being collapsed).
 
-**Target table:** `sales` (DB migration `008_create_sales.sql`)
+**Target table:** `sales` (DB migration `008_create_sales.sql`; key widened by `031_add_barcodes_to_purchases_sales_key.sql`)
 
 ---
 
@@ -1311,6 +1311,25 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **`barcodes` added to the `purchases`/`sales` milestoning key (2026-07-14):** the 5-column
+  natural key `(purchase_date, voucher_no, branch, party, product)` did not uniquely identify a
+  line item — a single voucher legitimately carries the same product on multiple batch/barcode
+  lines, and the close-then-insert loop collapsed them (last-writer-wins). Observed in
+  `AppendixPurchaseReport.xlsx`: 785 parsed rows → 770 stored (15 real rows lost across 7 vouchers;
+  worst was PVA2526-48 / SUNITHA GRAPHICS collapsing 7 lines → 1). Fix: added
+  `COALESCE(barcodes,'') = COALESCE(%s,'')` to the UPDATE predicate in all four ETL handlers
+  (`etl_appendix_b_x11_purchase`, `_purchase_return`, `_sale`, `_sale_return` — `_upsert_purchases`
+  / `_upsert_sales`) and widened both partial unique indexes to include `COALESCE(barcodes,'')`
+  (IaC migration `031_add_barcodes_to_purchases_sales_key.sql`). `COALESCE` keeps NULL/'' barcodes
+  deduping as one value (a bare nullable column in a UNIQUE index would let multiple NULL rows stay
+  active). Verified: `py_compile` clean on all four handlers; in-memory simulation of the new-key
+  load against the sample file → 785 parsed / 785 active / 0 lost. **IaC needed:** apply migration
+  031 via psql/SSM. **Re-ingest required after migration lands:** re-upload the Appendix
+  purchase/sale/return files to S3 `raw/` so the previously-collapsed batch lines are backfilled
+  (the new UPDATE only closes the exact-barcode match, so the survivor re-versions cleanly and the
+  missing lines insert fresh — no duplicates). No Redis change (purchases/sales are read fresh; run
+  `POST /admin/cache/flush` if any sales-derived report cache needs refreshing).
 
 - [x] **`procurement_api` Lambda — Procurement dashboard CRUD backend (2026-07-13):** new folder
   `lambda/procurement_api/` powering `procurement.iraviagrolife.com`. Standalone Lambda (its own

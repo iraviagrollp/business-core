@@ -219,10 +219,11 @@ def _upsert_purchases(conn, rows: list[dict]):
                    SET out_z = NOW()
                  WHERE purchase_date = %s AND voucher_no = %s AND branch = %s
                    AND party = %s AND product = %s
+                   AND COALESCE(barcodes, '') = COALESCE(%s, '')
                    AND out_z IS NULL
                 """,
                 (row['purchase_date'], row['voucher_no'], row['branch'],
-                 row['party'], row['product']),
+                 row['party'], row['product'], row['barcodes']),
             )
             cur.execute(
                 """
