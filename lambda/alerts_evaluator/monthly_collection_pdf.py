@@ -27,10 +27,11 @@ Sections, in order:
      (shaded), one row per day (DD-MM-YYYY; future blank; zero '-'; negative
      in parens), G. TOTAL row (dark-green header band), EXCESS / SHORT row
      (shaded, leading-minus negatives).
-  3. "ANNUAL POSITION & CUMULATIVE COLLECTION (UP TO {prev_month_label_full})" —
-     two-row header: STATE | Actual Collections {prev_fy} | Annual Target {cur_fy} |
-     UP TO {prev_month_label_full} (spans 4: {prev_fy} | {cur_fy} | DIFF | GROWTH %).
-     Rows AP, TS, bold-shaded SUB TOT.
+  3. "UP TO {prev_month_label_full}" — single-row header
+     STATE | {prev_fy} | {cur_fy} | DIFF, rows AP / TS / bold-shaded SUB TOT.
+     Matches the Reports-section Monthly Collection PDF (iravi-ui
+     MonthlyCollection.tsx). The Actual Collections / Annual Target / GROWTH %
+     columns were dropped 2026-07-14; the payload still carries those keys.
   4. Two small side-by-side tables: "{month} MONTH ONLY" and
      "CUMULATIVE — UP TO / AS ON DATE", each STATE | col | col | DIFF,
      rows AP / TS / SUB TOT.
@@ -146,13 +147,6 @@ def _cell_plain(value: float) -> str:
         return "-"
     s = _lakhs_abs(value)
     return f"-{s}" if value < 0 else s
-
-
-def _cell_growth(value) -> str:
-    """Growth % cell: None -> '-'; else signed 2 dp number (no % sign)."""
-    if value is None:
-        return "-"
-    return f"-{abs(value):.2f}" if value < 0 else f"{value:.2f}"
 
 
 # ── footer callback ───────────────────────────────────────────────────────────
@@ -359,79 +353,54 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
     day_tbl.setStyle(TableStyle(day_cmds))
     elements.append(day_tbl)
 
-    # ── Section 3: ANNUAL POSITION & CUMULATIVE COLLECTION ───────────────────
+    # ── Section 3: UP TO {prev_month} ────────────────────────────────────────
+    # Mirrors the Reports-section Monthly Collection PDF (iravi-ui
+    # MonthlyCollection.tsx, annualPositionHtml): a plain 4-column table
+    # STATE | {prev_fy} | {cur_fy} | DIFF. Actual Collections / Annual Target /
+    # GROWTH % are not rendered (the payload still carries those keys).
     ap_data       = data["annual_position"]
     prev_fy_label = ap_data["prev_fy_label"]
     cur_fy_label  = ap_data["cur_fy_label"]
     prev_m_full   = ap_data["prev_month_label_full"]
-    actual_prev   = ap_data["actual_collections_prev_fy"]
-    target_cur    = ap_data["annual_target_cur_fy"]
     utp           = ap_data["upto_prev_month"]
 
-    elements.append(Paragraph(
-        f"ANNUAL POSITION &amp; CUMULATIVE COLLECTION (UP TO {prev_m_full})", section_style,
-    ))
+    elements.append(Paragraph(f"UP TO {prev_m_full}", section_style))
 
     state_w = 1.8 * cm
-    ap_val_w = (_CONTENT_W - state_w) / 6
-    ap_col_w = [state_w] + [ap_val_w] * 6
+    ap_val_w = (_CONTENT_W - state_w) / 3
+    ap_col_w = [state_w] + [ap_val_w] * 3
 
-    ap_row0 = [
+    ap_rows = [[
         Paragraph("STATE", hdr_c),
-        Paragraph(f"Actual Collections {prev_fy_label}", hdr_c),
-        Paragraph(f"Annual Target {cur_fy_label}", hdr_c),
-        Paragraph(f"UP TO {prev_m_full}", hdr_c),
-        "", "", "",
-    ]
-    ap_row1 = [
-        "", "", "",
         Paragraph(prev_fy_label, hdr_c),
         Paragraph(cur_fy_label, hdr_c),
         Paragraph("DIFF", hdr_c),
-        Paragraph("GROWTH %", hdr_c),
-    ]
+    ]]
 
-    def _ap_data_row(label, actual_v, target_v, utp_prev_v, utp_cur_v, diff_v, growth_v):
+    def _ap_data_row(label, utp_prev_v, utp_cur_v, diff_v):
+        is_tot = label == "SUB TOT"
         return [
-            Paragraph(label, tot_l if label == "SUB TOT" else dat_l),
-            Paragraph(_cell_plain(actual_v),  tot_c if label == "SUB TOT" else dat_c),
-            Paragraph(_cell_plain(target_v),  tot_c if label == "SUB TOT" else dat_c),
-            Paragraph(_cell_plain(utp_prev_v), tot_c if label == "SUB TOT" else dat_c),
-            Paragraph(_cell_plain(utp_cur_v),  tot_c if label == "SUB TOT" else dat_c),
-            Paragraph(_cell_plain(diff_v),     tot_c if label == "SUB TOT" else dat_c),
-            Paragraph(_cell_growth(growth_v),  tot_c if label == "SUB TOT" else dat_c),
+            Paragraph(label, tot_l if is_tot else dat_l),
+            Paragraph(_cell_plain(utp_prev_v), tot_c if is_tot else dat_c),
+            Paragraph(_cell_plain(utp_cur_v),  tot_c if is_tot else dat_c),
+            Paragraph(_cell_plain(diff_v),     tot_c if is_tot else dat_c),
         ]
 
-    ap_rows = [ap_row0, ap_row1]
-    ap_rows.append(_ap_data_row(
-        "AP", actual_prev["ap"], target_cur["ap"],
-        utp["prev_fy"]["ap"], utp["cur_fy"]["ap"],
-        utp["diff"]["ap"], utp["growth_pct"]["ap"],
-    ))
-    ap_rows.append(_ap_data_row(
-        "TS", actual_prev["ts"], target_cur["ts"],
-        utp["prev_fy"]["ts"], utp["cur_fy"]["ts"],
-        utp["diff"]["ts"], utp["growth_pct"]["ts"],
-    ))
+    ap_rows.append(_ap_data_row("AP", utp["prev_fy"]["ap"], utp["cur_fy"]["ap"], utp["diff"]["ap"]))
+    ap_rows.append(_ap_data_row("TS", utp["prev_fy"]["ts"], utp["cur_fy"]["ts"], utp["diff"]["ts"]))
     ap_subtot_idx = len(ap_rows)
     ap_rows.append(_ap_data_row(
-        "SUB TOT", actual_prev["total"], target_cur["total"],
-        utp["prev_fy"]["total"], utp["cur_fy"]["total"],
-        utp["diff"]["total"], utp["growth_pct"]["total"],
+        "SUB TOT", utp["prev_fy"]["total"], utp["cur_fy"]["total"], utp["diff"]["total"],
     ))
 
     ap_cmds = _base_tbl_cmds() + [
-        ("SPAN", (0, 0), (0, 1)),
-        ("SPAN", (1, 0), (1, 1)),
-        ("SPAN", (2, 0), (2, 1)),
-        ("SPAN", (3, 0), (6, 0)),
-        ("BACKGROUND", (0, 0), (-1, 1), _HEADER_COLOR),
+        ("BACKGROUND", (0, 0), (-1, 0), _HEADER_COLOR),
         ("BACKGROUND", (0, ap_subtot_idx), (-1, ap_subtot_idx), _TOTAL_BG_COLOR),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("ALIGN", (0, 2), (0, -1), "LEFT"),
+        ("ALIGN", (0, 1), (0, -1), "LEFT"),
     ]
 
-    ap_tbl = Table(ap_rows, colWidths=ap_col_w, repeatRows=2)
+    ap_tbl = Table(ap_rows, colWidths=ap_col_w, repeatRows=1)
     ap_tbl.setStyle(TableStyle(ap_cmds))
     elements.append(ap_tbl)
 
