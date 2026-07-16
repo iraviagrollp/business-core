@@ -576,14 +576,22 @@ def _po_validate(b):
     }
 
 
+def _fy_code(po_date_str: str) -> str:
+    """4-digit financial-year code for a YYYY-MM-DD date, e.g. 2026-07-16 -> '2627'
+    (FY Apr-Mar: 2026-04..2027-03 -> '2627')."""
+    d = datetime.strptime(po_date_str[:10], '%Y-%m-%d').date()
+    start = d.year if d.month >= 4 else d.year - 1
+    return f'{start % 100:02d}{(start + 1) % 100:02d}'
+
+
 def _po_create(event):
     b = _json_body(event)
     p = _po_validate(b)
     po_date = _s(b.get('po_date')) or date.today().isoformat()
-    yyyymmdd = po_date.replace('-', '')
+    fy = _fy_code(po_date)
 
-    # Compute the next per-day serial and insert atomically; retry on the rare race
-    # where two POs for the same day collide on (po_date, po_seq) / po_no.
+    # Compute the next per-FY serial and insert atomically; retry on the rare race
+    # where two POs in the same FY collide on (fy, po_seq) / po_no.
     conn = _get_db_conn()
     try:
         for _attempt in range(5):
@@ -591,19 +599,19 @@ def _po_create(event):
                 with conn.cursor() as cur:
                     cur.execute(
                         'SELECT COALESCE(MAX(po_seq), 0) + 1 FROM procurement.purchase_orders '
-                        'WHERE po_date = %s',
-                        (po_date,),
+                        'WHERE fy = %s',
+                        (fy,),
                     )
                     seq = cur.fetchone()[0]
-                    po_no = f'IAL/{yyyymmdd}/{seq}'
+                    po_no = f'IAL/{fy}/{seq}'
                     cur.execute(
                         'INSERT INTO procurement.purchase_orders '
-                        '(po_type, po_no, po_date, po_seq, supplier_company_id, product_technical_id, '
+                        '(po_type, po_no, po_date, fy, po_seq, supplier_company_id, product_technical_id, '
                         'quantity, quantity_unit, rate, gst_rate, terms, dispatch, transport, '
                         'bill_to_company_id, ship_to_company_id, signatory_id, note) '
-                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
                         (
-                            p['po_type'], po_no, po_date, seq, p['supplier_company_id'],
+                            p['po_type'], po_no, po_date, fy, seq, p['supplier_company_id'],
                             p['product_technical_id'], p['quantity'], p['quantity_unit'], p['rate'],
                             p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
                             p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
