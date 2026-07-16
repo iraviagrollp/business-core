@@ -421,9 +421,15 @@ def _technicals_delete(_id):
 
 # ── Supplier Companies ────────────────────────────────────────────────────────
 
+_COMPANY_COLS = (
+    'id, company_name, location, address_line1, address_line2, address_line3, '
+    'state, pin_code, gstin, is_active, created_at, updated_at'
+)
+
+
 def _companies_list():
     return _response(200, _query(
-        'SELECT id, company_name, location, is_active, created_at, updated_at '
+        f'SELECT {_COMPANY_COLS} '
         'FROM procurement.supplier_companies ORDER BY company_name'
     ))
 
@@ -434,9 +440,17 @@ def _companies_create(event):
     if not name:
         raise auth.AuthError('company_name is required', 400)
     row = _write(
-        'INSERT INTO procurement.supplier_companies (company_name, location, is_active) '
-        'VALUES (%s, %s, %s) RETURNING id, company_name, location, is_active, created_at, updated_at',
-        (name, _s(b.get('location')), bool(b.get('is_active', True))),
+        'INSERT INTO procurement.supplier_companies '
+        '(company_name, location, address_line1, address_line2, address_line3, '
+        'state, pin_code, gstin, is_active) '
+        'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) '
+        f'RETURNING {_COMPANY_COLS}',
+        (
+            name, _s(b.get('location')), _s(b.get('address_line1')),
+            _s(b.get('address_line2')), _s(b.get('address_line3')),
+            _s(b.get('state')), _s(b.get('pin_code')), _s(b.get('gstin')),
+            bool(b.get('is_active', True)),
+        ),
     )
     return _response(201, row)
 
@@ -447,9 +461,16 @@ def _companies_update(event, _id):
     if not name:
         raise auth.AuthError('company_name is required', 400)
     row = _write(
-        'UPDATE procurement.supplier_companies SET company_name=%s, location=%s, is_active=%s '
-        'WHERE id=%s RETURNING id, company_name, location, is_active, created_at, updated_at',
-        (name, _s(b.get('location')), bool(b.get('is_active', True)), _id),
+        'UPDATE procurement.supplier_companies SET '
+        'company_name=%s, location=%s, address_line1=%s, address_line2=%s, '
+        'address_line3=%s, state=%s, pin_code=%s, gstin=%s, is_active=%s '
+        f'WHERE id=%s RETURNING {_COMPANY_COLS}',
+        (
+            name, _s(b.get('location')), _s(b.get('address_line1')),
+            _s(b.get('address_line2')), _s(b.get('address_line3')),
+            _s(b.get('state')), _s(b.get('pin_code')), _s(b.get('gstin')),
+            bool(b.get('is_active', True)), _id,
+        ),
     )
     if row is None:
         return _response(404, {'error': 'Supplier company not found'})

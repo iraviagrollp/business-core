@@ -1353,6 +1353,11 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   Dates/Decimals JSON-serialized via a custom default. `py_compile` clean.
   DB: migrations `026_create_procurement_schema.sql` (schema + 5 tables), `027_add_procurement_screens.sql`
   (RBAC screen seeds `procurement.*`), `028_seed_procurement_data.sql` (seed from `IAL Enquiry.xlsx`).
+  **Supplier-company address extension (2026-07-16):** `_companies_list/create/update` now also
+  read/write `address_line1`, `address_line2`, `address_line3`, `state`, `pin_code`, `gstin`
+  (all nullable, via shared `_COMPANY_COLS`); legacy `location` retained in SELECT/INSERT/UPDATE
+  for back-compat. Requires **IaC migration `032_add_supplier_company_address.sql`** (additive
+  `ALTER TABLE procurement.supplier_companies ADD COLUMN ...`) applied via psql before deploy.
   UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.
