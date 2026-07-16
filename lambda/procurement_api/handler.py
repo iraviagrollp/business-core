@@ -150,6 +150,7 @@ def _route_data(event, method, path):
     # Collection roots and their {id} item routes.
     routes = {
         '/technicals': (_technicals_list, _technicals_create),
+        '/packaging-meta': (_packaging_meta_list, _packaging_meta_create),
         '/packagings': (_packagings_list, _packagings_create),
         '/supplier-companies': (_companies_list, _companies_create),
         '/suppliers': (_suppliers_list, _suppliers_create),
@@ -158,6 +159,7 @@ def _route_data(event, method, path):
     }
     item_routes = {
         '/technicals/': (_technicals_update, _technicals_delete),
+        '/packaging-meta/': (_packaging_meta_update, _packaging_meta_delete),
         '/packagings/': (_packagings_update, _packagings_delete),
         '/supplier-companies/': (_companies_update, _companies_delete),
         '/suppliers/': (_suppliers_update, _suppliers_delete),
@@ -421,19 +423,75 @@ def _technicals_delete(_id):
     return _response(200, {'deleted': _id})
 
 
-# ── Packagings (packaging sizes per brand) ────────────────────────────────────
+# ── Packaging Meta (master size lists per unit type) ──────────────────────────
+
+_VALID_UNIT_TYPES = ('KG', 'LTR')
+
+
+def _packaging_meta_list():
+    return _response(200, _query(
+        'SELECT id, unit_type, label, sort_order, is_active, created_at, updated_at '
+        'FROM procurement.packaging_meta ORDER BY unit_type, sort_order, label'
+    ))
+
+
+def _packaging_meta_create(event):
+    b = _json_body(event)
+    unit_type = (_s(b.get('unit_type')) or '').upper()
+    label = _s(b.get('label'))
+    if unit_type not in _VALID_UNIT_TYPES:
+        raise auth.AuthError('unit_type must be one of KG, LTR', 400)
+    if not label:
+        raise auth.AuthError('label is required', 400)
+    row = _write(
+        'INSERT INTO procurement.packaging_meta (unit_type, label, sort_order, is_active) '
+        'VALUES (%s, %s, %s, %s) '
+        'RETURNING id, unit_type, label, sort_order, is_active, created_at, updated_at',
+        (unit_type, label, _int(b.get('sort_order')) or 100, bool(b.get('is_active', True))),
+    )
+    return _response(201, row)
+
+
+def _packaging_meta_update(event, _id):
+    b = _json_body(event)
+    unit_type = (_s(b.get('unit_type')) or '').upper()
+    label = _s(b.get('label'))
+    if unit_type not in _VALID_UNIT_TYPES:
+        raise auth.AuthError('unit_type must be one of KG, LTR', 400)
+    if not label:
+        raise auth.AuthError('label is required', 400)
+    row = _write(
+        'UPDATE procurement.packaging_meta SET unit_type=%s, label=%s, sort_order=%s, is_active=%s '
+        'WHERE id=%s '
+        'RETURNING id, unit_type, label, sort_order, is_active, created_at, updated_at',
+        (unit_type, label, _int(b.get('sort_order')) or 100, bool(b.get('is_active', True)), _id),
+    )
+    if row is None:
+        return _response(404, {'error': 'Packaging size not found'})
+    return _response(200, row)
+
+
+def _packaging_meta_delete(_id):
+    if _delete('DELETE FROM procurement.packaging_meta WHERE id=%s', (_id,)) == 0:
+        return _response(404, {'error': 'Packaging size not found'})
+    return _response(200, {'deleted': _id})
+
+
+# ── Packagings (packaging sizes assigned per brand) ───────────────────────────
 
 _PACKAGING_SELECT = """
-    SELECT p.id, p.technical_id, t.brand_name, t.technical_name, p.packaging,
+    SELECT p.id, p.technical_id, t.brand_name, t.technical_name,
+           p.packaging_meta_id, m.unit_type, m.label AS packaging,
            p.is_active, p.created_at, p.updated_at
     FROM procurement.packagings p
     JOIN procurement.technicals t ON t.id = p.technical_id
+    JOIN procurement.packaging_meta m ON m.id = p.packaging_meta_id
 """
 
 
 def _packagings_list():
     return _response(200, _query(
-        _PACKAGING_SELECT + ' ORDER BY t.brand_name, t.technical_name, p.packaging'
+        _PACKAGING_SELECT + ' ORDER BY t.brand_name, t.technical_name, m.unit_type, m.sort_order'
     ))
 
 
@@ -445,15 +503,15 @@ def _packagings_get_one(_id):
 def _packagings_create(event):
     b = _json_body(event)
     technical_id = _int(b.get('technical_id'))
-    packaging = _s(b.get('packaging'))
+    packaging_meta_id = _int(b.get('packaging_meta_id'))
     if not technical_id:
         raise auth.AuthError('technical_id is required', 400)
-    if not packaging:
-        raise auth.AuthError('packaging is required', 400)
+    if not packaging_meta_id:
+        raise auth.AuthError('packaging_meta_id is required', 400)
     row = _write(
-        'INSERT INTO procurement.packagings (technical_id, packaging, is_active) '
+        'INSERT INTO procurement.packagings (technical_id, packaging_meta_id, is_active) '
         'VALUES (%s, %s, %s) RETURNING id',
-        (technical_id, packaging, bool(b.get('is_active', True))),
+        (technical_id, packaging_meta_id, bool(b.get('is_active', True))),
     )
     return _response(201, _packagings_get_one(row['id']))
 
@@ -461,15 +519,15 @@ def _packagings_create(event):
 def _packagings_update(event, _id):
     b = _json_body(event)
     technical_id = _int(b.get('technical_id'))
-    packaging = _s(b.get('packaging'))
+    packaging_meta_id = _int(b.get('packaging_meta_id'))
     if not technical_id:
         raise auth.AuthError('technical_id is required', 400)
-    if not packaging:
-        raise auth.AuthError('packaging is required', 400)
+    if not packaging_meta_id:
+        raise auth.AuthError('packaging_meta_id is required', 400)
     row = _write(
-        'UPDATE procurement.packagings SET technical_id=%s, packaging=%s, is_active=%s '
+        'UPDATE procurement.packagings SET technical_id=%s, packaging_meta_id=%s, is_active=%s '
         'WHERE id=%s RETURNING id',
-        (technical_id, packaging, bool(b.get('is_active', True)), _id),
+        (technical_id, packaging_meta_id, bool(b.get('is_active', True)), _id),
     )
     if row is None:
         return _response(404, {'error': 'Packaging not found'})
