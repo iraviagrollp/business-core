@@ -1345,7 +1345,7 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `app_roles` / `app_screens` tables using the SAME `JWT_SECRET_ARN`, so users are managed once in
   the dashboard's Access Control. `POST /auth/login` + `GET /auth/me` are public/token; every other
   route requires a valid bearer token (any authenticated user — per-screen authz is UI-only, phase 1).
-  CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`,
+  CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`, `/packagings`,
   `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc` + `PUT/DELETE /<resource>/{id}`.
   **No Redis** (low-volume write-heavy config data → straight to RDS). Env: `DB_SECRET_ARN`,
   `JWT_SECRET_ARN`. `requirements.txt` = psycopg2-binary (reuses the existing `api_deps` layer via
@@ -1358,6 +1358,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   (all nullable, via shared `_COMPANY_COLS`); legacy `location` retained in SELECT/INSERT/UPDATE
   for back-compat. Requires **IaC migration `032_add_supplier_company_address.sql`** (additive
   `ALTER TABLE procurement.supplier_companies ADD COLUMN ...`) applied via psql before deploy.
+  **Packagings CRUD (2026-07-16):** new `/packagings` resource (`_packagings_list/get_one/create/
+  update/delete`) — packaging sizes per brand. Rows FK to `procurement.technicals(id)` (the brand
+  carrier); list JOINs technicals to return `brand_name` + `technical_name` + `packaging`. Routes
+  added to both `routes`/`item_routes` dicts. Requires **IaC migration `033_create_procurement_
+  packagings.sql`** (table, `ON DELETE CASCADE` from technicals, unique `(technical_id, packaging)`)
+  + `034_add_procurement_packagings_screen.sql` (RBAC screen `procurement.packagings`) applied via
+  psql, and the 4 API Gateway routes in the `production/procurement/` module.
   UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.
