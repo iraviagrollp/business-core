@@ -1346,7 +1346,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   the dashboard's Access Control. `POST /auth/login` + `GET /auth/me` are public/token; every other
   route requires a valid bearer token (any authenticated user — per-screen authz is UI-only, phase 1).
   CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`, `/packaging-meta`,
-  `/packagings`, `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc` + `PUT/DELETE /<resource>/{id}`.
+  `/packagings`, `/signatory-authorities`, `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc`
+  + `PUT/DELETE /<resource>/{id}`.
   **No Redis** (low-volume write-heavy config data → straight to RDS). Env: `DB_SECRET_ARN`,
   `JWT_SECRET_ARN`. `requirements.txt` = psycopg2-binary (reuses the existing `api_deps` layer via
   IaC — no new CI layer step). ForeignKeyViolation on delete → 409 "in use"; UniqueViolation → 409.
@@ -1370,6 +1371,12 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   packaging_meta RESTRICT, unique `(technical_id, packaging_meta_id)`), `036_add_procurement_packaging_
   screens.sql` (screens `procurement.packaging_meta` + `procurement.packagings`) applied via psql,
   plus the 8 API Gateway routes in the `production/procurement/` module.
+  **Signatory Authorities CRUD (2026-07-16):** new `/signatory-authorities` resource
+  (`_signatories_list/create/update/delete`) — flat master (name required; title, department
+  nullable via shared `_SIGNATORY_COLS`; unique name). Routes added to `routes`/`item_routes`.
+  Requires **IaC migration `037_create_procurement_signatory_authorities.sql`** +
+  `038_add_procurement_signatory_authority_screen.sql` (RBAC screen `procurement.signatory_authorities`)
+  applied via psql, plus the 4 API Gateway routes in the `production/procurement/` module.
   UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.
