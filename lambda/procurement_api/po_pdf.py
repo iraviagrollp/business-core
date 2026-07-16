@@ -180,14 +180,14 @@ def _styles():
     # Sizes taken directly from the template (Liberation Sans → Helvetica, same metrics).
     def s(name, size, **kw):
         kw.setdefault('fontName', _BASE)
-        kw.setdefault('leading', size * 1.32)
+        kw.setdefault('leading', size * 1.4)
         return ParagraphStyle(name, fontSize=size, **kw)
     return {
         'company': s('company', 17, fontName=_BOLD, textColor=_GREEN, alignment=TA_CENTER, leading=20),
         'tagline': s('tagline', 8.2, fontName=_BOLD, textColor=_ORANGE, alignment=TA_CENTER, leading=11),
         'identity': s('identity', 7.5, textColor=_MUTED, alignment=TA_CENTER, leading=10),
         'potitle': s('potitle', 13.5, fontName=_BOLD, textColor=_GREEN, leading=16),
-        'seclabel': s('seclabel', 7.7, fontName=_BOLD, textColor=_GREEN),
+        'seclabel': s('seclabel', 9.5, fontName=_BOLD, textColor=_GREEN),
         'boxlabel': s('boxlabel', 8.4, fontName=_BOLD, textColor=_BODY),
         'boxval': s('boxval', 8.4, textColor=_BODY),
         'name': s('name', 9.8, fontName=_BOLD, textColor=_GREEN),
@@ -208,7 +208,7 @@ def _styles():
         'addr': s('addr', 8.1, textColor=_BODY),
         'ctlabel': s('ctlabel', 8.4, fontName=_BOLD, textColor=_GREEN),
         'ctval': s('ctval', 8.4, textColor=_BODY),
-        'tc': s('tc', 7.2, textColor=_MUTED, leading=9.2),
+        'tc': s('tc', 7.2, textColor=_MUTED, leading=9.4),
         'note': s('note', 8.2, textColor=_BODY),
         'sign': s('sign', 8.3, textColor=_BODY),
         'signr': s('signr', 8.3, textColor=_BODY, alignment=TA_RIGHT),
@@ -219,9 +219,9 @@ def _styles():
 
 def _section_label(text, st, width):
     """Green uppercase label with a hairline rule beneath (full width)."""
-    return [Spacer(1, 0.1 * cm),
+    return [Spacer(1, 0.24 * cm),
             Paragraph(text, st['seclabel']),
-            HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=1.5, spaceAfter=2)]
+            HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=2, spaceAfter=4)]
 
 
 def _draw_footer(canvas, doc):
@@ -229,11 +229,11 @@ def _draw_footer(canvas, doc):
     w = A4[0]
     canvas.setStrokeColor(_RULE)
     canvas.setLineWidth(0.6)
-    canvas.line(doc.leftMargin, 1.3 * cm, w - doc.rightMargin, 1.3 * cm)
+    canvas.line(doc.leftMargin, 1.15 * cm, w - doc.rightMargin, 1.15 * cm)
     canvas.setFont(_BASE, 7.5)
     canvas.setFillColor(_MUTED)
-    canvas.drawCentredString(w / 2, 0.98 * cm, _FOOTER_1)
-    canvas.drawCentredString(w / 2, 0.72 * cm, _FOOTER_2)
+    canvas.drawCentredString(w / 2, 0.84 * cm, _FOOTER_1)
+    canvas.drawCentredString(w / 2, 0.6 * cm, _FOOTER_2)
     canvas.restoreState()
 
 
@@ -290,7 +290,7 @@ def render_po_pdf(po: dict) -> bytes:
     buf = BytesIO()
     doc = BaseDocTemplate(
         buf, pagesize=A4,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.85 * cm, bottomMargin=1.15 * cm,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.7 * cm, bottomMargin=1.0 * cm,
         title=f'Purchase Order {po.get("po_no", "")}',
     )
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
@@ -442,10 +442,11 @@ def render_po_pdf(po: dict) -> bytes:
         flow.append(nb)
 
     # Signature.
-    flow.append(Spacer(1, 2))
+    flow.append(Spacer(1, 3))
     left_sig = [Paragraph('Thanking you,', st['sign']), Paragraph('Yours faithfully,', st['sign'])]
-    right_sig = [Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']), Spacer(1, 8),
-                 HRFlowable(width=6.5 * cm, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=3)]
+    right_sig = [Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']),
+                 Spacer(1, 22),  # room for a physical signature
+                 HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4)]
     if po.get('signatory_name'):
         right_sig.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
     sub = ' — '.join(_esc(po[k]) for k in ('signatory_title', 'signatory_department') if po.get(k))
