@@ -1346,8 +1346,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   the dashboard's Access Control. `POST /auth/login` + `GET /auth/me` are public/token; every other
   route requires a valid bearer token (any authenticated user — per-screen authz is UI-only, phase 1).
   CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`, `/packaging-meta`,
-  `/packagings`, `/signatory-authorities`, `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc`
-  + `PUT/DELETE /<resource>/{id}`.
+  `/packagings`, `/signatory-authorities`, `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc`,
+  `/purchase-orders` + `PUT/DELETE /<resource>/{id}`, plus `GET /purchase-orders/{id}/pdf`.
   **No Redis** (low-volume write-heavy config data → straight to RDS). Env: `DB_SECRET_ARN`,
   `JWT_SECRET_ARN`. `requirements.txt` = psycopg2-binary (reuses the existing `api_deps` layer via
   IaC — no new CI layer step). ForeignKeyViolation on delete → 409 "in use"; UniqueViolation → 409.
@@ -1377,6 +1377,22 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   Requires **IaC migration `037_create_procurement_signatory_authorities.sql`** +
   `038_add_procurement_signatory_authority_screen.sql` (RBAC screen `procurement.signatory_authorities`)
   applied via psql, plus the 4 API Gateway routes in the `production/procurement/` module.
+  **Purchase Orders (Bulk) + PDF export (2026-07-16):** new `/purchase-orders` resource
+  (`_po_list/get_one/create/update/delete`) + `GET /purchase-orders/{id}/pdf`. `_PO_SELECT` joins
+  supplier / bill-to / ship-to `supplier_companies` (renders their address+GSTIN), the product
+  `technicals`, and `signatory_authorities`. **PO number** generated server-side as
+  `IAL/{YYYYMMDD of po_date}/{po_seq}` — `_po_create` computes `MAX(po_seq)+1` for the date and inserts
+  atomically, retrying on `UniqueViolation` (guarded by unique `(po_date, po_seq)` + unique `po_no`);
+  po_no/po_date/po_seq are immutable on update. New `po_pdf.py` renders a single-page A4 PDF with
+  reportlab (Helvetica + "Rs.", no ₹/fonts) styled like the Customer Ledger Statement export
+  (centered letterhead, field rows, two-column Bill/Ship table, yellow-highlighted note, signature
+  block, Kukatpally footer). Binary response via new `_pdf_response` helper (`isBase64Encoded`).
+  `requirements.txt` adds `reportlab==4.2.2` (provided at runtime by the shared reportlab layer —
+  IaC reuses `alerts_evaluator_deps`; not packaged from procurement's requirements). Requires **IaC
+  migrations** `039_create_procurement_purchase_orders.sql` + `040_add_procurement_purchase_order_screen.sql`,
+  the 5 API Gateway routes, and the reportlab layer attached to the procurement Lambda (all in the
+  `production/procurement/` module). Verified: `py_compile` clean; `render_po_pdf` smoke-tested against
+  a representative row (rasterized page visually matches the reference PO).
   UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.

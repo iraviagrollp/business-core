@@ -16,9 +16,11 @@ Company configuration, Enquiries, PDC) plus reuse of the shared RBAC login.
 Env vars: DB_SECRET_ARN, JWT_SECRET_ARN.
 """
 
+import base64
 import json
 import logging
 import os
+import re
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -61,6 +63,18 @@ def _response(status: int, body) -> dict:
         'statusCode': status,
         'headers': {'Content-Type': 'application/json'},
         'body': json.dumps(body, default=_ser),
+    }
+
+
+def _pdf_response(pdf_bytes: bytes, filename: str) -> dict:
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': f'attachment; filename="{filename}"',
+        },
+        'body': base64.b64encode(pdf_bytes).decode('ascii'),
+        'isBase64Encoded': True,
     }
 
 
@@ -147,6 +161,14 @@ def _route_data(event, method, path):
             return _overview()
         return _response(405, {'error': 'Method not allowed'})
 
+    # Purchase Order PDF export — GET /purchase-orders/{id}/pdf (before the generic
+    # item-route loop, which only handles PUT/DELETE on /<resource>/{id}).
+    pdf_m = re.match(r'^/purchase-orders/(\d+)/pdf$', path)
+    if pdf_m:
+        if method == 'GET':
+            return _po_pdf(int(pdf_m.group(1)))
+        return _response(405, {'error': 'Method not allowed'})
+
     # Collection roots and their {id} item routes.
     routes = {
         '/technicals': (_technicals_list, _technicals_create),
@@ -157,6 +179,7 @@ def _route_data(event, method, path):
         '/enquiries': (_enquiries_list, _enquiries_create),
         '/pdc': (_pdc_list, _pdc_create),
         '/signatory-authorities': (_signatories_list, _signatories_create),
+        '/purchase-orders': (_po_list, _po_create),
     }
     item_routes = {
         '/technicals/': (_technicals_update, _technicals_delete),
@@ -167,6 +190,7 @@ def _route_data(event, method, path):
         '/enquiries/': (_enquiries_update, _enquiries_delete),
         '/pdc/': (_pdc_update, _pdc_delete),
         '/signatory-authorities/': (_signatories_update, _signatories_delete),
+        '/purchase-orders/': (_po_update, _po_delete),
     }
 
     if path in routes:
@@ -469,6 +493,162 @@ def _signatories_delete(_id):
     if _delete('DELETE FROM procurement.signatory_authorities WHERE id=%s', (_id,)) == 0:
         return _response(404, {'error': 'Signatory authority not found'})
     return _response(200, {'deleted': _id})
+
+
+# ── Purchase Orders (Bulk) ────────────────────────────────────────────────────
+
+# Full row + joined display fields for supplier / bill-to / ship-to companies,
+# the product technical, and the signatory.
+_PO_SELECT = """
+    SELECT
+      po.id, po.po_type, po.po_no, po.po_date, po.po_seq,
+      po.supplier_company_id, sc.company_name  AS supplier_company_name,
+      sc.address_line1 AS supplier_address_line1, sc.address_line2 AS supplier_address_line2,
+      sc.address_line3 AS supplier_address_line3, sc.state AS supplier_state,
+      sc.pin_code AS supplier_pin_code, sc.gstin AS supplier_gstin,
+      po.product_technical_id, t.technical_name, t.brand_name,
+      po.quantity, po.quantity_unit, po.price, po.gst, po.terms, po.dispatch, po.transport,
+      po.bill_to_company_id, bc.company_name AS bill_to_company_name,
+      bc.address_line1 AS bill_to_address_line1, bc.address_line2 AS bill_to_address_line2,
+      bc.address_line3 AS bill_to_address_line3, bc.state AS bill_to_state,
+      bc.pin_code AS bill_to_pin_code, bc.gstin AS bill_to_gstin,
+      po.ship_to_company_id, pc.company_name AS ship_to_company_name,
+      pc.address_line1 AS ship_to_address_line1, pc.address_line2 AS ship_to_address_line2,
+      pc.address_line3 AS ship_to_address_line3, pc.state AS ship_to_state,
+      pc.pin_code AS ship_to_pin_code, pc.gstin AS ship_to_gstin,
+      po.signatory_id, sa.name AS signatory_name, sa.title AS signatory_title,
+      sa.department AS signatory_department,
+      po.note, po.created_at, po.updated_at
+    FROM procurement.purchase_orders po
+    JOIN procurement.supplier_companies sc ON sc.id = po.supplier_company_id
+    JOIN procurement.technicals t          ON t.id = po.product_technical_id
+    LEFT JOIN procurement.supplier_companies bc ON bc.id = po.bill_to_company_id
+    LEFT JOIN procurement.supplier_companies pc ON pc.id = po.ship_to_company_id
+    LEFT JOIN procurement.signatory_authorities sa ON sa.id = po.signatory_id
+"""
+
+_VALID_QTY_UNITS = ('KGS', 'LTRS')
+
+
+def _po_list():
+    return _response(200, _query(_PO_SELECT + ' ORDER BY po.po_date DESC, po.po_seq DESC'))
+
+
+def _po_get_one(_id):
+    rows = _query(_PO_SELECT + ' WHERE po.id = %s', (_id,))
+    return rows[0] if rows else None
+
+
+def _po_validate(b):
+    """Validate + coerce the shared PO fields. Returns a params dict (no po_no/seq)."""
+    supplier_company_id = _int(b.get('supplier_company_id'))
+    product_technical_id = _int(b.get('product_technical_id'))
+    quantity = _num(b.get('quantity'))
+    unit = (_s(b.get('quantity_unit')) or '').upper()
+    if not supplier_company_id:
+        raise auth.AuthError('supplier_company_id is required', 400)
+    if not product_technical_id:
+        raise auth.AuthError('product_technical_id is required', 400)
+    if quantity is None:
+        raise auth.AuthError('quantity is required', 400)
+    if unit not in _VALID_QTY_UNITS:
+        raise auth.AuthError('quantity_unit must be one of KGS, LTRS', 400)
+    return {
+        'supplier_company_id': supplier_company_id,
+        'product_technical_id': product_technical_id,
+        'quantity': quantity,
+        'quantity_unit': unit,
+        'price': _s(b.get('price')),
+        'gst': _s(b.get('gst')) or '18%',
+        'terms': _s(b.get('terms')),
+        'dispatch': _s(b.get('dispatch')),
+        'transport': _s(b.get('transport')),
+        'bill_to_company_id': _int(b.get('bill_to_company_id')),
+        'ship_to_company_id': _int(b.get('ship_to_company_id')),
+        'signatory_id': _int(b.get('signatory_id')),
+        'note': _s(b.get('note')),
+        'po_type': (_s(b.get('po_type')) or 'BULK').upper(),
+    }
+
+
+def _po_create(event):
+    b = _json_body(event)
+    p = _po_validate(b)
+    po_date = _s(b.get('po_date')) or date.today().isoformat()
+    yyyymmdd = po_date.replace('-', '')
+
+    # Compute the next per-day serial and insert atomically; retry on the rare race
+    # where two POs for the same day collide on (po_date, po_seq) / po_no.
+    conn = _get_db_conn()
+    try:
+        for _attempt in range(5):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'SELECT COALESCE(MAX(po_seq), 0) + 1 FROM procurement.purchase_orders '
+                        'WHERE po_date = %s',
+                        (po_date,),
+                    )
+                    seq = cur.fetchone()[0]
+                    po_no = f'IAL/{yyyymmdd}/{seq}'
+                    cur.execute(
+                        'INSERT INTO procurement.purchase_orders '
+                        '(po_type, po_no, po_date, po_seq, supplier_company_id, product_technical_id, '
+                        'quantity, quantity_unit, price, gst, terms, dispatch, transport, '
+                        'bill_to_company_id, ship_to_company_id, signatory_id, note) '
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
+                        (
+                            p['po_type'], po_no, po_date, seq, p['supplier_company_id'],
+                            p['product_technical_id'], p['quantity'], p['quantity_unit'], p['price'],
+                            p['gst'], p['terms'], p['dispatch'], p['transport'],
+                            p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
+                        ),
+                    )
+                    new_id = cur.fetchone()[0]
+                conn.commit()
+                return _response(201, _po_get_one(new_id))
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()  # another PO grabbed this serial — recompute and retry
+        raise auth.AuthError('Could not allocate a PO number, please retry', 409)
+    finally:
+        conn.close()
+
+
+def _po_update(event, _id):
+    b = _json_body(event)
+    p = _po_validate(b)
+    # po_no / po_date / po_seq are immutable once created — only the content changes.
+    row = _write(
+        'UPDATE procurement.purchase_orders SET '
+        'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
+        'price=%s, gst=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
+        'ship_to_company_id=%s, signatory_id=%s, note=%s '
+        'WHERE id=%s RETURNING id',
+        (
+            p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
+            p['quantity_unit'], p['price'], p['gst'], p['terms'], p['dispatch'], p['transport'],
+            p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'], _id,
+        ),
+    )
+    if row is None:
+        return _response(404, {'error': 'Purchase order not found'})
+    return _response(200, _po_get_one(_id))
+
+
+def _po_delete(_id):
+    if _delete('DELETE FROM procurement.purchase_orders WHERE id=%s', (_id,)) == 0:
+        return _response(404, {'error': 'Purchase order not found'})
+    return _response(200, {'deleted': _id})
+
+
+def _po_pdf(_id):
+    po = _po_get_one(_id)
+    if po is None:
+        return _response(404, {'error': 'Purchase order not found'})
+    import po_pdf  # local import so a reportlab issue never breaks the CRUD routes
+    pdf_bytes = po_pdf.render_po_pdf(po)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', po.get('po_no') or f'PO_{_id}')
+    return _pdf_response(pdf_bytes, f'{safe}.pdf')
 
 
 # ── Packaging Meta (master size lists per unit type) ──────────────────────────
