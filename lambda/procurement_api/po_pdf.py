@@ -208,7 +208,7 @@ def _styles():
         'addr': s('addr', 8.1, textColor=_BODY),
         'ctlabel': s('ctlabel', 8.4, fontName=_BOLD, textColor=_GREEN),
         'ctval': s('ctval', 8.4, textColor=_BODY),
-        'tc': s('tc', 7.2, textColor=_MUTED, leading=8.6),
+        'tc': s('tc', 7.2, textColor=_MUTED, leading=8),
         'note': s('note', 8.2, textColor=_BODY),
         'sign': s('sign', 8.3, textColor=_BODY),
         'signr': s('signr', 8.3, textColor=_BODY, alignment=TA_RIGHT),
@@ -219,7 +219,7 @@ def _styles():
 
 def _section_label(text, st, width):
     """Green uppercase label with a hairline rule beneath (full width)."""
-    return [Spacer(1, 0.16 * cm),
+    return [Spacer(1, 0.11 * cm),
             Paragraph(text, st['seclabel']),
             HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=2, spaceAfter=4)]
 
@@ -458,12 +458,12 @@ def render_po_pdf(po: dict) -> bytes:
 
     # Signature — stacked vertically so "For IRAVI AGRO LIFE LLP" sits on its own line
     # below the salutation, with room to sign; title and department on separate lines.
-    flow.append(Spacer(1, 4))
+    flow.append(Spacer(1, 3))
     flow.append(Paragraph('Thanking you,', st['sign']))
     flow.append(Paragraph('Yours faithfully,', st['sign']))
-    flow.append(Spacer(1, 8))
+    flow.append(Spacer(1, 6))
     flow.append(Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']))
-    flow.append(Spacer(1, 8))  # room for a physical signature
+    flow.append(Spacer(1, 30))  # room for a physical signature
     flow.append(HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4))
     if po.get('signatory_name'):
         flow.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
