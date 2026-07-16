@@ -180,7 +180,7 @@ def _styles():
     # Sizes taken directly from the template (Liberation Sans → Helvetica, same metrics).
     def s(name, size, **kw):
         kw.setdefault('fontName', _BASE)
-        kw.setdefault('leading', size * 1.4)
+        kw.setdefault('leading', size * 1.34)
         return ParagraphStyle(name, fontSize=size, **kw)
     return {
         'company': s('company', 17, fontName=_BOLD, textColor=_GREEN, alignment=TA_CENTER, leading=20),
@@ -208,7 +208,7 @@ def _styles():
         'addr': s('addr', 8.1, textColor=_BODY),
         'ctlabel': s('ctlabel', 8.4, fontName=_BOLD, textColor=_GREEN),
         'ctval': s('ctval', 8.4, textColor=_BODY),
-        'tc': s('tc', 7.2, textColor=_MUTED, leading=9),
+        'tc': s('tc', 7.2, textColor=_MUTED, leading=8.6),
         'note': s('note', 8.2, textColor=_BODY),
         'sign': s('sign', 8.3, textColor=_BODY),
         'signr': s('signr', 8.3, textColor=_BODY, alignment=TA_RIGHT),
@@ -219,7 +219,7 @@ def _styles():
 
 def _section_label(text, st, width):
     """Green uppercase label with a hairline rule beneath (full width)."""
-    return [Spacer(1, 0.2 * cm),
+    return [Spacer(1, 0.16 * cm),
             Paragraph(text, st['seclabel']),
             HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=2, spaceAfter=4)]
 
@@ -317,17 +317,27 @@ def render_po_pdf(po: dict) -> bytes:
                               ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
     flow.append(trow)
 
-    # Vendor / Supplier.
+    # Vendor / Supplier — boxed so it reads as a distinct unit, separate from the
+    # salutation below.
     flow += _section_label('VENDOR / SUPPLIER', st, dw)
-    flow.append(Paragraph(_esc(po.get('supplier_company_name')), st['name']))
+    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
     sup_lines = [po.get(k) for k in ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
     if sup_lines:
-        flow.append(Paragraph(', '.join(_esc(x) for x in sup_lines), st['body']))
+        ven.append(Paragraph(', '.join(_esc(x) for x in sup_lines), st['body']))
     if po.get('supplier_gstin'):
-        flow.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
+        ven.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
+    vbox = Table([[ven]], colWidths=[dw])
+    vbox.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    flow.append(vbox)
 
     # Salutation + body.
-    flow.append(Spacer(1, 9))
+    flow.append(Spacer(1, 11))
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
     body = (f'We are pleased to place the following order with you, on the terms set out below. Please '

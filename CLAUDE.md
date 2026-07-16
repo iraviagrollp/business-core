@@ -1389,7 +1389,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   and `total_value` (rounded) — `_po_validate` was updated from the old free-text `price`/`gst` to
   numeric `rate`/`gst_rate`.
   **`po_pdf.py` — formal IAL house design (rewritten 2026-07-16 to match `IAL_PO_..._formal_2.pdf`):**
-  single-page A4 with a two-tone letterhead (IAL logo + centered "IRAVI AGRO LIFE LLP" + orange
+  single-page A4 (spacing-tuned to fit, with a boxed VENDOR/SUPPLIER block and a fluorescent-
+  highlighted note) — a two-tone letterhead (IAL logo + centered "IRAVI AGRO LIFE LLP" + orange
   tagline "Nurturing Life, Protecting the Harvest" + GSTIN/LLPIN/email/website line, green+orange
   rules), a "PURCHASE ORDER" title with a PO Number/Date box, green **ORDER DETAILS** goods table
   (SL/DESCRIPTION/QUANTITY/UOM/RATE ₹/AMOUNT ₹), a Taxable/GST/Total block + **amount-in-words**
