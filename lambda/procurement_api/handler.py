@@ -156,6 +156,7 @@ def _route_data(event, method, path):
         '/suppliers': (_suppliers_list, _suppliers_create),
         '/enquiries': (_enquiries_list, _enquiries_create),
         '/pdc': (_pdc_list, _pdc_create),
+        '/signatory-authorities': (_signatories_list, _signatories_create),
     }
     item_routes = {
         '/technicals/': (_technicals_update, _technicals_delete),
@@ -165,6 +166,7 @@ def _route_data(event, method, path):
         '/suppliers/': (_suppliers_update, _suppliers_delete),
         '/enquiries/': (_enquiries_update, _enquiries_delete),
         '/pdc/': (_pdc_update, _pdc_delete),
+        '/signatory-authorities/': (_signatories_update, _signatories_delete),
     }
 
     if path in routes:
@@ -420,6 +422,52 @@ def _technicals_update(event, _id):
 def _technicals_delete(_id):
     if _delete('DELETE FROM procurement.technicals WHERE id=%s', (_id,)) == 0:
         return _response(404, {'error': 'Technical not found'})
+    return _response(200, {'deleted': _id})
+
+
+# ── Signatory Authorities ─────────────────────────────────────────────────────
+
+_SIGNATORY_COLS = 'id, name, title, department, is_active, created_at, updated_at'
+
+
+def _signatories_list():
+    return _response(200, _query(
+        f'SELECT {_SIGNATORY_COLS} '
+        'FROM procurement.signatory_authorities ORDER BY name'
+    ))
+
+
+def _signatories_create(event):
+    b = _json_body(event)
+    name = _s(b.get('name'))
+    if not name:
+        raise auth.AuthError('name is required', 400)
+    row = _write(
+        'INSERT INTO procurement.signatory_authorities (name, title, department, is_active) '
+        f'VALUES (%s, %s, %s, %s) RETURNING {_SIGNATORY_COLS}',
+        (name, _s(b.get('title')), _s(b.get('department')), bool(b.get('is_active', True))),
+    )
+    return _response(201, row)
+
+
+def _signatories_update(event, _id):
+    b = _json_body(event)
+    name = _s(b.get('name'))
+    if not name:
+        raise auth.AuthError('name is required', 400)
+    row = _write(
+        'UPDATE procurement.signatory_authorities SET name=%s, title=%s, department=%s, is_active=%s '
+        f'WHERE id=%s RETURNING {_SIGNATORY_COLS}',
+        (name, _s(b.get('title')), _s(b.get('department')), bool(b.get('is_active', True)), _id),
+    )
+    if row is None:
+        return _response(404, {'error': 'Signatory authority not found'})
+    return _response(200, row)
+
+
+def _signatories_delete(_id):
+    if _delete('DELETE FROM procurement.signatory_authorities WHERE id=%s', (_id,)) == 0:
+        return _response(404, {'error': 'Signatory authority not found'})
     return _response(200, {'deleted': _id})
 
 
