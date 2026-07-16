@@ -1345,8 +1345,8 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `app_roles` / `app_screens` tables using the SAME `JWT_SECRET_ARN`, so users are managed once in
   the dashboard's Access Control. `POST /auth/login` + `GET /auth/me` are public/token; every other
   route requires a valid bearer token (any authenticated user — per-screen authz is UI-only, phase 1).
-  CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`, `/packagings`,
-  `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc` + `PUT/DELETE /<resource>/{id}`.
+  CRUD over the `procurement.*` schema (migration 026): `GET/POST /technicals`, `/packaging-meta`,
+  `/packagings`, `/supplier-companies`, `/suppliers`, `/enquiries`, `/pdc` + `PUT/DELETE /<resource>/{id}`.
   **No Redis** (low-volume write-heavy config data → straight to RDS). Env: `DB_SECRET_ARN`,
   `JWT_SECRET_ARN`. `requirements.txt` = psycopg2-binary (reuses the existing `api_deps` layer via
   IaC — no new CI layer step). ForeignKeyViolation on delete → 409 "in use"; UniqueViolation → 409.
@@ -1358,13 +1358,18 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   (all nullable, via shared `_COMPANY_COLS`); legacy `location` retained in SELECT/INSERT/UPDATE
   for back-compat. Requires **IaC migration `032_add_supplier_company_address.sql`** (additive
   `ALTER TABLE procurement.supplier_companies ADD COLUMN ...`) applied via psql before deploy.
-  **Packagings CRUD (2026-07-16):** new `/packagings` resource (`_packagings_list/get_one/create/
-  update/delete`) — packaging sizes per brand. Rows FK to `procurement.technicals(id)` (the brand
-  carrier); list JOINs technicals to return `brand_name` + `technical_name` + `packaging`. Routes
-  added to both `routes`/`item_routes` dicts. Requires **IaC migration `033_create_procurement_
-  packagings.sql`** (table, `ON DELETE CASCADE` from technicals, unique `(technical_id, packaging)`)
-  + `034_add_procurement_packagings_screen.sql` (RBAC screen `procurement.packagings`) applied via
-  psql, and the 4 API Gateway routes in the `production/procurement/` module.
+  **Packaging Meta + Packagings CRUD (2026-07-16):** two resources.
+  `/packaging-meta` (`_packaging_meta_list/create/update/delete`) is the master size list per unit
+  type — `unit_type` in (`KG`,`LTR`), `label` (verbatim report string), `sort_order`, `is_active`;
+  server validates `unit_type`. `/packagings` (`_packagings_list/get_one/create/update/delete`)
+  assigns a size to a brand: rows FK `technical_id` → technicals (brand carrier) + `packaging_meta_id`
+  → packaging_meta; the list JOINs both to return `brand_name`, `technical_name`, `unit_type`, and
+  `packaging` (the meta label). Routes for both added to `routes`/`item_routes`. Requires **IaC
+  migrations** `033_create_procurement_packaging_meta.sql`, `034_seed_procurement_packaging_meta.sql`
+  (KG+LTR sizes from the stock PDF), `035_create_procurement_packagings.sql` (FK technicals CASCADE +
+  packaging_meta RESTRICT, unique `(technical_id, packaging_meta_id)`), `036_add_procurement_packaging_
+  screens.sql` (screens `procurement.packaging_meta` + `procurement.packagings`) applied via psql,
+  plus the 8 API Gateway routes in the `production/procurement/` module.
   UI: `procurement-ui` repo. **IaC needed (done):** `production/procurement/` module (Lambda + API GW +
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.
