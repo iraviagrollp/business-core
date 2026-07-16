@@ -1383,13 +1383,21 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `technicals`, and `signatory_authorities`. **PO number** generated server-side as
   `IAL/{YYYYMMDD of po_date}/{po_seq}` — `_po_create` computes `MAX(po_seq)+1` for the date and inserts
   atomically, retrying on `UniqueViolation` (guarded by unique `(po_date, po_seq)` + unique `po_no`);
-  po_no/po_date/po_seq are immutable on update. New `po_pdf.py` renders a single-page A4 PDF with
-  reportlab (Helvetica + "Rs.", no ₹/fonts) in the Customer Ledger Statement house style: **IAL logo
-  top-left** (`ial-logo.png` bundled in this dir — ships in the archive_file zip, graceful fallback if
-  absent), "IRAVI AGRO LIFE LLP" centered + "PURCHASE ORDER" subtitle, field rows, a two-column
-  Bill/Ship table with a **dark-green `#1a3c2b` header band (white text)**, yellow-highlighted note,
-  signature block, and a **ruled gray Kukatpally footer**. Binary response via new `_pdf_response`
-  helper (`isBase64Encoded`).
+  po_no/po_date/po_seq are immutable on update. **Amounts are computed:** the PO stores numeric
+  `rate` (₹/unit) + `gst_rate` (%), and `_PO_SELECT` returns `amount` (= qty×rate), `gst_amount`,
+  and `total_value` (rounded) — `_po_validate` was updated from the old free-text `price`/`gst` to
+  numeric `rate`/`gst_rate`.
+  **`po_pdf.py` — formal IAL house design (rewritten 2026-07-16 to match `IAL_PO_..._formal_2.pdf`):**
+  single-page A4 with a two-tone letterhead (IAL logo + centered "IRAVI AGRO LIFE LLP" + orange
+  tagline "Nurturing Life, Protecting the Harvest" + GSTIN/LLPIN/email/website line, green+orange
+  rules), a "PURCHASE ORDER" title with a PO Number/Date box, green **ORDER DETAILS** goods table
+  (SL/DESCRIPTION/QUANTITY/UOM/RATE ₹/AMOUNT ₹), a Taxable/GST/Total block + **amount-in-words**
+  (Indian numbering, computed in-module), BILL TO / SHIP TO, a **COMMERCIAL TERMS** table, seven
+  standard **TERMS & CONDITIONS**, a peach highlighted note, signature block and registered-office
+  footer. Palette green `#17452f` / orange `#c8641e`. **DejaVuSans + DejaVuSans-Bold are bundled**
+  in this dir (ship in the zip) so the **₹** glyph renders via `registerFontFamily`; falls back to
+  Helvetica + "Rs." if the TTFs are absent. `ial-logo.png` also bundled. Layout is spacing-tuned to
+  fit one page (leading 1.18). Binary response via new `_pdf_response` helper (`isBase64Encoded`).
   `requirements.txt` adds `reportlab==4.2.2` (provided at runtime by the shared reportlab layer —
   IaC reuses `alerts_evaluator_deps`; not packaged from procurement's requirements). Requires **IaC
   migrations** `039_create_procurement_purchase_orders.sql` + `040_add_procurement_purchase_order_screen.sql`,

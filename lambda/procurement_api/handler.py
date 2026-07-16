@@ -507,7 +507,11 @@ _PO_SELECT = """
       sc.address_line3 AS supplier_address_line3, sc.state AS supplier_state,
       sc.pin_code AS supplier_pin_code, sc.gstin AS supplier_gstin,
       po.product_technical_id, t.technical_name, t.brand_name,
-      po.quantity, po.quantity_unit, po.price, po.gst, po.terms, po.dispatch, po.transport,
+      po.quantity, po.quantity_unit, po.rate, po.gst_rate,
+      ROUND(po.quantity * po.rate, 2)                          AS amount,
+      ROUND(po.quantity * po.rate * po.gst_rate / 100.0, 2)    AS gst_amount,
+      ROUND(po.quantity * po.rate * (1 + po.gst_rate / 100.0), 2) AS total_value,
+      po.terms, po.dispatch, po.transport,
       po.bill_to_company_id, bc.company_name AS bill_to_company_name,
       bc.address_line1 AS bill_to_address_line1, bc.address_line2 AS bill_to_address_line2,
       bc.address_line3 AS bill_to_address_line3, bc.state AS bill_to_state,
@@ -553,13 +557,14 @@ def _po_validate(b):
         raise auth.AuthError('quantity is required', 400)
     if unit not in _VALID_QTY_UNITS:
         raise auth.AuthError('quantity_unit must be one of KGS, LTRS', 400)
+    gst_rate = _num(b.get('gst_rate'))
     return {
         'supplier_company_id': supplier_company_id,
         'product_technical_id': product_technical_id,
         'quantity': quantity,
         'quantity_unit': unit,
-        'price': _s(b.get('price')),
-        'gst': _s(b.get('gst')) or '18%',
+        'rate': _num(b.get('rate')) or 0,
+        'gst_rate': gst_rate if gst_rate is not None else 18,
         'terms': _s(b.get('terms')),
         'dispatch': _s(b.get('dispatch')),
         'transport': _s(b.get('transport')),
@@ -594,13 +599,13 @@ def _po_create(event):
                     cur.execute(
                         'INSERT INTO procurement.purchase_orders '
                         '(po_type, po_no, po_date, po_seq, supplier_company_id, product_technical_id, '
-                        'quantity, quantity_unit, price, gst, terms, dispatch, transport, '
+                        'quantity, quantity_unit, rate, gst_rate, terms, dispatch, transport, '
                         'bill_to_company_id, ship_to_company_id, signatory_id, note) '
                         'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
                         (
                             p['po_type'], po_no, po_date, seq, p['supplier_company_id'],
-                            p['product_technical_id'], p['quantity'], p['quantity_unit'], p['price'],
-                            p['gst'], p['terms'], p['dispatch'], p['transport'],
+                            p['product_technical_id'], p['quantity'], p['quantity_unit'], p['rate'],
+                            p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
                             p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
                         ),
                     )
@@ -621,12 +626,12 @@ def _po_update(event, _id):
     row = _write(
         'UPDATE procurement.purchase_orders SET '
         'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
-        'price=%s, gst=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
+        'rate=%s, gst_rate=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
         'ship_to_company_id=%s, signatory_id=%s, note=%s '
         'WHERE id=%s RETURNING id',
         (
             p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
-            p['quantity_unit'], p['price'], p['gst'], p['terms'], p['dispatch'], p['transport'],
+            p['quantity_unit'], p['rate'], p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
             p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'], _id,
         ),
     )
