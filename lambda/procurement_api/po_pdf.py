@@ -59,8 +59,6 @@ _TERMS = [
     "material is liable to be rejected and returned at the vendor's cost.",
     "Technical grade standards and a batch-wise Certificate of Analysis must accompany every invoice; "
     "invoices received without them will not be processed for payment.",
-    "This order number must be quoted on all invoices, delivery challans, e-way bills, packing lists "
-    "and correspondence.",
     "Quantity supplied shall not exceed the ordered quantity without prior written approval; short or "
     "excess supplies will be adjusted against the invoice value.",
     "Delivery shall be completed within the dispatch schedule stated above. Delay entitles IAL to cancel "
