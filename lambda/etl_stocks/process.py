@@ -1,3 +1,4 @@
+import csv
 import re
 import logging
 from datetime import datetime
@@ -10,6 +11,10 @@ from openpyxl.styles import PatternFill
 _NO_RATE_FILL = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
 
 logger = logging.getLogger(__name__)
+
+# Quantity column on the stock CSV. 'Qty' and 'BalQty' are identical in observed
+# samples — switch to 'BalQty' here if that ever changes upstream.
+_QTY_COLUMN = 'Qty'
 
 # Matches: <number> <unit>, e.g. "1000 ML", "1 KG", "8 GMS", "100 GM", "1 LTR"
 # Alternation is ordered longest-first to avoid partial matches (LTR > LT > L, GMS > GM).
@@ -102,7 +107,8 @@ def _parse_product(product: str, brand: str) -> tuple[str, float, str, str]:
 
 def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None, rates_path: str = None) -> int:
     """
-    Read a Current Stock Balances xlsx and write a Stock-Processed xlsx.
+    Read a StockReport CSV (header row 1, data from row 2, UTF-8 with BOM,
+    all values quoted strings) and write a Stock-Processed xlsx.
 
     Rows with the same (Brand, Technical, Packing Size, Packing Configuration,
     Branch, Special Packing Mention) are merged: Available Nos is summed and
@@ -116,39 +122,38 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
 
     rates = _load_rates(rates_path) if rates_path else {}
 
-    src_wb = openpyxl.load_workbook(src_path, data_only=True)
-    src_ws = src_wb.active
-
     # merged[(brand, technical, packing_size, packing_config, branch, spec)]
     #   = {'nos': total, 'cf': first_cf, 'product': raw_product_string}
     merged: dict[tuple, dict] = {}
 
-    for row in src_ws.iter_rows(min_row=6, values_only=True):
-        branch = row[0]
-        product = row[1]
-        brand = row[3]
-        qty = row[4]
-        cf = row[5]
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            branch = row.get('BranchId')
+            product = row.get('ProductId')
+            brand = row.get('BrandId')
+            qty_raw = row.get(_QTY_COLUMN)
+            cf_raw = row.get('CF')
 
-        if not brand or not str(brand).strip():
-            continue
-        if not product or not str(product).strip():
-            continue
+            if not brand or not str(brand).strip():
+                continue
+            if not product or not str(product).strip():
+                continue
 
-        brand = str(brand).strip()
-        product = str(product).strip()
+            brand = str(brand).strip()
+            product = str(product).strip()
 
-        technical, packing_size, packing_config, packing_spec = _parse_product(product, brand)
-        branch_str = str(branch).strip() if branch else ''
-        available_nos = qty or 0
-        conversion_factor = cf or 0
+            technical, packing_size, packing_config, packing_spec = _parse_product(product, brand)
+            branch_str = str(branch).strip() if branch else ''
+            available_nos = float(qty_raw) if qty_raw not in (None, '') else 0
+            conversion_factor = float(cf_raw) if cf_raw not in (None, '') else 0
 
-        key = (brand, technical, packing_size, packing_config, branch_str, packing_spec)
+            key = (brand, technical, packing_size, packing_config, branch_str, packing_spec)
 
-        if key in merged:
-            merged[key]['nos'] += available_nos
-        else:
-            merged[key] = {'nos': available_nos, 'cf': conversion_factor, 'product': product}
+            if key in merged:
+                merged[key]['nos'] += available_nos
+            else:
+                merged[key] = {'nos': available_nos, 'cf': conversion_factor, 'product': product}
 
     dst_wb = Workbook()
     dst_ws = dst_wb.active

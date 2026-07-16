@@ -30,10 +30,11 @@ business-core/
 ├── README.md
 ├── .gitignore
 └── lambda/
-    ├── etl_stocks/           ← ETL: parse stock balance xlsx → RDS snapshot_stock [COMPLETE]
+    ├── etl_stocks/           ← ETL: parse StockReport csv (+ rates xlsx) → RDS snapshot_stock [COMPLETE]
     │   ├── handler.py        ← Lambda entry point (S3 trigger)
     │   ├── process.py        ← core transform logic (no S3/Lambda deps)
-    │   ├── run_local.py      ← local test runner
+    │   ├── run_local.py      ← local test runner (STALE — still points at old xlsx sample, see etl_stocks section)
+    │   ├── tests/            ← test_process_csv.py + gen_fixture.py + fixtures/ (added 2026-07-16)
     │   └── requirements.txt
     ├── etl_sales/            ← ETL: parse sales xlsx → RDS fact_sales [STUB]
     │   ├── handler.py
@@ -272,13 +273,15 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 **Status: complete**
 
-Source file pattern: `Current Stock Balances*.xlsx` (S3 prefix filter: `raw/Current`)
+Source file pattern: `StockReport_<YYYYMMDD>_<HHMMSS>.csv` (S3 prefix filter: `raw/Current`; `_STOCK_PREFIX = 'StockReport'`).
+**Changed 2026-07-16:** the upstream daily stock export switched from `Current Stock Balances*.xlsx` to this CSV format. The stock file is now read with `csv.DictReader` (`encoding='utf-8-sig'` — UTF-8 with BOM, every value quoted/stringified, no title/footer rows, header on row 1, data from row 2, 43 columns) mapped by header **name**, not position: `branch=BranchId, product=ProductId, brand=BrandId, qty=Qty (module constant `_QTY_COLUMN`, switchable to `BalQty` — identical in samples), cf=CF`. Numerics are cast explicitly (`float(v) if v not in (None, '') else 0`) since CSV values are strings. `BranchId`/`ProductId`/`BrandId` still hold the same human-readable text the old `Branch`/`Product`/`Brand` xlsx columns held (including the literal `&amp;` HTML entity in some branch names, passed through unchanged). The separate **rates** file (`Product Masters With Rates*.xlsx`) is UNCHANGED — still read via `openpyxl`, `min_row=6`.
 
 **Product string parsing** (`Technical - Brand - Packing Size [- Packing Spec]`):
 - Brand column used as anchor to locate split point in product string
 - Handles embedded brand+size in one segment (IMIX pattern: `...WP - IMIX 8 GMS TIN`)
 - Handles multi-segment technical names containing ` - ` (VIVAYA PLUS)
 - Handles optional packing spec segment (BOX, TIN, POUCH S, POUCH L)
+- Unchanged by the CSV migration — `_parse_product()` still receives the same `ProductId` string format as the old `Product` column.
 
 **Unit conversion** (always normalised to grams or ml):
 - `GMS`, `GM` → `gms` (no conversion)
@@ -288,19 +291,23 @@ Source file pattern: `Current Stock Balances*.xlsx` (S3 prefix filter: `raw/Curr
 
 **`available_qty` in DB:** stored as kg or L (divided by 1000 on INSERT). The in-memory dict and Excel output retain the original gram/ml value. The API and redis_updater accumulate the raw DB value directly — no further division.
 
-**Row merging:** rows sharing the same (Brand, Technical, Packing Size, Packing Configuration, Branch, Special Packing Mention) are collapsed into one — `Available Nos` is summed, `Available Cases` and `Available Qty` are recalculated from the total.
+**Row merging:** rows sharing the same (Brand, Technical, Packing Size, Packing Configuration, Branch, Special Packing Mention) are collapsed into one — `Available Nos` is summed, `Available Cases` and `Available Qty` are recalculated from the total. Unchanged by the CSV migration.
 
-**Rate lookup:** `process_stock_file` accepts optional `rates_path` pointing to a `Product Masters With Rates*.xlsx` file. Rates are joined on the raw product string, filtered to `Purchase Price List` only.
+**Rate lookup:** `process_stock_file` accepts optional `rates_path` pointing to a `Product Masters With Rates*.xlsx` file (still openpyxl). Rates are joined on the raw product string, filtered to `Purchase Price List` only.
 
 **Lambda handler (`handler.py`):**
-- Trigger: S3 `ObjectCreated` on `{RAW_PREFIX}Current Stock Balances*.xlsx`
-- Finds latest `{RAW_PREFIX}Product Masters With Rates*.xlsx` automatically (by LastModified)
-- Downloads both to `/tmp/`, calls `process_stock_file`, uploads output to `{PROCESSED_PREFIX}Stock - Processed <date_suffix>.xlsx`
-- Archives source to `{PROCESSED_PREFIX}raw/<original_filename>`
+- Trigger: S3 `ObjectCreated` on `{RAW_PREFIX}StockReport*.csv`
+- Finds latest `{RAW_PREFIX}Product Masters With Rates*.xlsx` automatically (by LastModified) — unchanged
+- Downloads both to `/tmp/` (stock file as `stock.csv`), calls `process_stock_file`, uploads output to `{PROCESSED_PREFIX}Stock - Processed <date_suffix>.xlsx` — the processed output stays an xlsx workbook, so `_process()` swaps the source's `.csv` suffix for `.xlsx` when building `out_filename` (the source filename's date suffix now starts with `_` not a bare date, e.g. `StockReport_20260715_194634.csv` → suffix `_20260715_194634.csv` → `.xlsx`)
+- Archives source (the raw `.csv`) to `{PROCESSED_PREFIX}raw/<original_filename>`
 - Upserts into `snapshot_stock` (unitemporal milestoning)
 - Emits `ETLStocksSuccess` EventBridge event on success
 
-**Snapshot replace:** `Current Stock Balances*.xlsx` is a full snapshot, not an incremental feed. Each run closes **every** currently active row (`UPDATE snapshot_stock SET out_z = NOW() WHERE out_z IS NULL`) before inserting the new rows — not just rows matching a natural key in the new file. This ensures products/packings that drop out of stock (absent from the new file) are correctly marked superseded instead of remaining `out_z IS NULL` forever, which would otherwise inflate `iravi:stocks:current` and the summary tiles.
+**Snapshot replace:** the stock file is a full snapshot, not an incremental feed. Each run closes **every** currently active row (`UPDATE snapshot_stock SET out_z = NOW() WHERE out_z IS NULL`) before inserting the new rows — not just rows matching a natural key in the new file. This ensures products/packings that drop out of stock (absent from the new file) are correctly marked superseded instead of remaining `out_z IS NULL` forever, which would otherwise inflate `iravi:stocks:current` and the summary tiles.
+
+**Tests:** `tests/test_process_csv.py` (run: `python test_process_csv.py` from `lambda/etl_stocks/tests/`) — exercises `process_stock_file()` against a synthetic fixture (`tests/fixtures/StockReport_20260715_194634.csv`, generated by `tests/gen_fixture.py`, mirrors the real format: BOM, quoted values, 43 headers) covering header-name column mapping, blank-brand skip, `_parse_product` size/unit parsing, `float(Qty)`/`float(CF)` casts, and row-merge summing. 16/16 assertions pass.
+
+**Known stale reference (not yet fixed — flagged 2026-07-16):** `run_local.py` still points at the old `Current Stock Balances*.xlsx` sample under `../etl_sales/sample_data/` and will fail against `process_stock_file`'s new CSV-only reader. It was out of scope for the CSV migration task; update it (or add a CSV sample there) before next using it for local end-to-end testing.
 
 ---
 

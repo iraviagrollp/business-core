@@ -20,7 +20,7 @@ events = boto3.client('events')
 _BUCKET = os.environ['DATA_BUCKET']
 _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
-_STOCK_PREFIX = 'Current Stock Balances'
+_STOCK_PREFIX = 'StockReport'
 _RATES_PREFIX = 'Product Masters With Rates'
 
 
@@ -44,7 +44,7 @@ def lambda_handler(event, context):
         logger.info('S3 event: s3://%s/%s', bucket, key)
 
         filename = key.split('/')[-1]
-        if not (filename.startswith(_STOCK_PREFIX) and filename.endswith('.xlsx')):
+        if not (filename.startswith(_STOCK_PREFIX) and filename.endswith('.csv')):
             logger.info('Skipping: %s', key)
             continue
 
@@ -52,13 +52,17 @@ def lambda_handler(event, context):
 
 
 def _process(bucket: str, key: str, filename: str):
+    # e.g. filename='StockReport_20260715_194634.csv' -> suffix='_20260715_194634.csv'
+    # The processed output is still an xlsx workbook, so swap the extension.
     suffix = filename[len(_STOCK_PREFIX):]
+    if suffix.lower().endswith('.csv'):
+        suffix = suffix[:-4] + '.xlsx'
     out_filename = f'Stock - Processed {suffix}'
     out_key = _PROCESSED_PREFIX + out_filename
     archive_key = _PROCESSED_PREFIX + 'raw/' + filename
 
     with tempfile.TemporaryDirectory() as tmp:
-        src_path = os.path.join(tmp, 'stock.xlsx')
+        src_path = os.path.join(tmp, 'stock.csv')
         dst_path = os.path.join(tmp, out_filename)
         rates_path = None
 
