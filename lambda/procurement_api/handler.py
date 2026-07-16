@@ -150,6 +150,7 @@ def _route_data(event, method, path):
     # Collection roots and their {id} item routes.
     routes = {
         '/technicals': (_technicals_list, _technicals_create),
+        '/packagings': (_packagings_list, _packagings_create),
         '/supplier-companies': (_companies_list, _companies_create),
         '/suppliers': (_suppliers_list, _suppliers_create),
         '/enquiries': (_enquiries_list, _enquiries_create),
@@ -157,6 +158,7 @@ def _route_data(event, method, path):
     }
     item_routes = {
         '/technicals/': (_technicals_update, _technicals_delete),
+        '/packagings/': (_packagings_update, _packagings_delete),
         '/supplier-companies/': (_companies_update, _companies_delete),
         '/suppliers/': (_suppliers_update, _suppliers_delete),
         '/enquiries/': (_enquiries_update, _enquiries_delete),
@@ -416,6 +418,67 @@ def _technicals_update(event, _id):
 def _technicals_delete(_id):
     if _delete('DELETE FROM procurement.technicals WHERE id=%s', (_id,)) == 0:
         return _response(404, {'error': 'Technical not found'})
+    return _response(200, {'deleted': _id})
+
+
+# ── Packagings (packaging sizes per brand) ────────────────────────────────────
+
+_PACKAGING_SELECT = """
+    SELECT p.id, p.technical_id, t.brand_name, t.technical_name, p.packaging,
+           p.is_active, p.created_at, p.updated_at
+    FROM procurement.packagings p
+    JOIN procurement.technicals t ON t.id = p.technical_id
+"""
+
+
+def _packagings_list():
+    return _response(200, _query(
+        _PACKAGING_SELECT + ' ORDER BY t.brand_name, t.technical_name, p.packaging'
+    ))
+
+
+def _packagings_get_one(_id):
+    rows = _query(_PACKAGING_SELECT + ' WHERE p.id = %s', (_id,))
+    return rows[0] if rows else None
+
+
+def _packagings_create(event):
+    b = _json_body(event)
+    technical_id = _int(b.get('technical_id'))
+    packaging = _s(b.get('packaging'))
+    if not technical_id:
+        raise auth.AuthError('technical_id is required', 400)
+    if not packaging:
+        raise auth.AuthError('packaging is required', 400)
+    row = _write(
+        'INSERT INTO procurement.packagings (technical_id, packaging, is_active) '
+        'VALUES (%s, %s, %s) RETURNING id',
+        (technical_id, packaging, bool(b.get('is_active', True))),
+    )
+    return _response(201, _packagings_get_one(row['id']))
+
+
+def _packagings_update(event, _id):
+    b = _json_body(event)
+    technical_id = _int(b.get('technical_id'))
+    packaging = _s(b.get('packaging'))
+    if not technical_id:
+        raise auth.AuthError('technical_id is required', 400)
+    if not packaging:
+        raise auth.AuthError('packaging is required', 400)
+    row = _write(
+        'UPDATE procurement.packagings SET technical_id=%s, packaging=%s, is_active=%s '
+        'WHERE id=%s RETURNING id',
+        (technical_id, packaging, bool(b.get('is_active', True)), _id),
+    )
+    if row is None:
+        return _response(404, {'error': 'Packaging not found'})
+    return _response(200, _packagings_get_one(_id))
+
+
+def _packagings_delete(_id):
+    if _delete('DELETE FROM procurement.packagings WHERE id=%s', (_id,)) == 0:
+        return _response(404, {'error': 'Packaging not found'})
     return _response(200, {'deleted': _id})
 
 
