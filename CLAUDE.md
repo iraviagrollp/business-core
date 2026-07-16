@@ -1394,10 +1394,12 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   (SL/DESCRIPTION/QUANTITY/UOM/RATE ₹/AMOUNT ₹), a Taxable/GST/Total block + **amount-in-words**
   (Indian numbering, computed in-module), BILL TO / SHIP TO, a **COMMERCIAL TERMS** table, seven
   standard **TERMS & CONDITIONS**, a peach highlighted note, signature block and registered-office
-  footer. Palette green `#17452f` / orange `#c8641e`. **DejaVuSans + DejaVuSans-Bold are bundled**
-  in this dir (ship in the zip) so the **₹** glyph renders via `registerFontFamily`; falls back to
-  Helvetica + "Rs." if the TTFs are absent. `ial-logo.png` also bundled. Layout is spacing-tuned to
-  fit one page (leading 1.18). Binary response via new `_pdf_response` helper (`isBase64Encoded`).
+  footer. Palette green `#17452f` / orange `#c8641e`. **Base font is built-in Helvetica** (Arial-metric
+  — matches the template's Liberation Sans; font sizes lifted directly from the template so it reads as
+  the professional original, not the earlier clunky DejaVu render). **DejaVuSans (regular) is bundled**
+  in this dir ONLY to render the **₹** glyph (Helvetica lacks it) via an inline `<font>` span; ₹ degrades
+  to "Rs." if the TTF is absent. `ial-logo.png` also bundled. Fits one A4 page. Binary response via new
+  `_pdf_response` helper (`isBase64Encoded`).
   `requirements.txt` adds `reportlab==4.2.2` (provided at runtime by the shared reportlab layer —
   IaC reuses `alerts_evaluator_deps`; not packaged from procurement's requirements). Requires **IaC
   migrations** `039_create_procurement_purchase_orders.sql` + `040_add_procurement_purchase_order_screen.sql`,
