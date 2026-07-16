@@ -1384,9 +1384,12 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `IAL/{YYYYMMDD of po_date}/{po_seq}` — `_po_create` computes `MAX(po_seq)+1` for the date and inserts
   atomically, retrying on `UniqueViolation` (guarded by unique `(po_date, po_seq)` + unique `po_no`);
   po_no/po_date/po_seq are immutable on update. New `po_pdf.py` renders a single-page A4 PDF with
-  reportlab (Helvetica + "Rs.", no ₹/fonts) styled like the Customer Ledger Statement export
-  (centered letterhead, field rows, two-column Bill/Ship table, yellow-highlighted note, signature
-  block, Kukatpally footer). Binary response via new `_pdf_response` helper (`isBase64Encoded`).
+  reportlab (Helvetica + "Rs.", no ₹/fonts) in the Customer Ledger Statement house style: **IAL logo
+  top-left** (`ial-logo.png` bundled in this dir — ships in the archive_file zip, graceful fallback if
+  absent), "IRAVI AGRO LIFE LLP" centered + "PURCHASE ORDER" subtitle, field rows, a two-column
+  Bill/Ship table with a **dark-green `#1a3c2b` header band (white text)**, yellow-highlighted note,
+  signature block, and a **ruled gray Kukatpally footer**. Binary response via new `_pdf_response`
+  helper (`isBase64Encoded`).
   `requirements.txt` adds `reportlab==4.2.2` (provided at runtime by the shared reportlab layer —
   IaC reuses `alerts_evaluator_deps`; not packaged from procurement's requirements). Requires **IaC
   migrations** `039_create_procurement_purchase_orders.sql` + `040_add_procurement_purchase_order_screen.sql`,

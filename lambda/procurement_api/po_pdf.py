@@ -2,13 +2,15 @@
 Bulk Purchase Order PDF renderer (reportlab).
 
 `render_po_pdf(po: dict) -> bytes` — takes a joined purchase-order row (as returned
-by handler._po_get_one) and renders a single-page A4 PDF that mirrors the reference
-layout (D:\\2026\\IRA\\Reports\\POs\\Bulk\\IAL PO for PENOXSULAM 1.02 OD.pdf) in the
-house style of the Customer Ledger Statement export (centered IRAVI AGRO LIFE LLP
-letterhead, clean black type, Kukatpally reg-address footer, computer-generated
-note). Helvetica + "Rs." only — no ₹ / no bundled fonts.
+by handler._po_get_one) and renders a single-page A4 PDF in the house style of the
+Customer Ledger Statement export: IAL logo top-left, "IRAVI AGRO LIFE LLP" centered,
+dark-green (#1a3c2b) header bands with white text, green section labels, and a ruled
+gray footer (Kukatpally reg address + computer-generated note). Content mirrors the
+reference PO (D:\\2026\\IRA\\Reports\\POs\\Bulk\\IAL PO for PENOXSULAM 1.02 OD.pdf).
+Helvetica + "Rs." only — no ₹ / no bundled fonts.
 """
 
+import os
 from datetime import date, datetime
 from io import BytesIO
 
@@ -18,8 +20,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Table, TableStyle,
+    BaseDocTemplate, Frame, Image, PageTemplate, Paragraph, Spacer, Table, TableStyle,
 )
+
+_GREEN = colors.HexColor('#1a3c2b')
+_GREEN_BORDER = colors.HexColor('#2a5c3b')
+_HIGHLIGHT = colors.HexColor('#FFF200')
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), 'ial-logo.png')
 
 _INTRO = (
     'Please supply the under mentioned goods, subject to terms &amp; conditions '
@@ -59,49 +66,73 @@ def _esc(v) -> str:
     return (str(v) if v is not None else '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-def _address_lines(po, prefix, styles):
-    """Company name (bold) + address lines + State + GST for a bill/ship party."""
+def _address_html(po, prefix, styles):
+    """Multi-line address for a bill/ship party as a single <br/>-joined Paragraph."""
     name = po.get(f'{prefix}_company_name')
     if not name:
-        return [Paragraph('&mdash;', styles['cell'])]
-    out = [Paragraph(f'<b>{_esc(name)}</b>', styles['cell'])]
+        return Paragraph('&mdash;', styles['cell'])
+    lines = [f'<b>{_esc(name)}</b>']
     for key in ('address_line1', 'address_line2', 'address_line3'):
-        val = po.get(f'{prefix}_{key}')
-        if val:
-            out.append(Paragraph(_esc(val), styles['cell']))
+        if po.get(f'{prefix}_{key}'):
+            lines.append(_esc(po[f'{prefix}_{key}']))
     if po.get(f'{prefix}_state'):
-        out.append(Paragraph(f'State: {_esc(po[f"{prefix}_state"])}', styles['cell']))
+        lines.append(f'State: {_esc(po[f"{prefix}_state"])}')
     if po.get(f'{prefix}_gstin'):
-        out.append(Paragraph(f'GST: {_esc(po[f"{prefix}_gstin"])}', styles['cell']))
-    return out
+        lines.append(f'GST: {_esc(po[f"{prefix}_gstin"])}')
+    return Paragraph('<br/>'.join(lines), styles['cell'])
 
 
 def _styles():
     return {
-        'company': ParagraphStyle('company', fontName='Helvetica-Bold', fontSize=15,
-                                  alignment=TA_CENTER, spaceAfter=2, leading=18),
-        'title': ParagraphStyle('title', fontName='Helvetica-Bold', fontSize=11.5,
-                                 alignment=TA_CENTER, spaceAfter=10, leading=14),
+        'company': ParagraphStyle('company', fontName='Helvetica-Bold', fontSize=20,
+                                  alignment=TA_CENTER, leading=23),
+        'title': ParagraphStyle('title', fontName='Helvetica-Bold', fontSize=12,
+                                 alignment=TA_CENTER, spaceBefore=2, leading=15),
         'meta': ParagraphStyle('meta', fontName='Helvetica', fontSize=10, leading=15),
         'supplier': ParagraphStyle('supplier', fontName='Helvetica-Bold', fontSize=10.5, leading=16),
         'body': ParagraphStyle('body', fontName='Helvetica', fontSize=10, leading=14, spaceBefore=6),
         'label': ParagraphStyle('label', fontName='Helvetica', fontSize=10, leading=14),
         'value': ParagraphStyle('value', fontName='Helvetica-Bold', fontSize=10, leading=14),
-        'cellh': ParagraphStyle('cellh', fontName='Helvetica-Bold', fontSize=9.5, leading=13),
+        'addrhead': ParagraphStyle('addrhead', fontName='Helvetica-Bold', fontSize=10,
+                                   textColor=colors.white, leading=13),
         'cell': ParagraphStyle('cell', fontName='Helvetica', fontSize=9.5, leading=13),
-        'note': ParagraphStyle('note', fontName='Helvetica-Bold', fontSize=10, alignment=TA_CENTER, leading=14),
+        'note': ParagraphStyle('note', fontName='Helvetica-Bold', fontSize=10,
+                               alignment=TA_CENTER, leading=14),
         'sign': ParagraphStyle('sign', fontName='Helvetica', fontSize=10, leading=15),
     }
 
 
+def _header_flowable(st, doc):
+    """IAL logo left + company name/title centered over the full page width."""
+    company = [Paragraph('IRAVI AGRO LIFE LLP', st['company']),
+               Paragraph('PURCHASE ORDER', st['title'])]
+    logo_w = 2.0 * cm
+    if os.path.exists(_LOGO_PATH):
+        img = Image(_LOGO_PATH, width=logo_w, height=logo_w * 530.0 / 471.0)
+        left = img
+    else:
+        left = Paragraph('', st['meta'])
+    tbl = Table([[left, company, '']], colWidths=[logo_w, doc.width - 2 * logo_w, logo_w])
+    tbl.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    return tbl
+
+
 def _draw_footer(canvas, doc):
     canvas.saveState()
+    w = A4[0]
+    canvas.setStrokeColor(colors.HexColor('#cccccc'))
+    canvas.setLineWidth(0.6)
+    canvas.line(doc.leftMargin, 1.95 * cm, w - doc.rightMargin, 1.95 * cm)
     canvas.setFont('Helvetica', 7.5)
     canvas.setFillColor(colors.HexColor('#555555'))
-    w = A4[0]
-    canvas.drawCentredString(w / 2, 1.5 * cm, _FOOTER_1)
-    canvas.drawCentredString(w / 2, 1.2 * cm, _FOOTER_2)
-    canvas.drawCentredString(w / 2, 0.9 * cm, _FOOTER_3)
+    canvas.drawCentredString(w / 2, 1.55 * cm, _FOOTER_1)
+    canvas.drawCentredString(w / 2, 1.25 * cm, _FOOTER_2)
+    canvas.drawCentredString(w / 2, 0.95 * cm, _FOOTER_3)
     canvas.restoreState()
 
 
@@ -110,15 +141,13 @@ def render_po_pdf(po: dict) -> bytes:
     buf = BytesIO()
     doc = BaseDocTemplate(
         buf, pagesize=A4,
-        leftMargin=1.8 * cm, rightMargin=1.8 * cm, topMargin=1.6 * cm, bottomMargin=2.2 * cm,
+        leftMargin=1.8 * cm, rightMargin=1.8 * cm, topMargin=1.4 * cm, bottomMargin=2.3 * cm,
         title=f'Purchase Order {po.get("po_no", "")}',
     )
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
     doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_draw_footer)])
 
-    flow = []
-    flow.append(Paragraph('IRAVI AGRO LIFE LLP', st['company']))
-    flow.append(Paragraph('PURCHASE ORDER', st['title']))
+    flow = [_header_flowable(st, doc), Spacer(1, 0.5 * cm)]
 
     flow.append(Paragraph(f'<b>PO:</b> {_esc(po.get("po_no"))}', st['meta']))
     flow.append(Paragraph(f'<b>Date:</b> {_esc(_fmt_date(po.get("po_date")))}', st['meta']))
@@ -156,17 +185,22 @@ def render_po_pdf(po: dict) -> bytes:
         ('LEFTPADDING', (0, 0), (0, -1), 0),
     ]))
     flow.append(ftab)
-    flow.append(Spacer(1, 0.35 * cm))
+    flow.append(Spacer(1, 0.4 * cm))
 
-    # Bill To / Ship To table.
-    bill = [Paragraph('BILL TO ADDRESS:', st['cellh'])] + _address_lines(po, 'bill_to', st)
-    ship = [Paragraph('SHIP TO ADDRESS:', st['cellh'])] + _address_lines(po, 'ship_to', st)
+    # Bill To / Ship To table — green header band (white text) over a bordered box.
     half = doc.width / 2
-    addr = Table([[bill, ship]], colWidths=[half, half])
+    addr = Table(
+        [
+            [Paragraph('BILL TO ADDRESS:', st['addrhead']), Paragraph('SHIP TO ADDRESS:', st['addrhead'])],
+            [_address_html(po, 'bill_to', st), _address_html(po, 'ship_to', st)],
+        ],
+        colWidths=[half, half],
+    )
     addr.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('BOX', (0, 0), (-1, -1), 0.75, colors.black),
-        ('LINEBEFORE', (1, 0), (1, -1), 0.75, colors.black),
+        ('BACKGROUND', (0, 0), (-1, 0), _GREEN),
+        ('BOX', (0, 0), (-1, -1), 0.75, _GREEN_BORDER),
+        ('LINEBEFORE', (1, 0), (1, -1), 0.75, _GREEN_BORDER),
         ('TOPPADDING', (0, 0), (-1, -1), 6),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ('LEFTPADDING', (0, 0), (-1, -1), 8),
@@ -179,7 +213,7 @@ def render_po_pdf(po: dict) -> bytes:
     if note:
         note_tbl = Table([[Paragraph(f'Note: {_esc(note)}', st['note'])]], colWidths=[doc.width])
         note_tbl.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FFF200')),
+            ('BACKGROUND', (0, 0), (-1, -1), _HIGHLIGHT),
             ('TOPPADDING', (0, 0), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ]))
