@@ -208,7 +208,7 @@ def _styles():
         'addr': s('addr', 8.1, textColor=_BODY),
         'ctlabel': s('ctlabel', 8.4, fontName=_BOLD, textColor=_GREEN),
         'ctval': s('ctval', 8.4, textColor=_BODY),
-        'tc': s('tc', 7.2, textColor=_MUTED, leading=9.4),
+        'tc': s('tc', 7.2, textColor=_MUTED, leading=9),
         'note': s('note', 8.2, textColor=_BODY),
         'sign': s('sign', 8.3, textColor=_BODY),
         'signr': s('signr', 8.3, textColor=_BODY, alignment=TA_RIGHT),
@@ -219,7 +219,7 @@ def _styles():
 
 def _section_label(text, st, width):
     """Green uppercase label with a hairline rule beneath (full width)."""
-    return [Spacer(1, 0.24 * cm),
+    return [Spacer(1, 0.2 * cm),
             Paragraph(text, st['seclabel']),
             HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=2, spaceAfter=4)]
 
@@ -229,16 +229,16 @@ def _draw_footer(canvas, doc):
     w = A4[0]
     canvas.setStrokeColor(_RULE)
     canvas.setLineWidth(0.6)
-    canvas.line(doc.leftMargin, 1.15 * cm, w - doc.rightMargin, 1.15 * cm)
+    canvas.line(doc.leftMargin, 0.95 * cm, w - doc.rightMargin, 0.95 * cm)
     canvas.setFont(_BASE, 7.5)
     canvas.setFillColor(_MUTED)
-    canvas.drawCentredString(w / 2, 0.84 * cm, _FOOTER_1)
-    canvas.drawCentredString(w / 2, 0.6 * cm, _FOOTER_2)
+    canvas.drawCentredString(w / 2, 0.66 * cm, _FOOTER_1)
+    canvas.drawCentredString(w / 2, 0.46 * cm, _FOOTER_2)
     canvas.restoreState()
 
 
 def _header(st, doc):
-    logo_w = 1.65 * cm
+    logo_w = 1.5 * cm
     left = (Image(_LOGO_PATH, width=logo_w, height=logo_w * 530.0 / 471.0)
             if os.path.exists(_LOGO_PATH) else Paragraph('', st['body']))
     center = [
@@ -290,7 +290,7 @@ def render_po_pdf(po: dict) -> bytes:
     buf = BytesIO()
     doc = BaseDocTemplate(
         buf, pagesize=A4,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.7 * cm, bottomMargin=1.0 * cm,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
         title=f'Purchase Order {po.get("po_no", "")}',
     )
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
@@ -327,7 +327,7 @@ def render_po_pdf(po: dict) -> bytes:
         flow.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
 
     # Salutation + body.
-    flow.append(Spacer(1, 3))
+    flow.append(Spacer(1, 9))
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
     body = (f'We are pleased to place the following order with you, on the terms set out below. Please '
@@ -429,33 +429,38 @@ def render_po_pdf(po: dict) -> bytes:
     ]))
     flow.append(tctab)
 
-    # Note band.
+    # Note band — the note text is highlighted with a fluorescent-yellow marker
+    # (backColor) inside a subtle callout with an orange left accent.
     note = po.get('note')
     if note:
-        nb = Table([[Paragraph(f'<font name="{_BOLD}">Note:</font> {_esc(note)}', st['note'])]], colWidths=[dw])
+        note_html = (f'<font name="{_BOLD}" color="#c8641e">Note:</font> '
+                     f'<font backColor="#E9FF2E">&nbsp;{_esc(note)}&nbsp;</font>')
+        nb = Table([[Paragraph(note_html, st['note'])]], colWidths=[dw])
         nb.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), _PEACH), ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
-            ('TOPPADDING', (0, 0), (-1, -1), 5), ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
+            ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
+            ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
             ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
         ]))
         flow.append(Spacer(1, 4))
         flow.append(nb)
 
-    # Signature.
-    flow.append(Spacer(1, 3))
-    left_sig = [Paragraph('Thanking you,', st['sign']), Paragraph('Yours faithfully,', st['sign'])]
-    right_sig = [Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']),
-                 Spacer(1, 22),  # room for a physical signature
-                 HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4)]
+    # Signature — stacked vertically so "For IRAVI AGRO LIFE LLP" sits on its own line
+    # below the salutation, with room to sign; title and department on separate lines.
+    flow.append(Spacer(1, 4))
+    flow.append(Paragraph('Thanking you,', st['sign']))
+    flow.append(Paragraph('Yours faithfully,', st['sign']))
+    flow.append(Spacer(1, 8))
+    flow.append(Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']))
+    flow.append(Spacer(1, 8))  # room for a physical signature
+    flow.append(HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4))
     if po.get('signatory_name'):
-        right_sig.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
-    sub = ' — '.join(_esc(po[k]) for k in ('signatory_title', 'signatory_department') if po.get(k))
-    if sub:
-        right_sig.append(Paragraph(sub, st['signrs']))
-    sig = Table([[left_sig, right_sig]], colWidths=[dw / 2, dw / 2])
-    sig.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                             ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
-    flow.append(sig)
+        flow.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
+    if po.get('signatory_title'):
+        flow.append(Paragraph(_esc(po['signatory_title']), st['signrs']))
+    if po.get('signatory_department'):
+        flow.append(Paragraph(_esc(po['signatory_department']), st['signrs']))
 
     doc.build(flow)
     return buf.getvalue()

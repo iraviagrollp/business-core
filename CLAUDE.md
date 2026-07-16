@@ -1381,8 +1381,9 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   (`_po_list/get_one/create/update/delete`) + `GET /purchase-orders/{id}/pdf`. `_PO_SELECT` joins
   supplier / bill-to / ship-to `supplier_companies` (renders their address+GSTIN), the product
   `technicals`, and `signatory_authorities`. **PO number** generated server-side as
-  `IAL/{YYYYMMDD of po_date}/{po_seq}` — `_po_create` computes `MAX(po_seq)+1` for the date and inserts
-  atomically, retrying on `UniqueViolation` (guarded by unique `(po_date, po_seq)` + unique `po_no`);
+  `IAL/{fy}/{po_seq}` where `fy` is the 4-digit financial-year code (`_fy_code`, Apr-Mar → e.g. `2627`
+  for FY 2026-27) — `_po_create` computes `MAX(po_seq)+1` **for that FY** and inserts atomically,
+  retrying on `UniqueViolation` (guarded by unique `(fy, po_seq)` + unique `po_no`); serial resets per FY;
   po_no/po_date/po_seq are immutable on update. **Amounts are computed:** the PO stores numeric
   `rate` (₹/unit) + `gst_rate` (%), and `_PO_SELECT` returns `amount` (= qty×rate), `gst_amount`,
   and `total_value` (rounded) — `_po_validate` was updated from the old free-text `price`/`gst` to
