@@ -1,1 +1,4 @@
 psycopg2-binary==2.9.9
+# reportlab is provided at runtime by the shared reportlab Lambda layer
+# (IaC reuses aws_lambda_layer_version.alerts_evaluator_deps) — not packaged here.
+reportlab==4.2.2
