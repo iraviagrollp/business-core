@@ -560,6 +560,24 @@ def _po_items_for(_id):
     return rows
 
 
+def _po_apply_job_work_totals(po):
+    """Override the header-derived amount/gst_amount/total_value on a JOB_WORK PO dict
+    with figures computed from its line items (po['items'] must already be attached).
+
+    The header `rate` is 0 for JOB_WORK POs — all pricing lives on the line items — so
+    the header-based SQL in _PO_SELECT yields 0 for these three fields. Mirrors the
+    rounding convention used by _PO_SELECT for BULK: amount = Sum(item.amount) rounded
+    to 2dp (each item.amount is already qty*rate rounded to 2dp — see
+    _po_validate_items); gst_amount = round(amount * gst_rate / 100, 2);
+    total_value = round(amount + gst_amount, 2)."""
+    amount = round(sum(float(it.get('amount') or 0) for it in po.get('items') or []), 2)
+    gst_rate = float(po.get('gst_rate') or 0)
+    gst_amount = round(amount * gst_rate / 100.0, 2)
+    po['amount'] = amount
+    po['gst_amount'] = gst_amount
+    po['total_value'] = round(amount + gst_amount, 2)
+
+
 def _po_items_for_many(po_ids):
     """Items for several POs in one query (avoids N+1 on /purchase-orders list),
     grouped by po_id -> [item, ...]; po_id stripped from each row."""
@@ -592,6 +610,8 @@ def _po_list():
     items_by_po = _po_items_for_many([r['id'] for r in rows if r['po_type'] == 'JOB_WORK'])
     for r in rows:
         r['items'] = items_by_po.get(r['id'], [])
+        if r['po_type'] == 'JOB_WORK':
+            _po_apply_job_work_totals(r)
     return _response(200, rows)
 
 
@@ -601,6 +621,8 @@ def _po_get_one(_id):
         return None
     po = rows[0]
     po['items'] = _po_items_for(_id) if po['po_type'] == 'JOB_WORK' else []
+    if po['po_type'] == 'JOB_WORK':
+        _po_apply_job_work_totals(po)
     return po
 
 
