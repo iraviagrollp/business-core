@@ -189,6 +189,7 @@ def _styles():
         'seclabel': s('seclabel', 9.5, fontName=_BOLD, textColor=_GREEN),
         'boxlabel': s('boxlabel', 8.4, fontName=_BOLD, textColor=_BODY),
         'boxval': s('boxval', 8.4, textColor=_BODY),
+        'boxvalorange': s('boxvalorange', 8.4, fontName=_BOLD, textColor=_ORANGE),
         'name': s('name', 9.8, fontName=_BOLD, textColor=_GREEN),
         'body': s('body', 8.3, textColor=_BODY),
         'bodyc': s('bodyc', 8.3, textColor=_BODY, alignment=TA_CENTER),
@@ -256,7 +257,7 @@ def _header(st, dw):
 
 def _po_box(st, po):
     rows = [
-        [Paragraph('PO Number', st['boxlabel']), Paragraph(_esc(po.get('po_no')), st['boxval'])],
+        [Paragraph('PO Number', st['boxlabel']), Paragraph(_esc(po.get('po_no')), st['boxvalorange'])],
         [Paragraph('PO Date', st['boxlabel']), Paragraph(_esc(_fmt_date(po.get('po_date'))), st['boxval'])],
     ]
     t = Table(rows, colWidths=[2.4 * cm, 3.6 * cm])
@@ -428,8 +429,8 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
     body = (f'We are pleased to place the following order with you, on the terms set out below. Please '
-            f'<font name="{_BOLD}" color="#17452f">acknowledge this order</font> and quote '
-            f'<font name="{_BOLD}" color="#17452f">{po_no}</font> on every invoice, delivery challan, '
+            f'<font name="{_BOLD}" color="#c8641e">acknowledge this order</font> and quote '
+            f'<font name="{_BOLD}" color="#c8641e">{po_no}</font> on every invoice, delivery challan, '
             f'e-way bill and communication relating to this supply.')
     flow.append(Paragraph(body, st['bodyb']))
 
@@ -596,8 +597,8 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
     body = (f'We are pleased to place the following job work order with you, on the terms set out below. '
-            f'Please <font name="{_BOLD}" color="#17452f">acknowledge this order</font> and quote '
-            f'<font name="{_BOLD}" color="#17452f">{po_no}</font> on every invoice, delivery challan, '
+            f'Please <font name="{_BOLD}" color="#c8641e">acknowledge this order</font> and quote '
+            f'<font name="{_BOLD}" color="#c8641e">{po_no}</font> on every invoice, delivery challan, '
             f'e-way bill and communication relating to this supply.')
     flow.append(Paragraph(body, st['bodyb']))
 
