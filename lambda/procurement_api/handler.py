@@ -522,7 +522,7 @@ _PO_SELECT = """
       pc.pin_code AS ship_to_pin_code, pc.gstin AS ship_to_gstin,
       po.signatory_id, sa.name AS signatory_name, sa.title AS signatory_title,
       sa.department AS signatory_department,
-      po.note, po.created_at, po.updated_at
+      po.note, po.include_terms, po.created_at, po.updated_at
     FROM procurement.purchase_orders po
     JOIN procurement.supplier_companies sc ON sc.id = po.supplier_company_id
     JOIN procurement.technicals t          ON t.id = po.product_technical_id
@@ -677,6 +677,7 @@ def _po_validate(b):
         'note': _s(b.get('note')),
         'po_type': po_type,
         'items': items,
+        'include_terms': bool(b.get('include_terms', True)),
     }
 
 
@@ -712,13 +713,14 @@ def _po_create(event):
                         'INSERT INTO procurement.purchase_orders '
                         '(po_type, po_no, po_date, fy, po_seq, supplier_company_id, product_technical_id, '
                         'quantity, quantity_unit, rate, gst_rate, terms, dispatch, transport, '
-                        'bill_to_company_id, ship_to_company_id, signatory_id, note) '
-                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
+                        'bill_to_company_id, ship_to_company_id, signatory_id, note, include_terms) '
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
                         (
                             p['po_type'], po_no, po_date, fy, seq, p['supplier_company_id'],
                             p['product_technical_id'], p['quantity'], p['quantity_unit'], p['rate'],
                             p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
                             p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
+                            p['include_terms'],
                         ),
                     )
                     new_id = cur.fetchone()[0]
@@ -738,7 +740,7 @@ _PO_UPDATE_SQL = (
     'UPDATE procurement.purchase_orders SET '
     'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
     'rate=%s, gst_rate=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
-    'ship_to_company_id=%s, signatory_id=%s, note=%s '
+    'ship_to_company_id=%s, signatory_id=%s, note=%s, include_terms=%s '
     'WHERE id=%s RETURNING id'
 )
 
@@ -747,7 +749,8 @@ def _po_update_params(p, _id):
     return (
         p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
         p['quantity_unit'], p['rate'], p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
-        p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'], _id,
+        p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
+        p['include_terms'], _id,
     )
 
 
