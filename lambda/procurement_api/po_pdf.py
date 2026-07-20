@@ -28,8 +28,8 @@ from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, HRFlowable, Image, KeepTogether, PageTemplate, Paragraph, Spacer, Table,
-    TableStyle,
+    BaseDocTemplate, Frame, HRFlowable, Image, KeepTogether, PageBreak, PageTemplate, Paragraph, Spacer,
+    Table, TableStyle,
 )
 
 _DIR = os.path.dirname(__file__)
@@ -196,9 +196,9 @@ def _styles():
         'th': s('th', 7.5, fontName=_BOLD, textColor=colors.white),
         'thr': s('thr', 7.5, fontName=_BOLD, textColor=colors.white, alignment=TA_RIGHT),
         'thc': s('thc', 7.5, fontName=_BOLD, textColor=colors.white, alignment=TA_CENTER),
-        'cell': s('cell', 8.7, textColor=_BODY),
-        'cellc': s('cellc', 8.7, textColor=_BODY, alignment=TA_CENTER),
-        'cellr': s('cellr', 8.7, textColor=_BODY, alignment=TA_RIGHT),
+        'cell': s('cell', 8.5, textColor=_BODY),
+        'cellc': s('cellc', 8.5, textColor=_BODY, alignment=TA_CENTER),
+        'cellr': s('cellr', 8.5, textColor=_BODY, alignment=TA_RIGHT),
         'prod': s('prod', 9.3, fontName=_BOLD, textColor=_GREEN),
         'sub': s('sub', 7.5, textColor=_MUTED),
         'words': s('words', 8.4, textColor=_BODY),
@@ -221,7 +221,7 @@ def _section_label(text, st, width):
     """Green uppercase label with a hairline rule beneath (full width)."""
     return [Spacer(1, 0.11 * cm),
             Paragraph(text, st['seclabel']),
-            HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=2, spaceAfter=4)]
+            HRFlowable(width=width, thickness=0.5, color=_RULE, spaceBefore=1.5, spaceAfter=2.5)]
 
 
 def _draw_footer(canvas, doc):
@@ -264,7 +264,7 @@ def _po_box(st, po):
         ('BACKGROUND', (0, 0), (0, -1), _GRAYLABEL),
         ('GRID', (0, 0), (-1, -1), 0.5, _RULE),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 5), ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ('LEFTPADDING', (0, 0), (-1, -1), 7), ('RIGHTPADDING', (0, 0), (-1, -1), 7),
     ]))
     return t
@@ -309,7 +309,7 @@ def _vendor_box(po, st, dw):
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
         ('BACKGROUND', (0, 0), (-1, -1), _TINT),
-        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
     ]))
     return vbox
@@ -327,10 +327,10 @@ def _note_flow(po, st, dw):
         ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
         ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
         ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
-        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
     ]))
-    return [Spacer(1, 4), nb]
+    return [Spacer(1, 3), nb]
 
 
 def _signature_flow(po, st, dw):
@@ -340,13 +340,13 @@ def _signature_flow(po, st, dw):
     HRFlowable signature line landing on one page and the signatory name on the
     next)."""
     inner = [
-        Spacer(1, 3),
+        Spacer(1, 2),
         Paragraph('Thanking you,', st['sign']),
         Paragraph('Yours faithfully,', st['sign']),
-        Spacer(1, 6),
+        Spacer(1, 4),
         Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']),
-        Spacer(1, 30),  # room for a physical signature
-        HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4),
+        Spacer(1, 20),  # room for a physical signature
+        HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=3),
     ]
     if po.get('signatory_name'):
         inner.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
@@ -586,13 +586,13 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
         ('BACKGROUND', (0, 0), (-1, -1), _TINT),
-        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
     ]))
     flow.append(pbox)
 
     # Salutation + body.
-    flow.append(Spacer(1, 11))
+    flow.append(Spacer(1, 6))
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
     body = (f'We are pleased to place the following job work order with you, on the terms set out below. '
@@ -629,14 +629,14 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
         ('LINEBELOW', (0, 1), (-1, total_row_idx - 1), 0.4, colors.HexColor('#dcdcdc')),
         ('SPAN', (0, total_row_idx), (3, total_row_idx)),
         ('LINEABOVE', (0, total_row_idx), (-1, total_row_idx), 0.7, _GREEN),
-        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 2), ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
         ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
     ]))
     flow.append(gtab)
 
     # Totals: words (left) + taxable/gst/total (right) — same band as BULK, fed by
     # the item-grid's Σ amount.
-    words_cell = [Paragraph('TOTAL ORDER VALUE IN WORDS', st['seclabel']), Spacer(1, 3),
+    words_cell = [Paragraph('TOTAL ORDER VALUE IN WORDS', st['seclabel']), Spacer(1, 2),
                   Paragraph(_amount_in_words(total), st['words'])]
     right = Table(
         [[Paragraph('Taxable Value', st['cell']), Paragraph(_inr(amount), st['cellr'])],
@@ -647,23 +647,23 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
         ('BACKGROUND', (0, 2), (-1, 2), _GREEN),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('LINEBELOW', (0, 0), (-1, 0), 0.5, _RULE), ('LINEBELOW', (0, 1), (-1, 1), 0.5, _RULE),
-        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('TOPPADDING', (0, 0), (-1, -1), 2.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
         ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
     ]))
     tot = Table([[words_cell, right]], colWidths=[dw / 2, dw / 2])
     tot.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (0, 0), _TINT), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOX', (0, 0), (0, 0), 0.5, _RULE),
-        ('TOPPADDING', (0, 0), (0, 0), 5), ('BOTTOMPADDING', (0, 0), (0, 0), 5),
+        ('TOPPADDING', (0, 0), (0, 0), 4), ('BOTTOMPADDING', (0, 0), (0, 0), 4),
         ('LEFTPADDING', (0, 0), (0, 0), 8), ('RIGHTPADDING', (0, 0), (0, 0), 8),
         ('LEFTPADDING', (1, 0), (1, 0), 6), ('RIGHTPADDING', (1, 0), (1, 0), 0),
         ('TOPPADDING', (1, 0), (1, 0), 0), ('BOTTOMPADDING', (1, 0), (1, 0), 0),
     ]))
-    flow.append(Spacer(1, 4))
+    flow.append(Spacer(1, 3))
     flow.append(tot)
 
     # To Be Billed On / Delivered At (relabeled BILL TO / SHIP TO, same _addr_para()).
-    flow.append(Spacer(1, 3))
+    flow.append(Spacer(1, 2))
     bs = Table(
         [[Paragraph('TO BE BILLED ON', st['seclabel']), Paragraph('DELIVERED AT', st['seclabel'])],
          [_addr_para(po, 'bill_to', st), _addr_para(po, 'ship_to', st)]],
@@ -671,7 +671,7 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     bs.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
         ('LINEBEFORE', (1, 0), (1, -1), 0.5, _RULE),
-        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 2), ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
         ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
     ]))
     flow.append(bs)
@@ -689,17 +689,23 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     ctab.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (0, -1), _GRAYLABEL), ('GRID', (0, 0), (-1, -1), 0.5, _RULE),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 2.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+        ('TOPPADDING', (0, 0), (-1, -1), 1.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 1.5),
         ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
     ]))
     flow.append(ctab)
 
     # Note band, then signature (shared) — both are "core" content that must stay
-    # on page 1. Terms & Conditions (below) may be pushed to a fresh page 2.
+    # on page 1. Terms & Conditions (below), when included, is always started on a
+    # fresh page 2 (explicit PageBreak) rather than left to fall wherever there's
+    # leftover room — keeps the page count deterministic (core p1 / terms p2)
+    # regardless of exactly how much page-1 headroom a given item count leaves.
     flow += _note_flow(po, st, dw)
     flow += _signature_flow(po, st, dw)
 
-    terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
+    include_terms = po.get('include_terms', True)
+    if include_terms:
+        flow.append(PageBreak())
+    terms_flow = _terms_flow(st, dw) if include_terms else []
     return _build_pdf(flow, terms_flow, f'Job Work Purchase Order {po.get("po_no", "")}')
 
 

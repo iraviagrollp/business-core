@@ -1508,6 +1508,48 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
     block were confirmed (via per-page `pypdf` text extraction) to always land intact on a single
     page, never split across the boundary, and no `LayoutError`s at any row count.
 
+- [x] **Job Work PO PDF density fix — core content now fits 1 page through 7 line items
+  (2026-07-20):** the previous round's `include_terms` layout still let a JOB_WORK PO's "core"
+  (everything except Terms & Conditions) overflow onto page 2 once there were more than ~2 items,
+  which meant `terms=False` wasn't producing a true single page and `terms=True` wasn't
+  deterministically "core p1 / terms p2" — sometimes 2 pages, sometimes (with very short item text)
+  1 page, sometimes 3 once the grid itself spilled. Two changes in `po_pdf.py`:
+  - **Tightened vertical spacing across the shared core helpers** (apply to BOTH BULK and
+    JOB_WORK, since they're shared): `_section_label` HRFlowable `spaceBefore`/`spaceAfter` 2/4 →
+    1.5/2.5; `_po_box` (PO Number/Date) row `TOPPADDING`/`BOTTOMPADDING` 5 → 4; `_vendor_box`
+    (VENDOR/SUPPLIER + JOB WORKER) 6 → 4; `_note_flow` note-band padding 6 → 4 and its leading
+    `Spacer` 4 → 3; `_signature_flow` internal spacers 3/6/30 → 2/4/20 (the 30pt physical-signature
+    gap was the single biggest line item) and its `HRFlowable spaceAfter` 4 → 3. Plus
+    JOB_WORK-specific: `PRODUCT` box padding 6 → 4; salutation `Spacer` 11 → 6; particulars grid
+    (`gtab`) row `TOPPADDING`/`BOTTOMPADDING` 3 → 2 (biggest lever — scales with item count);
+    totals band (`right`/`tot` tables) paddings 4/5 → 2.5/4; `Spacer` before the totals band 4 → 3;
+    "TO BE BILLED ON / DELIVERED AT" (`bs`) row padding 3 → 2 and its leading `Spacer` 3 → 2;
+    Commercial Terms (`ctab`) row padding 2.5 → 1.5. One modest font-size reduction: the grid's
+    `cell`/`cellc`/`cellr` styles (also reused by BULK's single-row grid) 8.7pt → 8.5pt.
+  - **Deterministic terms-on page break:** `_render_job_work_po_pdf` now appends an explicit
+    `reportlab.platypus.PageBreak()` before the terms `KeepTogether` block whenever
+    `include_terms` is true, instead of relying on however much room happens to be left after the
+    signature block. This makes "core on page 1 / terms starts fresh on page 2" hold for every item
+    count (not just the ones where core spacing happens to leave too little room for terms to
+    sneak onto page 1) — still a single `doc.build()` pass, still no page-count
+    measurement/rebuild, still uses `KeepTogether` so terms is never split mid-list. Scoped to
+    `_render_job_work_po_pdf` only — `_render_bulk_po_pdf` is unchanged (still relies purely on
+    leftover space, matching the previous round's design; BULK stays 1 page with terms on/off
+    either way since its single-row grid never comes close to filling a page).
+  - Verified with `python -m py_compile handler.py po_pdf.py` (clean) and a temp `pypdf`
+    page-count script (written, run, then deleted along with `__pycache__`) using realistic
+    single-line item text (`"IMIDACLOPRID 17.8% SL - CONFIDOR - 500 ML BOTTLE"`-style particulars):
+    JOB_WORK `include_terms=False` → 1 page for 1–7 items (breaks to 2 pages at 8, so ~7-item
+    headroom as targeted); `include_terms=True` → exactly 2 pages for 1–7 items (core p1, terms
+    p2), 3 pages at 8+ once the grid itself needs a second page. Terms & Conditions content
+    (opening + closing clause text) and the "TERMS & CONDITIONS" heading were confirmed present
+    together on the last page at every tested row count via per-page `pypdf` text extraction —
+    never split. BULK unaffected: 1 page for both `include_terms=True` and `include_terms=False`.
+    Note: with much longer (wrapping) particulars text the break point moves earlier than 7 — the
+    fit numbers above assume item descriptions of realistic length (technical + brand + packaging
+    on one line at 8.5pt in the ~7.85cm particulars column); pathologically long combined names
+    will still wrap and consume more vertical space, same as before this change.
+
 - [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
   Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
   exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no
