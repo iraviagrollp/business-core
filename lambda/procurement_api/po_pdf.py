@@ -28,7 +28,8 @@ from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, HRFlowable, Image, PageTemplate, Paragraph, Spacer, Table, TableStyle,
+    BaseDocTemplate, Frame, HRFlowable, Image, KeepTogether, PageBreak, PageTemplate, Paragraph,
+    Spacer, Table, TableStyle,
 )
 
 _DIR = os.path.dirname(__file__)
@@ -190,6 +191,7 @@ def _styles():
         'boxval': s('boxval', 8.4, textColor=_BODY),
         'name': s('name', 9.8, fontName=_BOLD, textColor=_GREEN),
         'body': s('body', 8.3, textColor=_BODY),
+        'bodyc': s('bodyc', 8.3, textColor=_BODY, alignment=TA_CENTER),
         'bodyb': s('bodyb', 9.4, fontName=_BOLD, textColor=_BODY),
         'th': s('th', 7.5, fontName=_BOLD, textColor=colors.white),
         'thr': s('thr', 7.5, fontName=_BOLD, textColor=colors.white, alignment=TA_RIGHT),
@@ -235,7 +237,7 @@ def _draw_footer(canvas, doc):
     canvas.restoreState()
 
 
-def _header(st, doc):
+def _header(st, dw):
     logo_w = 1.5 * cm
     left = (Image(_LOGO_PATH, width=logo_w, height=logo_w * 530.0 / 471.0)
             if os.path.exists(_LOGO_PATH) else Paragraph('', st['body']))
@@ -246,7 +248,7 @@ def _header(st, doc):
         Paragraph(f'GSTIN: {_GSTIN} &nbsp;|&nbsp; LLPIN: {_LLPIN} &nbsp;|&nbsp; {_EMAIL} &nbsp;|&nbsp; {_WEB}',
                   st['identity']),
     ]
-    t = Table([[left, center, '']], colWidths=[logo_w + 0.3 * cm, doc.width - 2 * (logo_w + 0.3 * cm), logo_w + 0.3 * cm])
+    t = Table([[left, center, '']], colWidths=[logo_w + 0.3 * cm, dw - 2 * (logo_w + 0.3 * cm), logo_w + 0.3 * cm])
     t.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                            ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
     return t
@@ -283,17 +285,140 @@ def _addr_para(po, prefix, st):
     return Paragraph('<br/>'.join(lines), st['addr'])
 
 
+def _po_title_cell(st):
+    """The 'PURCHASE ORDER' banner — identical styling (letter-spacing, color,
+    underline) for both BULK and JOB_WORK layouts."""
+    return [Paragraph('P U R C H A S E &nbsp; O R D E R', st['potitle']),
+            HRFlowable(width=3.2 * cm, thickness=2.2, color=_ORANGE, spaceBefore=4, hAlign='LEFT')]
+
+
+def _vendor_box(po, st, dw):
+    """Supplier/vendor identity box: name + address, with the GSTIN appended inline
+    to the last address line (same paragraph) instead of on its own line."""
+    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
+    sup_lines = [po.get(k) for k in
+                 ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
+    addr_text = ', '.join(_esc(x) for x in sup_lines) if sup_lines else ''
+    if po.get('supplier_gstin'):
+        gstin_text = f'GSTIN: {_esc(po["supplier_gstin"])}'
+        addr_text = f'{addr_text}&nbsp;&nbsp;&nbsp;{gstin_text}' if addr_text else gstin_text
+    if addr_text:
+        ven.append(Paragraph(addr_text, st['body']))
+    vbox = Table([[ven]], colWidths=[dw])
+    vbox.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    return vbox
+
+
+def _note_flow(po, st, dw):
+    """Highlighted note callout — empty list if there's no note."""
+    note = po.get('note')
+    if not note:
+        return []
+    note_html = (f'<font name="{_BOLD}" color="#c8641e">Note:</font> '
+                 f'<font backColor="#E9FF2E">&nbsp;{_esc(note)}&nbsp;</font>')
+    nb = Table([[Paragraph(note_html, st['note'])]], colWidths=[dw])
+    nb.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
+        ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
+        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    return [Spacer(1, 4), nb]
+
+
+def _signature_flow(po, st, dw):
+    """Thanking-you / for-IAL / signature-line block — shared by BULK and JOB_WORK.
+    Wrapped in KeepTogether so the block moves as one atomic unit if it doesn't fit
+    in the remaining space on the page, instead of splitting mid-block (e.g. the
+    HRFlowable signature line landing on one page and the signatory name on the
+    next)."""
+    inner = [
+        Spacer(1, 3),
+        Paragraph('Thanking you,', st['sign']),
+        Paragraph('Yours faithfully,', st['sign']),
+        Spacer(1, 6),
+        Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']),
+        Spacer(1, 30),  # room for a physical signature
+        HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4),
+    ]
+    if po.get('signatory_name'):
+        inner.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
+    if po.get('signatory_title'):
+        inner.append(Paragraph(_esc(po['signatory_title']), st['signrs']))
+    if po.get('signatory_department'):
+        inner.append(Paragraph(_esc(po['signatory_department']), st['signrs']))
+    return [KeepTogether(inner)]
+
+
+def _terms_flow(st, dw):
+    """Terms & Conditions section — its own flowable list, so callers can either
+    append it inline or push it onto a fresh page."""
+    flow = _section_label('TERMS & CONDITIONS', st, dw)
+    tcd = [[Paragraph(f'{i}.', st['tc']), Paragraph(_esc(t), st['tc'])] for i, t in enumerate(_TERMS, 1)]
+    tctab = Table(tcd, colWidths=[0.6 * cm, dw - 0.6 * cm])
+    tctab.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('TOPPADDING', (0, 0), (-1, -1), 1), ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+        ('LEFTPADDING', (0, 0), (0, -1), 2), ('LEFTPADDING', (1, 0), (1, -1), 2),
+    ]))
+    flow.append(tctab)
+    return flow
+
+
+def _build_pdf(flow_builder, title):
+    """Two-pass build so the core PO content (everything up to and including the
+    signature block) never splits around the Terms & Conditions section.
+
+    `flow_builder()` returns a FRESH `(core_flow, terms_flow)` pair of flowable
+    lists on every call — reportlab flowables are stateful (wrap()/split() mutate
+    internal layout caches during doc.build()), so each build pass must be handed
+    brand-new Paragraph/Table instances rather than reusing ones from a prior pass.
+
+    Pass 1: render core_flow + terms_flow back-to-back on the normal frame flow. If
+    that already fits on a single page (or there's no terms section to move), keep
+    it — no forced page break, no blank page.
+
+    Pass 2 (only if pass 1 overflowed AND a terms section exists): insert an explicit
+    page break immediately before Terms & Conditions and rebuild from scratch, so the
+    whole section lands together on a fresh page 2 instead of splitting across the
+    boundary. This works for any number of grid/item rows — no per-line hacks.
+    """
+    def _try(flow):
+        buf = BytesIO()
+        doc = BaseDocTemplate(
+            buf, pagesize=A4,
+            leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
+            title=title,
+        )
+        frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
+        page_count = [0]
+
+        def _on_page(canvas, d):
+            page_count[0] += 1
+            _draw_footer(canvas, d)
+
+        doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_on_page)])
+        doc.build(flow)
+        return buf.getvalue(), page_count[0]
+
+    core_flow, terms_flow = flow_builder()
+    pdf_bytes, pages = _try(core_flow + terms_flow)
+    if pages > 1 and terms_flow:
+        core_flow2, terms_flow2 = flow_builder()
+        pdf_bytes, _pages2 = _try(core_flow2 + [PageBreak()] + terms_flow2)
+    return pdf_bytes
+
+
 def _render_bulk_po_pdf(po: dict) -> bytes:
     st = _styles()
-    buf = BytesIO()
-    doc = BaseDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
-        title=f'Purchase Order {po.get("po_no", "")}',
-    )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
-    doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_draw_footer)])
-    dw = doc.width
+    dw = A4[0] - 3.0 * cm  # leftMargin + rightMargin = 1.5cm + 1.5cm, matches _build_pdf
 
     qty = float(po.get('quantity') or 0)
     rate = float(po.get('rate') or 0)
@@ -303,14 +428,20 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     total = float(po.get('total_value') if po.get('total_value') is not None else round(amount + gst_amt, 2))
     gst_lbl = f'{gst_rate:g}'
 
-    flow = [_header(st, doc), Spacer(1, 2)]
+    def _flow():
+        return _bulk_flow(po, st, dw, qty, rate, gst_rate, gst_lbl, amount, gst_amt, total)
+
+    return _build_pdf(_flow, f'Purchase Order {po.get("po_no", "")}')
+
+
+def _bulk_flow(po, st, dw, qty, rate, gst_rate, gst_lbl, amount, gst_amt, total):
+    """Builds a FRESH (core_flow, terms_flow) pair — called once per _build_pdf pass."""
+    flow = [_header(st, dw), Spacer(1, 2)]
     flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
     flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
 
     # Title row + PO box.
-    title_cell = [Paragraph('P U R C H A S E &nbsp; O R D E R', st['potitle']),
-                  HRFlowable(width=3.2 * cm, thickness=2.2, color=_ORANGE, spaceBefore=4, hAlign='LEFT')]
-    trow = Table([[title_cell, _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
+    trow = Table([[_po_title_cell(st), _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
     trow.setStyle(TableStyle([('VALIGN', (0, 0), (0, 0), 'MIDDLE'), ('VALIGN', (1, 0), (1, 0), 'TOP'),
                               ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
     flow.append(trow)
@@ -318,21 +449,7 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     # Vendor / Supplier — boxed so it reads as a distinct unit, separate from the
     # salutation below.
     flow += _section_label('VENDOR / SUPPLIER', st, dw)
-    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
-    sup_lines = [po.get(k) for k in ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
-    if sup_lines:
-        ven.append(Paragraph(', '.join(_esc(x) for x in sup_lines), st['body']))
-    if po.get('supplier_gstin'):
-        ven.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
-    vbox = Table([[ven]], colWidths=[dw])
-    vbox.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
-        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
-        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
-    ]))
-    flow.append(vbox)
+    flow.append(_vendor_box(po, st, dw))
 
     # Salutation + body.
     flow.append(Spacer(1, 11))
@@ -426,52 +543,14 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     ]))
     flow.append(ctab)
 
-    # Terms & conditions.
-    flow += _section_label('TERMS & CONDITIONS', st, dw)
-    tcd = [[Paragraph(f'{i}.', st['tc']), Paragraph(_esc(t), st['tc'])] for i, t in enumerate(_TERMS, 1)]
-    tctab = Table(tcd, colWidths=[0.6 * cm, dw - 0.6 * cm])
-    tctab.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('TOPPADDING', (0, 0), (-1, -1), 1), ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
-        ('LEFTPADDING', (0, 0), (0, -1), 2), ('LEFTPADDING', (1, 0), (1, -1), 2),
-    ]))
-    flow.append(tctab)
+    # Note band, then signature — both are "core" content that must stay on page 1
+    # alongside everything above. Terms & Conditions (below) is the section that may
+    # be pushed to a fresh page 2 if the core content doesn't leave room for it.
+    flow += _note_flow(po, st, dw)
+    flow += _signature_flow(po, st, dw)
 
-    # Note band — the note text is highlighted with a fluorescent-yellow marker
-    # (backColor) inside a subtle callout with an orange left accent.
-    note = po.get('note')
-    if note:
-        note_html = (f'<font name="{_BOLD}" color="#c8641e">Note:</font> '
-                     f'<font backColor="#E9FF2E">&nbsp;{_esc(note)}&nbsp;</font>')
-        nb = Table([[Paragraph(note_html, st['note'])]], colWidths=[dw])
-        nb.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
-            ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
-            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
-            ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        flow.append(Spacer(1, 4))
-        flow.append(nb)
-
-    # Signature — stacked vertically so "For IRAVI AGRO LIFE LLP" sits on its own line
-    # below the salutation, with room to sign; title and department on separate lines.
-    flow.append(Spacer(1, 3))
-    flow.append(Paragraph('Thanking you,', st['sign']))
-    flow.append(Paragraph('Yours faithfully,', st['sign']))
-    flow.append(Spacer(1, 6))
-    flow.append(Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']))
-    flow.append(Spacer(1, 30))  # room for a physical signature
-    flow.append(HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4))
-    if po.get('signatory_name'):
-        flow.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
-    if po.get('signatory_title'):
-        flow.append(Paragraph(_esc(po['signatory_title']), st['signrs']))
-    if po.get('signatory_department'):
-        flow.append(Paragraph(_esc(po['signatory_department']), st['signrs']))
-
-    doc.build(flow)
-    return buf.getvalue()
+    terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
+    return flow, terms_flow
 
 
 # ── Job Work Purchase Order ────────────────────────────────────────────────────
@@ -494,15 +573,7 @@ def _job_work_particulars(it) -> str:
 
 def _render_job_work_po_pdf(po: dict) -> bytes:
     st = _styles()
-    buf = BytesIO()
-    doc = BaseDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
-        title=f'Job Work Purchase Order {po.get("po_no", "")}',
-    )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
-    doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_draw_footer)])
-    dw = doc.width
+    dw = A4[0] - 3.0 * cm  # leftMargin + rightMargin = 1.5cm + 1.5cm, matches _build_pdf
 
     items = po.get('items') or []
     gst_rate = float(po.get('gst_rate') or 0)
@@ -517,43 +588,38 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     base_unit = _UNIT_BASE_LABEL.get(header_unit, header_unit)
     dash = '—'
 
-    flow = [_header(st, doc), Spacer(1, 2)]
+    def _flow():
+        return _job_work_flow(po, st, dw, items, gst_rate, gst_lbl, amount, gst_amt, total,
+                               header_unit, base_unit, dash)
+
+    return _build_pdf(_flow, f'Job Work Purchase Order {po.get("po_no", "")}')
+
+
+def _job_work_flow(po, st, dw, items, gst_rate, gst_lbl, amount, gst_amt, total,
+                    header_unit, base_unit, dash):
+    """Builds a FRESH (core_flow, terms_flow) pair — called once per _build_pdf pass."""
+    flow = [_header(st, dw), Spacer(1, 2)]
     flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
     flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
 
-    # Title row + PO box.
-    title_cell = [Paragraph('JOB WORK PURCHASE ORDER', st['potitle']),
-                  HRFlowable(width=3.2 * cm, thickness=2.2, color=_ORANGE, spaceBefore=4, hAlign='LEFT')]
-    trow = Table([[title_cell, _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
+    # Title row + PO box — same "PURCHASE ORDER" banner as BULK.
+    trow = Table([[_po_title_cell(st), _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
     trow.setStyle(TableStyle([('VALIGN', (0, 0), (0, 0), 'MIDDLE'), ('VALIGN', (1, 0), (1, 0), 'TOP'),
                               ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
     flow.append(trow)
 
     # Job Worker (the reused supplier_company_id).
     flow += _section_label('JOB WORKER', st, dw)
-    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
-    sup_lines = [po.get(k) for k in ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
-    if sup_lines:
-        ven.append(Paragraph(', '.join(_esc(x) for x in sup_lines), st['body']))
-    if po.get('supplier_gstin'):
-        ven.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
-    vbox = Table([[ven]], colWidths=[dw])
-    vbox.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
-        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
-        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
-    ]))
-    flow.append(vbox)
+    flow.append(_vendor_box(po, st, dw))
 
-    # Product + header quantity — adjacent to the Job Worker block.
+    # Product + header quantity — adjacent to the Job Worker block; center-aligned
+    # per the approved layout.
     flow += _section_label('PRODUCT', st, dw)
     prod_line = (f'<font name="{_BOLD}">{_esc(po.get("technical_name"))}</font>'
                  f' &nbsp;{dash}&nbsp; Brand: {_esc(po.get("brand_name") or dash)}'
                  f' &nbsp;{dash}&nbsp; Quantity: <font name="{_BOLD}">{_fmt_qty(po.get("quantity"))} '
                  f'{_esc(header_unit)}</font>')
-    pbox = Table([[Paragraph(prod_line, st['body'])]], colWidths=[dw])
+    pbox = Table([[Paragraph(prod_line, st['bodyc'])]], colWidths=[dw])
     pbox.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
@@ -666,50 +732,13 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     ]))
     flow.append(ctab)
 
-    # Terms & conditions (shared).
-    flow += _section_label('TERMS & CONDITIONS', st, dw)
-    tcd = [[Paragraph(f'{i}.', st['tc']), Paragraph(_esc(t), st['tc'])] for i, t in enumerate(_TERMS, 1)]
-    tctab = Table(tcd, colWidths=[0.6 * cm, dw - 0.6 * cm])
-    tctab.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('TOPPADDING', (0, 0), (-1, -1), 1), ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
-        ('LEFTPADDING', (0, 0), (0, -1), 2), ('LEFTPADDING', (1, 0), (1, -1), 2),
-    ]))
-    flow.append(tctab)
+    # Note band, then signature (shared) — both are "core" content that must stay
+    # on page 1. Terms & Conditions (below) may be pushed to a fresh page 2.
+    flow += _note_flow(po, st, dw)
+    flow += _signature_flow(po, st, dw)
 
-    # Note band (shared).
-    note = po.get('note')
-    if note:
-        note_html = (f'<font name="{_BOLD}" color="#c8641e">Note:</font> '
-                     f'<font backColor="#E9FF2E">&nbsp;{_esc(note)}&nbsp;</font>')
-        nb = Table([[Paragraph(note_html, st['note'])]], colWidths=[dw])
-        nb.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
-            ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
-            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
-            ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-        ]))
-        flow.append(Spacer(1, 4))
-        flow.append(nb)
-
-    # Signature (shared) — Thanking you / Yours faithfully above "For IRAVI AGRO LIFE LLP".
-    flow.append(Spacer(1, 3))
-    flow.append(Paragraph('Thanking you,', st['sign']))
-    flow.append(Paragraph('Yours faithfully,', st['sign']))
-    flow.append(Spacer(1, 6))
-    flow.append(Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']))
-    flow.append(Spacer(1, 30))  # room for a physical signature
-    flow.append(HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4))
-    if po.get('signatory_name'):
-        flow.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
-    if po.get('signatory_title'):
-        flow.append(Paragraph(_esc(po['signatory_title']), st['signrs']))
-    if po.get('signatory_department'):
-        flow.append(Paragraph(_esc(po['signatory_department']), st['signrs']))
-
-    doc.build(flow)
-    return buf.getvalue()
+    terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
+    return flow, terms_flow
 
 
 def render_po_pdf(po: dict) -> bytes:
