@@ -1319,6 +1319,28 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **Bug fix: Job Work PO showed ₹0.00 total on the PO list (2026-07-20):** root cause —
+  `amount`/`gst_amount`/`total_value` in `_PO_SELECT` are computed from the header
+  `quantity * rate`, but for `po_type == 'JOB_WORK'` the header `rate` is always 0 (all
+  pricing lives on `purchase_order_items` line items), so those three fields evaluated to
+  0 for every Job Work PO in both `GET /purchase-orders` (list) and the detail response.
+  BULK POs were unaffected (header `rate` is real for BULK). Fix: new helper
+  `_po_apply_job_work_totals(po)` in `handler.py` — for JOB_WORK rows, once `items[]` is
+  attached, overrides `amount = round(Σ item.amount, 2)`, `gst_amount = round(amount *
+  gst_rate / 100, 2)`, `total_value = round(amount + gst_amount, 2)` (same rounding
+  convention as the BULK SQL). Called from both `_po_list` (after `_po_items_for_many`)
+  and `_po_get_one` (after `_po_items_for`), so list and detail always agree; BULK path
+  untouched (helper is only invoked when `po_type == 'JOB_WORK'`). Note:
+  `po_pdf.py`'s `_render_job_work_po_pdf` was already computing its own Σ-of-items totals
+  independently for the PDF — only the JSON API response was wrong, so no PDF change was
+  needed. Verified: `python -m py_compile handler.py po_pdf.py` clean; a logic-level check
+  (boto3/psycopg2/auth stubbed, run via a temp script then deleted) confirmed a JOB_WORK
+  PO with items 3000@250 and 2000@300 (taxable 750,000 + 600,000 = 1,350,000) at
+  `gst_rate=18` yields `amount=1,350,000.0`, `gst_amount=243,000.0`,
+  `total_value=1,593,000.0`; a simulated BULK PO's fields were confirmed byte-for-byte
+  unchanged by the same helper (no-op — only called for JOB_WORK). No IaC/DB/UI change
+  needed — same response shape, just corrected values.
+
 - [x] **`barcodes` added to the `purchases`/`sales` milestoning key (2026-07-14):** the 5-column
   natural key `(purchase_date, voucher_no, branch, party, product)` did not uniquely identify a
   line item — a single voucher legitimately carries the same product on multiple batch/barcode
