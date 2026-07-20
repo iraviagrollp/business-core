@@ -522,18 +522,28 @@ _PO_SELECT = """
       pc.pin_code AS ship_to_pin_code, pc.gstin AS ship_to_gstin,
       po.signatory_id, sa.name AS signatory_name, sa.title AS signatory_title,
       sa.department AS signatory_department,
-      po.note, po.include_terms, po.created_at, po.updated_at
+      po.note, po.include_terms, po.generic_config, po.created_at, po.updated_at
     FROM procurement.purchase_orders po
     JOIN procurement.supplier_companies sc ON sc.id = po.supplier_company_id
-    JOIN procurement.technicals t          ON t.id = po.product_technical_id
+    LEFT JOIN procurement.technicals t     ON t.id = po.product_technical_id
     LEFT JOIN procurement.supplier_companies bc ON bc.id = po.bill_to_company_id
     LEFT JOIN procurement.supplier_companies pc ON pc.id = po.ship_to_company_id
     LEFT JOIN procurement.signatory_authorities sa ON sa.id = po.signatory_id
 """
+# NOTE: `t` (technicals) is a LEFT JOIN (was INNER) so GENERIC rows — which have no
+# product_technical_id — still come back from list/get_one instead of being silently
+# dropped. BULK/JOB_WORK always set product_technical_id, so their rows are unaffected.
 
 _VALID_QTY_UNITS_BULK = ('KGS', 'LTRS')
 _VALID_QTY_UNITS_JOB_WORK = ('KGS', 'TONNE', 'LTRS', 'KL')
-_VALID_PO_TYPES = ('BULK', 'JOB_WORK')
+_VALID_PO_TYPES = ('BULK', 'JOB_WORK', 'GENERIC')
+
+# Default body text for a GENERIC PO when the caller sends an empty/blank body.
+_GENERIC_DEFAULT_BODY = (
+    'Please supply the under mentioned goods, subject to terms & conditions stated below. '
+    'Please also quote this order reference in all your supply documents and future '
+    'correspondence. Please dispatch the stock within 3 days of receipt of this PO.'
+)
 
 # Header quantity_unit -> (base unit stored on each line item, multiplier to convert
 # the header quantity into that base unit for the reconciliation guard below).
@@ -662,18 +672,83 @@ def _po_validate_items(raw_items, header_unit, header_qty):
     return items
 
 
+def _po_validate_generic_config(raw):
+    """Validate + coerce the GENERIC-only 'generic_config' JSON blob:
+    {subject, body, columns: [str,...], rows: [[str,...], ...]}. `columns` must be a
+    non-empty array; each row is defensively padded/truncated to len(columns) and every
+    cell coerced to a string (free-text, no numeric/rate/GST semantics). `body` defaults
+    to the standard text when blank; `subject` defaults to ''."""
+    raw = raw if isinstance(raw, dict) else {}
+    columns = raw.get('columns')
+    if not columns or not isinstance(columns, list):
+        raise auth.AuthError('generic_config.columns is required and must be a non-empty array', 400)
+    columns = [str(c) for c in columns]
+    n = len(columns)
+
+    raw_rows = raw.get('rows') or []
+    if not isinstance(raw_rows, list):
+        raise auth.AuthError('generic_config.rows must be an array', 400)
+    rows = []
+    for r in raw_rows:
+        r = r if isinstance(r, list) else [r]
+        r = ['' if c is None else str(c) for c in r]
+        if len(r) < n:
+            r = r + [''] * (n - len(r))
+        elif len(r) > n:
+            r = r[:n]
+        rows.append(r)
+
+    return {
+        'subject': _s(raw.get('subject')) or '',
+        'body': _s(raw.get('body')) or _GENERIC_DEFAULT_BODY,
+        'columns': columns,
+        'rows': rows,
+    }
+
+
 def _po_validate(b):
     """Validate + coerce the shared PO fields. Returns a params dict (no po_no/seq).
-    For JOB_WORK, also validates + coerces b['items'] (params['items']; None for BULK)."""
+    For JOB_WORK, also validates + coerces b['items'] (params['items']; None otherwise).
+    For GENERIC, validates b['generic_config'] instead (params['generic_config']; None
+    for BULK/JOB_WORK) — no product/quantity/rate/GST/items for that type."""
     po_type = (_s(b.get('po_type')) or 'BULK').upper()
     if po_type not in _VALID_PO_TYPES:
-        raise auth.AuthError('po_type must be one of BULK, JOB_WORK', 400)
+        raise auth.AuthError('po_type must be one of BULK, JOB_WORK, GENERIC', 400)
     supplier_company_id = _int(b.get('supplier_company_id'))
+    if not supplier_company_id:
+        raise auth.AuthError('supplier_company_id is required', 400)
+
+    common = {
+        'supplier_company_id': supplier_company_id,
+        'bill_to_company_id': _int(b.get('bill_to_company_id')),
+        'ship_to_company_id': _int(b.get('ship_to_company_id')),
+        'signatory_id': _int(b.get('signatory_id')),
+        'note': _s(b.get('note')),
+        'po_type': po_type,
+        'include_terms': bool(b.get('include_terms', True)),
+    }
+
+    if po_type == 'GENERIC':
+        # No product/quantity/rate/GST/items/terms-commercial fields, no reconciliation
+        # guard — Generic is a free-form, non-priced PO. All its content lives in
+        # generic_config.
+        return {
+            **common,
+            'product_technical_id': None,
+            'quantity': None,
+            'quantity_unit': None,
+            'rate': None,
+            'gst_rate': None,
+            'terms': None,
+            'dispatch': None,
+            'transport': None,
+            'items': None,
+            'generic_config': _po_validate_generic_config(b.get('generic_config')),
+        }
+
     product_technical_id = _int(b.get('product_technical_id'))
     quantity = _num(b.get('quantity'))
     unit = (_s(b.get('quantity_unit')) or '').upper()
-    if not supplier_company_id:
-        raise auth.AuthError('supplier_company_id is required', 400)
     if not product_technical_id:
         raise auth.AuthError('product_technical_id is required', 400)
     if quantity is None:
@@ -684,7 +759,7 @@ def _po_validate(b):
     items = _po_validate_items(b.get('items'), unit, quantity) if po_type == 'JOB_WORK' else None
     gst_rate = _num(b.get('gst_rate'))
     return {
-        'supplier_company_id': supplier_company_id,
+        **common,
         'product_technical_id': product_technical_id,
         'quantity': quantity,
         'quantity_unit': unit,
@@ -693,13 +768,8 @@ def _po_validate(b):
         'terms': _s(b.get('terms')),
         'dispatch': _s(b.get('dispatch')),
         'transport': _s(b.get('transport')),
-        'bill_to_company_id': _int(b.get('bill_to_company_id')),
-        'ship_to_company_id': _int(b.get('ship_to_company_id')),
-        'signatory_id': _int(b.get('signatory_id')),
-        'note': _s(b.get('note')),
-        'po_type': po_type,
         'items': items,
-        'include_terms': bool(b.get('include_terms', True)),
+        'generic_config': None,
     }
 
 
@@ -735,14 +805,16 @@ def _po_create(event):
                         'INSERT INTO procurement.purchase_orders '
                         '(po_type, po_no, po_date, fy, po_seq, supplier_company_id, product_technical_id, '
                         'quantity, quantity_unit, rate, gst_rate, terms, dispatch, transport, '
-                        'bill_to_company_id, ship_to_company_id, signatory_id, note, include_terms) '
-                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
+                        'bill_to_company_id, ship_to_company_id, signatory_id, note, include_terms, '
+                        'generic_config) '
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
                         (
                             p['po_type'], po_no, po_date, fy, seq, p['supplier_company_id'],
                             p['product_technical_id'], p['quantity'], p['quantity_unit'], p['rate'],
                             p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
                             p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
                             p['include_terms'],
+                            json.dumps(p['generic_config']) if p['generic_config'] is not None else None,
                         ),
                     )
                     new_id = cur.fetchone()[0]
@@ -762,7 +834,7 @@ _PO_UPDATE_SQL = (
     'UPDATE procurement.purchase_orders SET '
     'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
     'rate=%s, gst_rate=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
-    'ship_to_company_id=%s, signatory_id=%s, note=%s, include_terms=%s '
+    'ship_to_company_id=%s, signatory_id=%s, note=%s, include_terms=%s, generic_config=%s '
     'WHERE id=%s RETURNING id'
 )
 
@@ -772,7 +844,9 @@ def _po_update_params(p, _id):
         p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
         p['quantity_unit'], p['rate'], p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
         p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'],
-        p['include_terms'], _id,
+        p['include_terms'],
+        json.dumps(p['generic_config']) if p['generic_config'] is not None else None,
+        _id,
     )
 
 

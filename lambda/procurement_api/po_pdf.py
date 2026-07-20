@@ -710,9 +710,158 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     return _build_pdf(flow, terms_flow, f'Job Work Purchase Order {po.get("po_no", "")}')
 
 
+# ── Generic Purchase Order ─────────────────────────────────────────────────────
+
+# Defensive fallback only — handler.py's _po_validate already defaults an empty body
+# to this exact text before the row is ever persisted, so in practice generic_config
+# always arrives with a non-empty body. Kept in sync with handler._GENERIC_DEFAULT_BODY.
+_GENERIC_DEFAULT_BODY = (
+    'Please supply the under mentioned goods, subject to terms & conditions stated below. '
+    'Please also quote this order reference in all your supply documents and future '
+    'correspondence. Please dispatch the stock within 3 days of receipt of this PO.'
+)
+
+
+def _is_serial_col(header) -> bool:
+    """True if a column header looks like a serial-number column (S No., Sl., Sr No., ...)."""
+    h = re.sub(r'[^a-z]', '', (header or '').lower())
+    return h in ('sno', 'slno', 'sl', 'srno', 'sr', 'no')
+
+
+def _is_particulars_col(header) -> bool:
+    h = (header or '').lower()
+    return any(k in h for k in ('particular', 'description', 'desc', 'item', 'name'))
+
+
+def _generic_col_widths(columns, dw):
+    """Sensible auto column widths for the arbitrary Generic table: a narrow width for
+    a leading serial-number-looking column, the widest share for a Particulars/
+    description-type column if present, otherwise an even split of what's left."""
+    n = len(columns)
+    if n == 0:
+        return []
+    if n == 1:
+        return [dw]
+    serial_idx = 0 if _is_serial_col(columns[0]) else None
+    serial_w = 1.1 * cm if serial_idx is not None else 0.0
+    remaining = max(dw - serial_w, 0.0)
+    other_idxs = [i for i in range(n) if i != serial_idx]
+    if not other_idxs:
+        return [dw]
+
+    particulars_idx = next((i for i in other_idxs if _is_particulars_col(columns[i])), None)
+    if particulars_idx is not None and len(other_idxs) > 1:
+        particulars_w = remaining * 0.4
+        rest_each = (remaining - particulars_w) / (len(other_idxs) - 1)
+        return [serial_w if i == serial_idx else (particulars_w if i == particulars_idx else rest_each)
+                for i in range(n)]
+
+    each = remaining / len(other_idxs)
+    return [serial_w if i == serial_idx else each for i in range(n)]
+
+
+def _render_generic_po_pdf(po: dict) -> bytes:
+    st = _styles()
+    dw = A4[0] - 3.0 * cm  # leftMargin + rightMargin = 1.5cm + 1.5cm, matches _build_pdf
+
+    gc = po.get('generic_config') or {}
+    columns = gc.get('columns') or []
+    rows = gc.get('rows') or []
+    subject = (gc.get('subject') or '').strip()
+    body = (gc.get('body') or '').strip() or _GENERIC_DEFAULT_BODY
+
+    flow = [_header(st, dw), Spacer(1, 2)]
+    flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
+    flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
+
+    # Title row + PO box — same "PURCHASE ORDER" banner as BULK/JOB_WORK.
+    trow = Table([[_po_title_cell(st), _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
+    trow.setStyle(TableStyle([('VALIGN', (0, 0), (0, 0), 'MIDDLE'), ('VALIGN', (1, 0), (1, 0), 'TOP'),
+                              ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+    flow.append(trow)
+
+    # Vendor / Supplier (reused box).
+    flow += _section_label('VENDOR / SUPPLIER', st, dw)
+    flow.append(_vendor_box(po, st, dw))
+
+    # Subject line (optional), above the salutation.
+    flow.append(Spacer(1, 8))
+    if subject:
+        flow.append(Paragraph(f'<font name="{_BOLD}">Subject:</font> {_esc(subject)}', st['bodyb']))
+        flow.append(Spacer(1, 4))
+
+    # Salutation + configurable body, with the standard acknowledgment/quote-PO
+    # sentence appended (PO number kept in orange, same treatment as BULK/JOB_WORK).
+    flow.append(Paragraph('Dear Sir,', st['bodyb']))
+    po_no = _esc(po.get('po_no'))
+    ack = (f' Please <font name="{_BOLD}" color="#c8641e">acknowledge this order</font> and quote '
+           f'<font name="{_BOLD}" color="#c8641e">{po_no}</font> on every related document and '
+           f'correspondence.')
+    flow.append(Paragraph(_esc(body) + ack, st['bodyb']))
+
+    # The configurable table — arbitrary columns/rows, free text, no totals row
+    # (Generic is non-priced). Natural pagination if it overflows (Table is not
+    # wrapped in KeepTogether here).
+    flow += _section_label('ORDER DETAILS', st, dw)
+    if columns:
+        widths = _generic_col_widths(columns, dw)
+        serial_idx = 0 if _is_serial_col(columns[0]) else None
+        head = [Paragraph(_esc(c), st['thc']) for c in columns]
+        body_rows = []
+        for r in rows:
+            cells = []
+            for i in range(len(columns)):
+                val = r[i] if i < len(r) else ''
+                style = st['cellc'] if i == serial_idx else st['cell']
+                cells.append(Paragraph(_esc(val), style))
+            body_rows.append(cells)
+        gtab = Table([head] + body_rows, colWidths=widths, repeatRows=1)
+        gtab.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), _GREEN),
+            ('GRID', (0, 0), (-1, -1), 0.4, _RULE),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        flow.append(gtab)
+
+    # Bill To / Ship To — same two-column bordered table as BULK.
+    flow.append(Spacer(1, 6))
+    bs = Table(
+        [[Paragraph('BILL TO', st['seclabel']), Paragraph('SHIP TO', st['seclabel'])],
+         [_addr_para(po, 'bill_to', st), _addr_para(po, 'ship_to', st)]],
+        colWidths=[dw / 2, dw / 2])
+    bs.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('LINEBEFORE', (1, 0), (1, -1), 0.5, _RULE),
+        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    flow.append(bs)
+
+    # Note band, then the shared closing greeting + signature block ("Thanking you," /
+    # "Yours faithfully," / For IAL / signatory name-title-department).
+    flow += _note_flow(po, st, dw)
+    flow += _signature_flow(po, st, dw)
+
+    # Terms & Conditions, when included, always starts on a fresh page (same
+    # deterministic approach as JOB_WORK — the configurable table's row count is
+    # unbounded, so a forced PageBreak keeps "core / terms" pagination predictable
+    # instead of depending on how much page-1 headroom a given table happened to leave).
+    include_terms = po.get('include_terms', True)
+    if include_terms:
+        flow.append(PageBreak())
+    terms_flow = _terms_flow(st, dw) if include_terms else []
+    return _build_pdf(flow, terms_flow, f'Purchase Order {po.get("po_no", "")}')
+
+
 def render_po_pdf(po: dict) -> bytes:
     """Dispatch on po['po_type']. BULK renders byte-for-byte as before; JOB_WORK
-    renders the multi-item layout."""
-    if (po.get('po_type') or 'BULK').upper() == 'JOB_WORK':
+    renders the multi-item layout; GENERIC renders the free-form configurable-table
+    layout."""
+    po_type = (po.get('po_type') or 'BULK').upper()
+    if po_type == 'JOB_WORK':
         return _render_job_work_po_pdf(po)
+    if po_type == 'GENERIC':
+        return _render_generic_po_pdf(po)
     return _render_bulk_po_pdf(po)

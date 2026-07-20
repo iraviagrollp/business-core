@@ -1572,6 +1572,83 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
     on one line at 8.5pt in the ~7.85cm particulars column); pathologically long combined names
     will still wrap and consume more vertical space, same as before this change.
 
+- [x] **Purchase Orders — third PO type GENERIC added alongside BULK and JOB_WORK (2026-07-20):**
+  a free-form, NON-priced PO with a user-configurable table (arbitrary columns/rows, free text),
+  configurable subject/body, and the usual supplier + bill-to + ship-to + signatory — no
+  product/quantity/rate/GST/amount/total math, no line-items table. All Generic-specific content
+  lives in one new JSONB column, `procurement.purchase_orders.generic_config`
+  (`{subject, body, columns: [str,...], rows: [[str,...],...]}`) — **IaC migration owned by the
+  `iac` agent, assumed present, not created here**.
+  - `handler.py`: `_VALID_PO_TYPES` gains `'GENERIC'`. `_po_validate` restructured — a `common`
+    dict (supplier/bill-to/ship-to/signatory/note/po_type/include_terms) is now shared by all
+    three types; `supplier_company_id` is required for every type (moved out of the BULK/JOB_WORK-only
+    block). For GENERIC it returns early with `product_technical_id/quantity/quantity_unit/rate/
+    gst_rate/terms/dispatch/transport/items = None` and a new `generic_config` (validated by new
+    `_po_validate_generic_config`) — no reconciliation guard, no items requirement. New helper
+    coerces `columns` (non-empty array, required) and defensively pads/truncates each `rows[i]` to
+    `len(columns)`, coercing every cell to a string (free text); `body` defaults to the standard
+    text (`_GENERIC_DEFAULT_BODY`) when blank, `subject` defaults to `''`. BULK/JOB_WORK validation
+    logic is otherwise byte-identical to before (same required fields, same reconciliation guard),
+    just re-indented under the post-`common` branch; both now also return `generic_config: None`.
+    `_PO_SELECT`'s `technicals` join changed **INNER → LEFT** (`t` may be NULL for GENERIC rows,
+    which have no `product_technical_id`) — BULK/JOB_WORK unaffected since they always set it; added
+    `po.generic_config` to the select list (psycopg2 auto-parses jsonb to a dict/`None`, no manual
+    `json.loads` needed on read). `_po_create`'s INSERT and `_PO_UPDATE_SQL`/`_po_update_params` both
+    gained a `generic_config` column, written via `json.dumps(...)` (or `None`) — Postgres infers the
+    `jsonb` cast from the target column, same pattern used elsewhere in this codebase for text params
+    against typed columns. `_po_update`'s existing `if p['po_type'] != 'JOB_WORK':` branch already
+    covers GENERIC (single-statement `_write()` path, no items) — no change needed there. `_po_list`/
+    `_po_get_one` needed no change: `items_by_po`/`_po_apply_job_work_totals` are only invoked for
+    `po_type == 'JOB_WORK'` ids, so GENERIC rows naturally get `items: []` and keep their SQL-computed
+    `amount`/`gst_amount`/`total_value` as `NULL` (quantity/rate are NULL for GENERIC → the existing
+    `ROUND(po.quantity * po.rate, ...)` expressions evaluate to NULL with no code change — UI should
+    render these as "—" for GENERIC rows).
+  - `po_pdf.py`: new `_render_generic_po_pdf` + `render_po_pdf` dispatch branch. Reuses all shared
+    scaffolding — `_header`, `_po_title_cell` ("PURCHASE ORDER" banner), `_po_box` (PO Number/Date,
+    number in orange), `_vendor_box` ("VENDOR / SUPPLIER", GSTIN inline), `_addr_para` (Bill To/Ship
+    To), `_section_label`, `_note_flow`, `_signature_flow` ("Thanking you," / "Yours faithfully," /
+    For IAL / signatory name-title-department — reused as-is rather than re-implementing the
+    slightly different capitalization sketched in the task brief, to stay byte-consistent with
+    BULK/JOB_WORK's signature block), `_terms_flow`, `_build_pdf`. Body order: title+PO box → VENDOR/
+    SUPPLIER box → optional `Subject: <text>` line (bold label) → `Dear Sir,` salutation + the
+    configurable body text (defaults to `_GENERIC_DEFAULT_BODY`, a defensive fallback duplicate of
+    `handler._GENERIC_DEFAULT_BODY` since the handler already defaults it before persisting) with the
+    standard "acknowledge this order / quote `<po_no>`" sentence appended in orange (same treatment
+    as BULK/JOB_WORK) → the configurable table (green header band, bordered grid, one row per
+    `generic_config.rows[i]`, NO totals row) → BILL TO / SHIP TO → note band → signature block →
+    Terms & Conditions (when `include_terms`). New `_generic_col_widths(columns, dw)` gives a narrow
+    ~1.1cm width to a leading serial-number-looking column (`_is_serial_col`: S No./Sl./Sr No./No.),
+    the widest share (40% of the remainder) to a Particulars/Description/Item/Name-looking column
+    (`_is_particulars_col`) if present, else splits evenly; handles the 0/1-column edge cases without
+    crashing. The table is a plain `Table` (not wrapped in `KeepTogether`) so it paginates naturally
+    across pages for large row counts. Terms & Conditions uses the **JOB_WORK-style deterministic
+    approach** (explicit `PageBreak()` before `_terms_flow` when `include_terms`), not BULK's
+    leftover-space approach — chosen because the configurable table's row count is unbounded like
+    JOB_WORK's item grid, so a forced break keeps "core page(s) / terms starts fresh" predictable
+    regardless of how many rows the caller configures.
+  - Verified: `python -m py_compile handler.py po_pdf.py` clean. Smoke-tested (temp script, deleted
+    together with `__pycache__` afterward) via `render_po_pdf` for GENERIC at 0/1/6/60 rows ×
+    `include_terms` True/False (0/1/6 rows: 2 pages terms-on, 1 page terms-off; 60 rows: 4 pages
+    terms-on, 3 pages terms-off — core table itself spills before terms even starts), a no-subject
+    variant, and a single-column edge case — no exceptions, non-trivial byte counts (~216–224 KB).
+    `pypdf` text-extraction confirmed: default body text renders when `body=''`, the subject line and
+    PO number (in the ack sentence) appear on page 1, and "TERMS"/"CONDITIONS" appear only on the
+    final page (never page 1 when `include_terms=True`). Re-confirmed BULK (1 page either way) and
+    JOB_WORK (1/2 items × terms on/off) still render with unchanged page-count behavior — no
+    regression.
+  - **Not done here (follow-ups):** `iac` agent owns the `generic_config JSONB` column migration
+    (assumed present per the task) — confirm it's nullable and doesn't add a `NOT NULL` on
+    `product_technical_id`/`quantity`/`quantity_unit`/`rate`/`gst_rate`/`terms`/`dispatch`/
+    `transport` (this handler now writes `NULL` into all of those for GENERIC rows; if any of them
+    currently has a `NOT NULL` constraint from migration 039, `_po_create`/`_po_update` will raise a
+    Postgres `NotNullViolation` for GENERIC — surfaces as an unhandled 500, not a clean 400, since
+    only `ForeignKeyViolation`/`UniqueViolation` are caught by `_write()`). `procurement-ui` needs a
+    GENERIC create/edit form (subject/body text inputs + an editable columns/rows grid with
+    add/remove column and add/remove row) and must send `po_type: 'GENERIC'` + `generic_config` in
+    the create/update body; list/detail responses now always include `generic_config` (null for
+    BULK/JOB_WORK) and `items: []` for GENERIC, so the UI's PO list/detail can branch on `po_type`
+    to render the right summary/preview.
+
 - [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
   Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
   exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no
