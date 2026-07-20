@@ -531,20 +531,121 @@ _PO_SELECT = """
     LEFT JOIN procurement.signatory_authorities sa ON sa.id = po.signatory_id
 """
 
-_VALID_QTY_UNITS = ('KGS', 'LTRS')
+_VALID_QTY_UNITS_BULK = ('KGS', 'LTRS')
+_VALID_QTY_UNITS_JOB_WORK = ('KGS', 'TONNE', 'LTRS', 'KL')
+_VALID_PO_TYPES = ('BULK', 'JOB_WORK')
+
+# Header quantity_unit -> (base unit stored on each line item, multiplier to convert
+# the header quantity into that base unit for the reconciliation guard below).
+_UNIT_BASE = {'KGS': ('KGS', 1), 'TONNE': ('KGS', 1000), 'LTRS': ('LTRS', 1), 'KL': ('LTRS', 1000)}
+
+# JOIN chain reused from _PACKAGING_SELECT (packagings -> packaging_meta) to expose the
+# same 'packaging' label on each purchase_order_items row.
+_PO_ITEMS_SELECT_BASE = """
+    SELECT poi.po_id, poi.sl_no, poi.technical_id, t.technical_name, t.brand_name,
+           poi.packaging_id, m.label AS packaging,
+           poi.quantity, poi.rate, poi.amount
+    FROM procurement.purchase_order_items poi
+    JOIN procurement.technicals t ON t.id = poi.technical_id
+    LEFT JOIN procurement.packagings pkg ON pkg.id = poi.packaging_id
+    LEFT JOIN procurement.packaging_meta m ON m.id = pkg.packaging_meta_id
+"""
+
+
+def _po_items_for(_id):
+    """Items for a single PO, in sl_no order — po_id stripped from each row."""
+    rows = _query(_PO_ITEMS_SELECT_BASE + ' WHERE poi.po_id = %s ORDER BY poi.sl_no', (_id,))
+    for r in rows:
+        r.pop('po_id', None)
+    return rows
+
+
+def _po_items_for_many(po_ids):
+    """Items for several POs in one query (avoids N+1 on /purchase-orders list),
+    grouped by po_id -> [item, ...]; po_id stripped from each row."""
+    if not po_ids:
+        return {}
+    rows = _query(
+        _PO_ITEMS_SELECT_BASE + ' WHERE poi.po_id = ANY(%s) ORDER BY poi.po_id, poi.sl_no',
+        (list(po_ids),),
+    )
+    out = {}
+    for r in rows:
+        out.setdefault(r.pop('po_id'), []).append(r)
+    return out
+
+
+def _po_write_items(cur, po_id, items):
+    """Replace all line items for a PO (same cursor/transaction as the header write)."""
+    cur.execute('DELETE FROM procurement.purchase_order_items WHERE po_id = %s', (po_id,))
+    for sl_no, it in enumerate(items, 1):
+        cur.execute(
+            'INSERT INTO procurement.purchase_order_items '
+            '(po_id, sl_no, technical_id, packaging_id, quantity, rate, amount) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+            (po_id, sl_no, it['technical_id'], it['packaging_id'], it['quantity'], it['rate'], it['amount']),
+        )
 
 
 def _po_list():
-    return _response(200, _query(_PO_SELECT + ' ORDER BY po.po_date DESC, po.po_seq DESC'))
+    rows = _query(_PO_SELECT + ' ORDER BY po.po_date DESC, po.po_seq DESC')
+    items_by_po = _po_items_for_many([r['id'] for r in rows if r['po_type'] == 'JOB_WORK'])
+    for r in rows:
+        r['items'] = items_by_po.get(r['id'], [])
+    return _response(200, rows)
 
 
 def _po_get_one(_id):
     rows = _query(_PO_SELECT + ' WHERE po.id = %s', (_id,))
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    po = rows[0]
+    po['items'] = _po_items_for(_id) if po['po_type'] == 'JOB_WORK' else []
+    return po
+
+
+def _po_validate_items(raw_items, header_unit, header_qty):
+    """Validate/coerce JOB_WORK line items and enforce the reconciliation guard: the sum
+    of item quantities (each already in its base unit) must equal the header quantity
+    converted to that same base unit (TONNE->x1000 KGS, KL->x1000 LTRS)."""
+    if not raw_items or not isinstance(raw_items, list):
+        raise auth.AuthError('items is required for JOB_WORK purchase orders', 400)
+    base_unit, factor = _UNIT_BASE[header_unit]
+    base_qty = header_qty * factor
+    items = []
+    total = 0.0
+    for it in raw_items:
+        it = it or {}
+        technical_id = _int(it.get('technical_id'))
+        if not technical_id:
+            raise auth.AuthError('Each item requires a technical_id', 400)
+        qty = _num(it.get('quantity'))
+        if qty is None:
+            raise auth.AuthError('Each item requires a quantity', 400)
+        rate = _num(it.get('rate')) or 0
+        items.append({
+            'technical_id': technical_id,
+            'packaging_id': _int(it.get('packaging_id')),
+            'quantity': qty,
+            'rate': rate,
+            'amount': round(qty * rate, 2),
+        })
+        total += qty
+    if abs(total - base_qty) >= 0.01:
+        raise auth.AuthError(
+            f'Item quantities total {total:.2f} {base_unit}, but header quantity is '
+            f'{header_qty:g} {header_unit} ({base_qty:.2f} {base_unit}). They must match.',
+            400,
+        )
+    return items
 
 
 def _po_validate(b):
-    """Validate + coerce the shared PO fields. Returns a params dict (no po_no/seq)."""
+    """Validate + coerce the shared PO fields. Returns a params dict (no po_no/seq).
+    For JOB_WORK, also validates + coerces b['items'] (params['items']; None for BULK)."""
+    po_type = (_s(b.get('po_type')) or 'BULK').upper()
+    if po_type not in _VALID_PO_TYPES:
+        raise auth.AuthError('po_type must be one of BULK, JOB_WORK', 400)
     supplier_company_id = _int(b.get('supplier_company_id'))
     product_technical_id = _int(b.get('product_technical_id'))
     quantity = _num(b.get('quantity'))
@@ -555,8 +656,10 @@ def _po_validate(b):
         raise auth.AuthError('product_technical_id is required', 400)
     if quantity is None:
         raise auth.AuthError('quantity is required', 400)
-    if unit not in _VALID_QTY_UNITS:
-        raise auth.AuthError('quantity_unit must be one of KGS, LTRS', 400)
+    valid_units = _VALID_QTY_UNITS_JOB_WORK if po_type == 'JOB_WORK' else _VALID_QTY_UNITS_BULK
+    if unit not in valid_units:
+        raise auth.AuthError(f'quantity_unit must be one of {", ".join(valid_units)}', 400)
+    items = _po_validate_items(b.get('items'), unit, quantity) if po_type == 'JOB_WORK' else None
     gst_rate = _num(b.get('gst_rate'))
     return {
         'supplier_company_id': supplier_company_id,
@@ -572,7 +675,8 @@ def _po_validate(b):
         'ship_to_company_id': _int(b.get('ship_to_company_id')),
         'signatory_id': _int(b.get('signatory_id')),
         'note': _s(b.get('note')),
-        'po_type': (_s(b.get('po_type')) or 'BULK').upper(),
+        'po_type': po_type,
+        'items': items,
     }
 
 
@@ -618,6 +722,8 @@ def _po_create(event):
                         ),
                     )
                     new_id = cur.fetchone()[0]
+                    if p['po_type'] == 'JOB_WORK':
+                        _po_write_items(cur, new_id, p['items'])
                 conn.commit()
                 return _response(201, _po_get_one(new_id))
             except psycopg2.errors.UniqueViolation:
@@ -627,24 +733,56 @@ def _po_create(event):
         conn.close()
 
 
+# po_no / po_date / po_seq are immutable once created — only the content changes.
+_PO_UPDATE_SQL = (
+    'UPDATE procurement.purchase_orders SET '
+    'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
+    'rate=%s, gst_rate=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
+    'ship_to_company_id=%s, signatory_id=%s, note=%s '
+    'WHERE id=%s RETURNING id'
+)
+
+
+def _po_update_params(p, _id):
+    return (
+        p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
+        p['quantity_unit'], p['rate'], p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
+        p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'], _id,
+    )
+
+
 def _po_update(event, _id):
     b = _json_body(event)
     p = _po_validate(b)
-    # po_no / po_date / po_seq are immutable once created — only the content changes.
-    row = _write(
-        'UPDATE procurement.purchase_orders SET '
-        'po_type=%s, supplier_company_id=%s, product_technical_id=%s, quantity=%s, quantity_unit=%s, '
-        'rate=%s, gst_rate=%s, terms=%s, dispatch=%s, transport=%s, bill_to_company_id=%s, '
-        'ship_to_company_id=%s, signatory_id=%s, note=%s '
-        'WHERE id=%s RETURNING id',
-        (
-            p['po_type'], p['supplier_company_id'], p['product_technical_id'], p['quantity'],
-            p['quantity_unit'], p['rate'], p['gst_rate'], p['terms'], p['dispatch'], p['transport'],
-            p['bill_to_company_id'], p['ship_to_company_id'], p['signatory_id'], p['note'], _id,
-        ),
-    )
-    if row is None:
-        return _response(404, {'error': 'Purchase order not found'})
+
+    if p['po_type'] != 'JOB_WORK':
+        # BULK — unchanged single-statement write via the shared _write() helper.
+        row = _write(_PO_UPDATE_SQL, _po_update_params(p, _id))
+        if row is None:
+            return _response(404, {'error': 'Purchase order not found'})
+        return _response(200, _po_get_one(_id))
+
+    # JOB_WORK — header update + item replace must be the same transaction so a
+    # failure on either rolls back both.
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(_PO_UPDATE_SQL, _po_update_params(p, _id))
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return _response(404, {'error': 'Purchase order not found'})
+                _po_write_items(cur, _id, p['items'])
+            except psycopg2.errors.ForeignKeyViolation:
+                conn.rollback()
+                raise _InUse('This record is referenced by other records and cannot be deleted or changed.')
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise auth.AuthError('A record with the same key already exists.', 409)
+            conn.commit()
+    finally:
+        conn.close()
     return _response(200, _po_get_one(_id))
 
 

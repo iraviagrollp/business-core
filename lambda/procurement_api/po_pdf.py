@@ -283,7 +283,7 @@ def _addr_para(po, prefix, st):
     return Paragraph('<br/>'.join(lines), st['addr'])
 
 
-def render_po_pdf(po: dict) -> bytes:
+def _render_bulk_po_pdf(po: dict) -> bytes:
     st = _styles()
     buf = BytesIO()
     doc = BaseDocTemplate(
@@ -472,3 +472,249 @@ def render_po_pdf(po: dict) -> bytes:
 
     doc.build(flow)
     return buf.getvalue()
+
+
+# ── Job Work Purchase Order ────────────────────────────────────────────────────
+
+# Header quantity_unit -> base unit each line item's own 'quantity' is stored in
+# (TONNE items are in KGS; KL items are in LTRS) — mirrors handler.py's _UNIT_BASE.
+_UNIT_BASE_LABEL = {'KGS': 'KGS', 'TONNE': 'KGS', 'LTRS': 'LTRS', 'KL': 'LTRS'}
+
+
+def _job_work_particulars(it) -> str:
+    """'{technical_name} - {brand_name} - {packaging}', gracefully omitting missing
+    brand/packaging."""
+    parts = [it.get('technical_name') or '']
+    if it.get('brand_name'):
+        parts.append(it['brand_name'])
+    if it.get('packaging'):
+        parts.append(it['packaging'])
+    return ' - '.join(p for p in parts if p)
+
+
+def _render_job_work_po_pdf(po: dict) -> bytes:
+    st = _styles()
+    buf = BytesIO()
+    doc = BaseDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
+        title=f'Job Work Purchase Order {po.get("po_no", "")}',
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
+    doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_draw_footer)])
+    dw = doc.width
+
+    items = po.get('items') or []
+    gst_rate = float(po.get('gst_rate') or 0)
+    # Amount is the sum of item amounts (NOT the header quantity*rate SQL field —
+    # items carry the real per-line rate/quantity for JOB_WORK POs).
+    amount = round(sum(float(it.get('amount') or 0) for it in items), 2)
+    gst_amt = round(amount * gst_rate / 100, 2)
+    total = round(amount + gst_amt, 2)
+    gst_lbl = f'{gst_rate:g}'
+
+    header_unit = (po.get('quantity_unit') or '').upper()
+    base_unit = _UNIT_BASE_LABEL.get(header_unit, header_unit)
+    dash = '—'
+
+    flow = [_header(st, doc), Spacer(1, 2)]
+    flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
+    flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
+
+    # Title row + PO box.
+    title_cell = [Paragraph('JOB WORK PURCHASE ORDER', st['potitle']),
+                  HRFlowable(width=3.2 * cm, thickness=2.2, color=_ORANGE, spaceBefore=4, hAlign='LEFT')]
+    trow = Table([[title_cell, _po_box(st, po)]], colWidths=[dw - 6.0 * cm, 6.0 * cm])
+    trow.setStyle(TableStyle([('VALIGN', (0, 0), (0, 0), 'MIDDLE'), ('VALIGN', (1, 0), (1, 0), 'TOP'),
+                              ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+    flow.append(trow)
+
+    # Job Worker (the reused supplier_company_id).
+    flow += _section_label('JOB WORKER', st, dw)
+    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
+    sup_lines = [po.get(k) for k in ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
+    if sup_lines:
+        ven.append(Paragraph(', '.join(_esc(x) for x in sup_lines), st['body']))
+    if po.get('supplier_gstin'):
+        ven.append(Paragraph(f'GSTIN: {_esc(po["supplier_gstin"])}', st['body']))
+    vbox = Table([[ven]], colWidths=[dw])
+    vbox.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    flow.append(vbox)
+
+    # Product + header quantity — adjacent to the Job Worker block.
+    flow += _section_label('PRODUCT', st, dw)
+    prod_line = (f'<font name="{_BOLD}">{_esc(po.get("technical_name"))}</font>'
+                 f' &nbsp;{dash}&nbsp; Brand: {_esc(po.get("brand_name") or dash)}'
+                 f' &nbsp;{dash}&nbsp; Quantity: <font name="{_BOLD}">{_fmt_qty(po.get("quantity"))} '
+                 f'{_esc(header_unit)}</font>')
+    pbox = Table([[Paragraph(prod_line, st['body'])]], colWidths=[dw])
+    pbox.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
+        ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    flow.append(pbox)
+
+    # Salutation + body.
+    flow.append(Spacer(1, 11))
+    flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
+    po_no = _esc(po.get('po_no'))
+    body = (f'We are pleased to place the following job work order with you, on the terms set out below. '
+            f'Please <font name="{_BOLD}" color="#17452f">acknowledge this order</font> and quote '
+            f'<font name="{_BOLD}" color="#17452f">{po_no}</font> on every invoice, delivery challan, '
+            f'e-way bill and communication relating to this supply.')
+    flow.append(Paragraph(body, st['bodyb']))
+
+    # Order details — multi-row particulars grid (one row per item).
+    flow += _section_label('ORDER DETAILS', st, dw)
+    head = [Paragraph('SL.', st['thc']), Paragraph('PARTICULARS', st['th']),
+            Paragraph('QUANTITY', st['thc']), Paragraph(f'RATE ({_RS})', st['thr']),
+            Paragraph(f'AMOUNT ({_RS})', st['thr'])]
+    col = [1.15 * cm, dw - 1.15 * cm - 3.6 * cm - 2.5 * cm - 2.9 * cm, 3.6 * cm, 2.5 * cm, 2.9 * cm]
+    body_rows = []
+    for i, it in enumerate(items, 1):
+        qty = float(it.get('quantity') or 0)
+        rate = float(it.get('rate') or 0)
+        it_amount = float(it.get('amount') if it.get('amount') is not None else qty * rate)
+        body_rows.append([
+            Paragraph(str(i), st['cellc']),
+            Paragraph(_esc(_job_work_particulars(it)), st['cell']),
+            Paragraph(f'{_fmt_qty(qty)} {_esc(base_unit)}', st['cellc']),
+            Paragraph(_inr(rate), st['cellr']),
+            Paragraph(_inr(it_amount), st['cellr']),
+        ])
+    total_row_idx = len(body_rows) + 1
+    total_row = ['', Paragraph('TOTAL', st['bodyb']), '', '', Paragraph(_inr(amount), st['cellr'])]
+    gtab = Table([head] + body_rows + [total_row], colWidths=col, repeatRows=1)
+    gtab.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), _GREEN),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LINEBEFORE', (1, 0), (4, 0), 0.7, _GREEN2),
+        ('LINEBELOW', (0, 1), (-1, total_row_idx - 1), 0.4, colors.HexColor('#dcdcdc')),
+        ('SPAN', (0, total_row_idx), (3, total_row_idx)),
+        ('LINEABOVE', (0, total_row_idx), (-1, total_row_idx), 0.7, _GREEN),
+        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    flow.append(gtab)
+
+    # Totals: words (left) + taxable/gst/total (right) — same band as BULK, fed by
+    # the item-grid's Σ amount.
+    words_cell = [Paragraph('TOTAL ORDER VALUE IN WORDS', st['seclabel']), Spacer(1, 3),
+                  Paragraph(_amount_in_words(total), st['words'])]
+    right = Table(
+        [[Paragraph('Taxable Value', st['cell']), Paragraph(_inr(amount), st['cellr'])],
+         [Paragraph(f'GST @ {gst_lbl}%', st['cell']), Paragraph(_inr(gst_amt), st['cellr'])],
+         [Paragraph('Total Order Value', st['tot']), Paragraph(f'{_RS} {_inr(total)}', st['totr'])]],
+        colWidths=[(dw / 2) - 3.4 * cm, 3.4 * cm])
+    right.setStyle(TableStyle([
+        ('BACKGROUND', (0, 2), (-1, 2), _GREEN),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LINEBELOW', (0, 0), (-1, 0), 0.5, _RULE), ('LINEBELOW', (0, 1), (-1, 1), 0.5, _RULE),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    tot = Table([[words_cell, right]], colWidths=[dw / 2, dw / 2])
+    tot.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, 0), _TINT), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (0, 0), 0.5, _RULE),
+        ('TOPPADDING', (0, 0), (0, 0), 5), ('BOTTOMPADDING', (0, 0), (0, 0), 5),
+        ('LEFTPADDING', (0, 0), (0, 0), 8), ('RIGHTPADDING', (0, 0), (0, 0), 8),
+        ('LEFTPADDING', (1, 0), (1, 0), 6), ('RIGHTPADDING', (1, 0), (1, 0), 0),
+        ('TOPPADDING', (1, 0), (1, 0), 0), ('BOTTOMPADDING', (1, 0), (1, 0), 0),
+    ]))
+    flow.append(Spacer(1, 4))
+    flow.append(tot)
+
+    # To Be Billed On / Delivered At (relabeled BILL TO / SHIP TO, same _addr_para()).
+    flow.append(Spacer(1, 3))
+    bs = Table(
+        [[Paragraph('TO BE BILLED ON', st['seclabel']), Paragraph('DELIVERED AT', st['seclabel'])],
+         [_addr_para(po, 'bill_to', st), _addr_para(po, 'ship_to', st)]],
+        colWidths=[dw / 2, dw / 2])
+    bs.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('LINEBEFORE', (1, 0), (1, -1), 0.5, _RULE),
+        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    flow.append(bs)
+
+    # Commercial terms.
+    flow += _section_label('COMMERCIAL TERMS', st, dw)
+    ct = [
+        ('Payment Terms', po.get('terms')),
+        ('Dispatch Schedule', po.get('dispatch')),
+        ('Mode of Transport', po.get('transport')),
+        ('Taxes', f'GST @ {gst_lbl}% extra as applicable; rate quoted is exclusive of GST'),
+    ]
+    ctd = [[Paragraph(lbl, st['ctlabel']), Paragraph(_esc(val) if val else '&mdash;', st['ctval'])] for lbl, val in ct]
+    ctab = Table(ctd, colWidths=[4.6 * cm, dw - 4.6 * cm])
+    ctab.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), _GRAYLABEL), ('GRID', (0, 0), (-1, -1), 0.5, _RULE),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 2.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    flow.append(ctab)
+
+    # Terms & conditions (shared).
+    flow += _section_label('TERMS & CONDITIONS', st, dw)
+    tcd = [[Paragraph(f'{i}.', st['tc']), Paragraph(_esc(t), st['tc'])] for i, t in enumerate(_TERMS, 1)]
+    tctab = Table(tcd, colWidths=[0.6 * cm, dw - 0.6 * cm])
+    tctab.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('TOPPADDING', (0, 0), (-1, -1), 1), ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+        ('LEFTPADDING', (0, 0), (0, -1), 2), ('LEFTPADDING', (1, 0), (1, -1), 2),
+    ]))
+    flow.append(tctab)
+
+    # Note band (shared).
+    note = po.get('note')
+    if note:
+        note_html = (f'<font name="{_BOLD}" color="#c8641e">Note:</font> '
+                     f'<font backColor="#E9FF2E">&nbsp;{_esc(note)}&nbsp;</font>')
+        nb = Table([[Paragraph(note_html, st['note'])]], colWidths=[dw])
+        nb.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fffdf3')),
+            ('LINEBEFORE', (0, 0), (0, -1), 3, _ORANGE),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#efe4cf')),
+            ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ]))
+        flow.append(Spacer(1, 4))
+        flow.append(nb)
+
+    # Signature (shared) — Thanking you / Yours faithfully above "For IRAVI AGRO LIFE LLP".
+    flow.append(Spacer(1, 3))
+    flow.append(Paragraph('Thanking you,', st['sign']))
+    flow.append(Paragraph('Yours faithfully,', st['sign']))
+    flow.append(Spacer(1, 6))
+    flow.append(Paragraph(f'For <font name="{_BOLD}">IRAVI AGRO LIFE LLP</font>', st['signr']))
+    flow.append(Spacer(1, 30))  # room for a physical signature
+    flow.append(HRFlowable(width=dw / 2, thickness=0.6, color=_MUTED, hAlign='RIGHT', spaceAfter=4))
+    if po.get('signatory_name'):
+        flow.append(Paragraph(_esc(po['signatory_name']), st['signrb']))
+    if po.get('signatory_title'):
+        flow.append(Paragraph(_esc(po['signatory_title']), st['signrs']))
+    if po.get('signatory_department'):
+        flow.append(Paragraph(_esc(po['signatory_department']), st['signrs']))
+
+    doc.build(flow)
+    return buf.getvalue()
+
+
+def render_po_pdf(po: dict) -> bytes:
+    """Dispatch on po['po_type']. BULK renders byte-for-byte as before; JOB_WORK
+    renders the multi-item layout."""
+    if (po.get('po_type') or 'BULK').upper() == 'JOB_WORK':
+        return _render_job_work_po_pdf(po)
+    return _render_bulk_po_pdf(po)
