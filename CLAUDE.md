@@ -1466,6 +1466,48 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
     `items[]` in the create/update body; `GET`/list responses now always include `items` (empty for
     BULK) so the UI can render either type from one PO list.
 
+- [x] **Purchase Order PDF fixes + `include_terms` flag (2026-07-20):** review pass on the JOB_WORK
+  PDF; four `po_pdf.py` fixes applied to BOTH BULK and JOB_WORK, plus one `handler.py` field.
+  - **Title unified:** JOB_WORK no longer renders "JOB WORK PURCHASE ORDER" — both PO types now show
+    the identical letter-spaced "PURCHASE ORDER" banner via a new shared `_po_title_cell(st)` helper.
+  - **Supplier GSTIN inline:** the supplier/vendor box (new shared `_vendor_box(po, st, dw)` helper,
+    used by both BULK's "VENDOR / SUPPLIER" and JOB_WORK's "JOB WORKER" sections) now appends
+    `GSTIN: <gstin>` to the same paragraph as the last address line (`&nbsp;&nbsp;&nbsp;` separator)
+    instead of rendering it as its own line.
+  - **Product summary centered:** JOB_WORK's `{technical} — Brand: X — Quantity: Y` line now uses a
+    new centered style `st['bodyc']` (was `st['body']`, left-aligned).
+  - **`include_terms` flag:** `po_pdf.py` reads `po.get('include_terms', True)`; when falsy the
+    Terms & Conditions section is omitted entirely (both PO types). `handler.py` accepts the new
+    boolean body field `include_terms` (default `True`, coerced via `bool()`) in `_po_validate`,
+    persists it in `_po_create`/`_po_update` (new `procurement.purchase_orders.include_terms` column,
+    **IaC migration owned by the `iac` agent — assumed present, not created here**), and returns it
+    in `_PO_SELECT` (so the PDF renderer and the UI both see it).
+  - **One-page-else-terms-on-fresh-page layout (reworked twice during this session — final approach
+    below):** the flow order was changed so Note + Signature (new shared `_note_flow` /
+    `_signature_flow` helpers) render immediately after Commercial Terms, and Terms & Conditions
+    (new shared `_terms_flow` helper) is now the LAST section — previously it sat between Commercial
+    Terms and Note. New `_build_pdf(core_flow, terms_flow, title)` does a **single** `doc.build()`
+    call, wrapping `terms_flow` in one `reportlab.platypus.KeepTogether`: if it fits in the space
+    remaining on the current page it stays there (no forced blank page); if not, the whole section
+    (never split mid-list) moves to a fresh page. `_signature_flow`'s block is ALSO wrapped in its
+    own `KeepTogether` — without it, the trailing signatory name/title/department paragraphs could
+    separate from the "Yours faithfully / For IAL / signature line" above them and strand on their
+    own near-empty page (found via the page-content smoke test below). **Two earlier approaches were
+    tried and abandoned:** (1) a naive two-pass "measure page count, then re-add a `PageBreak()`
+    before terms" — broke because reportlab flowables are STATEFUL (`wrap()`/`split()` mutate
+    internal caches during `doc.build()`), so reusing the same Paragraph/Table instances across a
+    second `.build()` call corrupted layout and raised spurious `LayoutError`s; (2) making the
+    two-pass rebuild flowables fresh via a builder callable fixed the crash but still forced an
+    unnecessary near-blank page whenever the core content itself (large item grids) already spilled
+    past page 1 for reasons unrelated to terms. The final single-pass `KeepTogether`-only approach
+    has neither problem and needs no page-count measurement at all.
+  - Verified: `python -m py_compile handler.py po_pdf.py` clean. Smoke-tested `render_po_pdf` (via a
+    deleted temp script) for BULK (1 page, terms on/off), JOB_WORK 2-row (2 pages terms-on, 1 page
+    terms-off), and JOB_WORK at 5/6/7/8/9/10/15/20/25/30/40 rows terms-on (2 pages through 25 rows,
+    3 pages at 30+ once the item grid itself needs 2 pages) — Terms & Conditions and the signature
+    block were confirmed (via per-page `pypdf` text extraction) to always land intact on a single
+    page, never split across the boundary, and no `LayoutError`s at any row count.
+
 - [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
   Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
   exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no

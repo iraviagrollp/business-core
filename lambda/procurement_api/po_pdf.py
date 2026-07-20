@@ -28,8 +28,8 @@ from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    BaseDocTemplate, Frame, HRFlowable, Image, KeepTogether, PageBreak, PageTemplate, Paragraph,
-    Spacer, Table, TableStyle,
+    BaseDocTemplate, Frame, HRFlowable, Image, KeepTogether, PageTemplate, Paragraph, Spacer, Table,
+    TableStyle,
 )
 
 _DIR = os.path.dirname(__file__)
@@ -372,48 +372,28 @@ def _terms_flow(st, dw):
     return flow
 
 
-def _build_pdf(flow_builder, title):
-    """Two-pass build so the core PO content (everything up to and including the
-    signature block) never splits around the Terms & Conditions section.
+def _build_pdf(core_flow, terms_flow, title):
+    """Single-pass build. The Terms & Conditions section (terms_flow) is wrapped in
+    one KeepTogether so reportlab treats it as an atomic block: if it fits in the
+    space remaining on the current page, it stays right there (no forced blank
+    page); if it doesn't fit, reportlab pushes the WHOLE block onto a fresh page
+    instead of splitting the numbered list across the boundary. This is robust for
+    any number of grid/item rows in core_flow — no per-line hacks, no manual
+    page-count measurement/rebuild needed."""
+    flow = list(core_flow)
+    if terms_flow:
+        flow.append(KeepTogether(terms_flow))
 
-    `flow_builder()` returns a FRESH `(core_flow, terms_flow)` pair of flowable
-    lists on every call — reportlab flowables are stateful (wrap()/split() mutate
-    internal layout caches during doc.build()), so each build pass must be handed
-    brand-new Paragraph/Table instances rather than reusing ones from a prior pass.
-
-    Pass 1: render core_flow + terms_flow back-to-back on the normal frame flow. If
-    that already fits on a single page (or there's no terms section to move), keep
-    it — no forced page break, no blank page.
-
-    Pass 2 (only if pass 1 overflowed AND a terms section exists): insert an explicit
-    page break immediately before Terms & Conditions and rebuild from scratch, so the
-    whole section lands together on a fresh page 2 instead of splitting across the
-    boundary. This works for any number of grid/item rows — no per-line hacks.
-    """
-    def _try(flow):
-        buf = BytesIO()
-        doc = BaseDocTemplate(
-            buf, pagesize=A4,
-            leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
-            title=title,
-        )
-        frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
-        page_count = [0]
-
-        def _on_page(canvas, d):
-            page_count[0] += 1
-            _draw_footer(canvas, d)
-
-        doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_on_page)])
-        doc.build(flow)
-        return buf.getvalue(), page_count[0]
-
-    core_flow, terms_flow = flow_builder()
-    pdf_bytes, pages = _try(core_flow + terms_flow)
-    if pages > 1 and terms_flow:
-        core_flow2, terms_flow2 = flow_builder()
-        pdf_bytes, _pages2 = _try(core_flow2 + [PageBreak()] + terms_flow2)
-    return pdf_bytes
+    buf = BytesIO()
+    doc = BaseDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.5 * cm, rightMargin=1.5 * cm, topMargin=0.4 * cm, bottomMargin=1.1 * cm,
+        title=title,
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id='main')
+    doc.addPageTemplates([PageTemplate(id='po', frames=[frame], onPage=_draw_footer)])
+    doc.build(flow)
+    return buf.getvalue()
 
 
 def _render_bulk_po_pdf(po: dict) -> bytes:
@@ -428,14 +408,6 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     total = float(po.get('total_value') if po.get('total_value') is not None else round(amount + gst_amt, 2))
     gst_lbl = f'{gst_rate:g}'
 
-    def _flow():
-        return _bulk_flow(po, st, dw, qty, rate, gst_rate, gst_lbl, amount, gst_amt, total)
-
-    return _build_pdf(_flow, f'Purchase Order {po.get("po_no", "")}')
-
-
-def _bulk_flow(po, st, dw, qty, rate, gst_rate, gst_lbl, amount, gst_amt, total):
-    """Builds a FRESH (core_flow, terms_flow) pair — called once per _build_pdf pass."""
     flow = [_header(st, dw), Spacer(1, 2)]
     flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
     flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
@@ -550,7 +522,7 @@ def _bulk_flow(po, st, dw, qty, rate, gst_rate, gst_lbl, amount, gst_amt, total)
     flow += _signature_flow(po, st, dw)
 
     terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
-    return flow, terms_flow
+    return _build_pdf(flow, terms_flow, f'Purchase Order {po.get("po_no", "")}')
 
 
 # ── Job Work Purchase Order ────────────────────────────────────────────────────
@@ -588,16 +560,6 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
     base_unit = _UNIT_BASE_LABEL.get(header_unit, header_unit)
     dash = '—'
 
-    def _flow():
-        return _job_work_flow(po, st, dw, items, gst_rate, gst_lbl, amount, gst_amt, total,
-                               header_unit, base_unit, dash)
-
-    return _build_pdf(_flow, f'Job Work Purchase Order {po.get("po_no", "")}')
-
-
-def _job_work_flow(po, st, dw, items, gst_rate, gst_lbl, amount, gst_amt, total,
-                    header_unit, base_unit, dash):
-    """Builds a FRESH (core_flow, terms_flow) pair — called once per _build_pdf pass."""
     flow = [_header(st, dw), Spacer(1, 2)]
     flow.append(HRFlowable(width=dw, thickness=2.2, color=_GREEN, spaceBefore=2, spaceAfter=1.5))
     flow.append(HRFlowable(width=dw, thickness=0.8, color=_ORANGE, spaceAfter=3))
@@ -738,7 +700,7 @@ def _job_work_flow(po, st, dw, items, gst_rate, gst_lbl, amount, gst_amt, total,
     flow += _signature_flow(po, st, dw)
 
     terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
-    return flow, terms_flow
+    return _build_pdf(flow, terms_flow, f'Job Work Purchase Order {po.get("po_no", "")}')
 
 
 def render_po_pdf(po: dict) -> bytes:
