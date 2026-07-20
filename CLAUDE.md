@@ -1412,6 +1412,60 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   Amplify). **Manual:** apply 026→027→028 via psql; admins grant `procurement.*` screens to procurement
   roles in Access Control.
 
+- [x] **Purchase Orders — Job Work PO type (JOB_WORK) added alongside Bulk (2026-07-20):**
+  extends `_po_validate`/`_po_create`/`_po_update`/`_PO_SELECT`/`po_pdf.py` to support a second,
+  multi-line PO type on the SAME `purchase_orders` row (`po_type` discriminator, already a column)
+  plus N child rows in **`procurement.purchase_order_items`** (new table — IaC migration, assumed
+  present; not created here). BULK is untouched (same single-line shape, same numbering, same PDF
+  bytes via a renamed `_render_bulk_po_pdf` helper).
+  - `handler.py`: `_po_validate` now branches on `po_type` ('BULK' default | 'JOB_WORK'). BULK keeps
+    `quantity_unit` in `KGS|LTRS` exactly as before. JOB_WORK accepts `KGS|TONNE|LTRS|KL` and
+    **requires** a non-empty `items[]` (`{technical_id, packaging_id?, quantity, rate}`); each item's
+    `amount` is computed server-side (`quantity*rate`, never trusted from the client). New
+    `_po_validate_items` enforces the **reconciliation guard**: Σ item quantities (each already in
+    its base unit — KGS or LTRS) must equal the header quantity converted to that base unit
+    (TONNE→×1000 KGS, KL→×1000 LTRS, KGS/LTRS→as-is), tolerance `< 0.01`; violation → 400 with
+    message `"Item quantities total {X} {BASE}, but header quantity is {Y} {UNIT} ({Z} {BASE}).
+    They must match."`.
+  - `_po_create`/`_po_update`: for JOB_WORK, the header write and the item replace
+    (`DELETE FROM purchase_order_items WHERE po_id=...` then re-insert with sequential `sl_no`
+    starting at 1) happen on the **same cursor/transaction** so either both commit or both roll
+    back. `_po_update`'s JOB_WORK path no longer reuses the generic `_write()` helper (which opens
+    and closes its own connection) — it does its own `cur.execute`/`conn.commit()` with the same
+    ForeignKeyViolation→409/UniqueViolation→409 handling `_write()` provides; the BULK branch of
+    `_po_update` is unchanged (still via `_write()`). PO numbering (`IAL/{fy}/{seq}`, retry-on-race)
+    is untouched and shared by both types.
+  - `_PO_SELECT` already exposed `po_type`; added `_po_get_one`/`_po_list` now attach an `items[]`
+    array (empty `[]` for BULK). List avoids N+1 via one extra query keyed by `po_id = ANY(%s)`
+    for all JOB_WORK ids on the page (`_po_items_for_many`), grouped in Python. New
+    `_PO_ITEMS_SELECT_BASE` joins `technicals` (name/brand) and `packagings → packaging_meta`
+    (same join `_PACKAGING_SELECT` uses) to expose `packaging` (the size label). Item element shape:
+    `{sl_no, technical_id, technical_name, brand_name, packaging_id, packaging, quantity, rate,
+    amount}`.
+  - `po_pdf.py`: `render_po_pdf(po)` now dispatches on `po['po_type']` — `_render_bulk_po_pdf`
+    (renamed from the old `render_po_pdf`, body byte-for-byte unchanged) vs new
+    `_render_job_work_po_pdf`. JOB_WORK layout reuses all shared styling/helpers (`_header`,
+    `_section_label`, `_addr_para`, `_po_box`, `_TERMS`, amount-in-words, footer): title "JOB WORK
+    PURCHASE ORDER"; a tinted "PRODUCT" box (Product/Brand/header Quantity+unit) below the "JOB
+    WORKER" (renamed vendor) box; ORDER DETAILS renders a multi-row grid (SL / PARTICULARS /
+    QUANTITY / RATE ₹ / AMOUNT ₹, one row per item, `PARTICULARS = "{technical_name} - {brand_name}
+    - {packaging}"` with missing brand/packaging omitted, plus a TOTAL row) whose Σ amount feeds
+    the same green Taxable/GST/Total band + amount-in-words (NOT the header `quantity*rate` SQL
+    field — items carry the real per-line economics); BILL TO/SHIP TO relabeled "TO BE BILLED ON"
+    / "DELIVERED AT" (same `_addr_para()`, unchanged addressing logic); "Thanking you," / "Yours
+    faithfully," (already present in the BULK signature block) reused as-is. Single A4 page, no
+    pagination. Verified: `py_compile` clean on both files; `_po_validate` logic-tested (reconcile
+    pass/fail incl. tolerance, BULK unit unaffected, JOB_WORK missing-items 400) with boto3/psycopg2
+    stubbed out; `render_po_pdf` smoke-tested for both BULK (239 KB) and JOB_WORK (240 KB, incl. a
+    defensive empty-items edge case) — no exceptions, non-trivial byte counts.
+  - **Not done here (IaC/UI follow-up):** the `procurement.purchase_order_items` table + its
+    migration (FK `po_id → purchase_orders ON DELETE CASCADE`, FK `technical_id → technicals`, FK
+    `packaging_id → packagings` nullable, UNIQUE `(po_id, sl_no)`) is owned by the `iac` agent —
+    this handler assumes it exists. `procurement-ui` needs a JOB_WORK create/edit form (items grid
+    with add/remove rows, client-side mirror of the reconciliation guard) and to send `po_type` +
+    `items[]` in the create/update body; `GET`/list responses now always include `items` (empty for
+    BULK) so the UI can render either type from one PO list.
+
 - [x] New alert category `monthly_collection` — unconditional scheduled-PDF report alert (2026-07-12):
   Clones the `customer_balances_fy` / `supplier_balances_fy` unconditional report-alert pattern
   exactly (NOT the conditional `sales` pattern) — fires on every scheduled run, no
