@@ -115,6 +115,10 @@ business-core/
     │   │                        _handle_ledger_statement (per-voucher netting SQL unchanged).
     │   ├── supplier_ledger_statement.py ← SHARED (added 2026-07-20): compute_supplier_ledger_statement(...)
     │   │                        → dict. Extracted verbatim from _handle_supplier_ledger_statement.
+    │   │                        Gained a `city` field (2026-07-21) via a new LEFT-JOIN-style lookup on
+    │   │                        `supplier_accounts` (`UPPER(name)=UPPER(account_name) AND out_z IS NULL`)
+    │   │                        — same treatment as `ledger_statement.py`'s customer_details lookup; see
+    │   │                        "Supplier Ledger Statement PDF" entry below.
     │   ├── letterhead.py / pdf_fonts.py / DejaVuSans.ttf / DejaVuSans-Bold.ttf / ial-logo.png
     │   │                        ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/ (see
     │   │                        that package's entries below for full docs — keep both copies in sync).
@@ -125,20 +129,35 @@ business-core/
     │   │                        unchanged, so every OTHER consumer of this file is unaffected) — flagged
     │   │                        so a future "keep both copies in sync" pass doesn't silently drop it.
     │   ├── customer_balances_fy_pdf.py / supplier_balances_fy_pdf.py / monthly_sales_pdf.py /
-    │   │   monthly_collection_pdf.py ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/
-    │   │                        (unmodified — same renderers used for the SES email attachments).
+    │   │   monthly_collection_pdf.py ← bundled 2026-07-20 as byte-identical copies from
+    │   │                        alerts_evaluator/ (renderers themselves unmodified — same SES email
+    │   │                        attachments). **NO LONGER byte-identical to their alerts_evaluator/
+    │   │                        counterparts as of 2026-07-21** — each of these 4 files in `api/` (ONLY
+    │   │                        `api/`, not `alerts_evaluator/`) had its letterhead header switched from
+    │   │                        a page-1-only flowable (`list(letterhead.build_header(_CONTENT_W)) +
+    │   │                        [...]`) to a canvas callback that repeats on every page
+    │   │                        (`letterhead.draw_header` via a new per-file `_draw_header_footer(canvas,
+    │   │                        doc)`, passed as both `onFirstPage`/`onLaterPages` to `doc.build`), plus
+    │   │                        `topMargin` bumped from `0.6*cm`/`0.8*cm` to
+    │   │                        `letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3*cm` — see
+    │   │                        "Every-page letterhead header for all api/ report PDFs" entry below.
+    │   │                        `alerts_evaluator/`'s 4 copies (SES email attachments) intentionally kept
+    │   │                        on the OLD page-1-only flowable header — out of scope for this change,
+    │   │                        flagged here so a future "keep both copies in sync" pass doesn't
+    │   │                        overwrite this intentional divergence.
     │   ├── ledger_statement_pdf.py ← REWORKED (2026-07-21) to the client-approved "account statement"
     │   │                        design — see "Customer Ledger Statement PDF — client-approved redesign"
     │   │                        below for full detail (was: 2026-07-20 flat-table Dr=RED/Cr=GREEN layout,
     │   │                        now: per-FY tables, centered title, Location line, always-black balance,
     │   │                        closing-balance banner, Bank Particulars block, letterhead header
-    │   │                        repeating on every page). supplier_ledger_statement_pdf.py NOT touched by
-    │   │                        this change (still the 2026-07-20 flat-table layout, Dr/Cr swapped,
-    │   │                        single-page-1 flowable header).
-    │   ├── supplier_ledger_statement_pdf.py ← NEW (2026-07-20): render_supplier_ledger_statement_pdf(data)
-    │   │                        → bytes. Fully self-contained duplicate of ledger_statement_pdf.py with
-    │   │                        Dr/Cr SWAPPED (Dr→GREEN, Cr→RED) — supplier semantics, same convention as
-    │   │                        customer_balances_fy_pdf.py vs supplier_balances_fy_pdf.py.
+    │   │                        repeating on every page).
+    │   ├── supplier_ledger_statement_pdf.py ← REWORKED (2026-07-21, same session as the every-page-header
+    │   │                        pass above) from the 2026-07-20 flat-table Dr/Cr-swapped duplicate of
+    │   │                        ledger_statement_pdf.py to mirror ledger_statement_pdf.py's 2026-07-21
+    │   │                        "account statement" redesign, adapted for supplier/payable semantics — see
+    │   │                        "Supplier Ledger Statement PDF — mirrors the customer redesign" entry
+    │   │                        below. Still fully self-contained (no cross-import from
+    │   │                        ledger_statement_pdf.py), matching this package's existing convention.
     │   └── requirements.txt  ← added reportlab==4.2.2 (2026-07-20), matches alerts_evaluator's convention
     └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
         ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
@@ -1451,9 +1470,86 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **Supplier Ledger Statement PDF — mirrors the customer redesign, supplier semantics, no
+  Bank Particulars block (2026-07-21):** follow-up to the Customer Ledger Statement redesign
+  below — applies the SAME "account statement" layout to `supplier_ledger_statement_pdf.py`,
+  adapted for payable/supplier semantics, per explicit client confirmation that the Bank
+  Particulars block should be OMITTED for suppliers (suppliers don't pay into Iravi's account).
+  - `supplier_ledger_statement.py::compute_supplier_ledger_statement` — added a `city` field via
+    a new lookup on `supplier_accounts` (`WHERE UPPER(name) = UPPER(account_name) AND out_z IS
+    NULL`, mirroring `ledger_statement.py`'s `customer_details` lookup and
+    `supplier_balances_fy.py`'s existing city-lookup pattern). Cache key, opening/closing/
+    per-voucher-netting logic, and every other JSON field are unchanged — additive only.
+  - `supplier_ledger_statement_pdf.py::render_supplier_ledger_statement_pdf` — full rewrite,
+    same structure as `ledger_statement_pdf.py`'s redesign (centered title
+    `'{ACCOUNT NAME} ACCOUNT STATEMENT'`; `Location: {city or '-'}` / `Statement Date:
+    DD-MM-YYYY` row; centered `Statement Period: ...` line with the identical same-FY/multi-FY
+    logic; one `KeepTogether`-wrapped table per financial year with `Opening Balance` →
+    `Brought Forward` carry-forward and a bold `Totals` row each, `repeatRows=1`; Balance column
+    always plain black — `_RED`/`_GREEN` kept defined but unused; letterhead header repeating on
+    every page via `letterhead.draw_header`/a per-file `_draw_header_footer`, `topMargin` bumped
+    to reserve `letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3*cm`), with two
+    supplier-specific differences:
+    1. **Closing-balance banner label uses supplier (payable) semantics**, not the customer
+       receivable/payable wording: `closing_balance > 0` (Dr) → `'Closing Balance Payable'`
+       (Iravi owes the supplier — matches this codebase's existing convention, e.g.
+       `supplier_balances_fy_pdf.py`'s "Dr → GREEN (payable, normal)"); `closing_balance < 0`
+       (Cr) → `'Closing Balance Receivable'` (the supplier owes Iravi — an advance/
+       overpayment); `0` → `'Closing Balance'`. Same white-on-`letterhead.GREEN` banner
+       styling (11pt bold label left / 13pt bold right-aligned `_bal(closing_balance)`) as the
+       customer statement.
+    2. **NO Bank Particulars for Payment block** — the banner is wrapped in its own
+       `KeepTogether([closing_banner])` with nothing else in the group (no bordered bank-details
+       table, no disclaimer line) after the last FY table's own separate `KeepTogether`.
+  - Verified: `python -m py_compile lambda/api/supplier_ledger_statement.py
+    lambda/api/supplier_ledger_statement_pdf.py` clean. Smoke-tested (temp script in
+    `lambda/api/`, deleted afterward with `__pycache__`) a ~160-row two-FY dataset sized to
+    force pagination — `pypdf` confirmed **6 pages**, `'IRAVI AGRO LIFE LLP'` present on both
+    page 1 and the last page (header repeats), `'Closing Balance Payable'` present for a
+    positive closing balance, and confirmed `'Bank Particulars for Payment'` / `'UTIB0001922'`
+    are ABSENT from the rendered text (no bank block leaked in). A second case (negative
+    closing balance, zero rows, no city) confirmed `'Closing Balance Receivable'` and
+    `'Location: -'` render correctly on a single page.
+  - No IaC/DB/UI change required — same route (`GET /supplier-ledger/statement/pdf`), same
+    cache key/params, additive JSON field only.
+
+- [x] **Every-page letterhead header for all `api/` report PDFs (2026-07-21):** applied the
+  canvas-drawn repeating-header treatment (`letterhead.draw_header`, introduced for the Customer
+  Ledger Statement redesign below) to the four other `lambda/api/*_pdf.py` report renderers —
+  previously each showed the IAL letterhead only on page 1 (`letterhead.build_header()` added
+  once as a leading flowable); multi-page statements/reports had no header on continuation
+  pages. Scope: **`lambda/api/` only** — the byte-identical `lambda/alerts_evaluator/` copies of
+  these 4 renderers (used for SES email attachments) were intentionally left unchanged
+  (page-1-only flowable header), so the two directories' copies are no longer byte-identical for
+  these files — flagged in the file-tree note above so a future sync pass doesn't silently
+  overwrite this divergence. `procurement_api/po_pdf.py` is out of scope (doesn't import
+  `letterhead.py` at all — independent design). Files changed, each identically:
+  `customer_balances_fy_pdf.py`, `supplier_balances_fy_pdf.py` (both landscape A4),
+  `monthly_sales_pdf.py`, `monthly_collection_pdf.py` (both portrait A4).
+  - Per file: removed `letterhead.build_header(_CONTENT_W)` from the flowable `elements` list
+    (would otherwise double-render the header on page 1 once the canvas callback also draws
+    it); `SimpleDocTemplate(topMargin=...)` changed from a fixed `0.6*cm`/`0.8*cm` to
+    `letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3*cm` so flowing content starts
+    below the header band (landscape's wider content width doesn't change the header's
+    height, so the same margin works for both orientations); new per-file
+    `_draw_header_footer(canvas, doc)` calling `letterhead.draw_header` then
+    `letterhead.draw_footer`, passed as both `onFirstPage`/`onLaterPages` to `doc.build`
+    (previously `letterhead.draw_footer` alone).
+  - No changes to `letterhead.py` itself in this pass (already gained `draw_header`/
+    `HEADER_TOP_PAD`/`HEADER_HEIGHT` in the Customer Ledger Statement redesign below) — this
+    was purely wiring 4 more callers onto the existing mechanism.
+  - Verified: `python -m py_compile` clean on all 4 files. Smoke-tested (temp script in
+    `lambda/api/`, deleted afterward with `__pycache__`): `customer_balances_fy_pdf.py`
+    rendered a 40-row synthetic dataset → 2 pages, `'IRAVI AGRO LIFE LLP'` confirmed present on
+    both page 1 and the last page via `pypdf` text extraction (header repeats; landscape
+    content width doesn't clip it). `supplier_balances_fy_pdf.py`, `monthly_sales_pdf.py`, and
+    `monthly_collection_pdf.py` were each smoke-tested with a representative single-page
+    payload — all three returned valid `%PDF`-prefixed bytes with no exceptions (no
+    LayoutError from the increased topMargin).
+  - No IaC/DB/UI change required — same routes, same cache keys/params, presentation-only.
+
 - [x] **Customer Ledger Statement PDF — client-approved redesign (2026-07-21):** reworked
-  `ledger_statement.py` + `ledger_statement_pdf.py` only (`supplier_ledger_statement*.py`
-  untouched — still the 2026-07-20 flat-table layout, Dr/Cr swapped).
+  `ledger_statement.py` + `ledger_statement_pdf.py` only.
   - `ledger_statement.py::compute_ledger_statement` — added a `city` field to the returned
     dict via a new LEFT-JOIN-style lookup on `customer_details`
     (`WHERE UPPER(customer_name) = UPPER(account_name) AND out_z IS NULL`, same

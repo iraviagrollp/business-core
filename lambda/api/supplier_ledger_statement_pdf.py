@@ -7,20 +7,49 @@ render_supplier_ledger_statement_pdf(data: dict) -> bytes
     data    : dict returned by supplier_ledger_statement.compute_supplier_ledger_statement()
     returns : raw PDF bytes (A4 portrait)
 
-Design
-------
-Exact mirror of ledger_statement_pdf.py (independent, fully self-contained
-file — matches this package's existing convention of NOT cross-importing
-between the paired customer/supplier report renderers; see
-customer_balances_fy_pdf.py / supplier_balances_fy_pdf.py), with the
-supplier-specific Dr/Cr color SWAP noted in the repo docs:
-  Customer: Dr (receivable) -> RED, Cr (credit/advance) -> GREEN
-  Supplier: Dr (payable)    -> GREEN, Cr (advance/overpayment) -> RED
-Everything else — portrait A4, 1 cm margins, shared letterhead, one-row
-repeating header, opening-balance row, running-balance data rows, TOTAL /
-closing row, zebra striping, ₹ inline-font token, hyphen placeholders — is
-identical to ledger_statement_pdf.py. See that module's docstring for the
-full layout/₹-handling rationale.
+Design (reworked 2026-07-21 to mirror ledger_statement_pdf.py's client-approved
+"account statement" layout, adapted for supplier/payable semantics)
+-------------------------------------------------------------------------------------
+- Shared letterhead — header drawn on the canvas on EVERY page via
+  letterhead.draw_header (not just page 1), letterhead.draw_footer on every
+  page. Portrait A4, 1 cm margins.
+- Title: centered, bold, letterhead.GREEN — '{ACCOUNT NAME} ACCOUNT STATEMENT'.
+- Location + Statement Date row directly under the title: 'Location: {city}'
+  (left, bold; '-' when no city on file in supplier_accounts) / 'Statement
+  Date: {DD-MM-YYYY}' (right, muted).
+- Statement Period line (centered): full Indian-FY boundaries ('FY DD-MM-YYYY
+  to DD-MM-YYYY') when from_date/to_date fall in the same FY (Apr 1 -> Mar
+  31), else 'DD-MM-YYYY to DD-MM-YYYY' snapping only the start to that FY's
+  April 1. Identical logic to the customer statement.
+- The statement is split into one table PER FINANCIAL YEAR (ascending), each
+  with a small bold FY heading, a one-row repeating green header band
+  (repeatRows=1: Date | Voucher No | Type | Debit (Rs) | Credit (Rs) |
+  Balance (Rs)), a synthetic first row ('Opening Balance' for the first FY
+  shown, 'Brought Forward' for every later FY), one row per transaction, and
+  a bold light-grey 'Totals' row (that FY's debit/credit sums + closing
+  balance). The running balance carries across FY boundaries. Each FY
+  section (heading + table) is wrapped in KeepTogether so it is never split
+  across a page boundary unless the table itself is taller than a full page.
+- Balance column is ALWAYS rendered in plain black (no Dr=green/Cr=red
+  coloring) — the '_bal()' text keeps its 'Dr'/'Cr' suffix ('-' for zero).
+- After the LAST FY table only: a closing-balance banner (white-on-
+  letterhead.GREEN), label depends on supplier semantics (Dr/payable ->
+  GREEN in the balances report; Cr/advance -> RED there) — here the banner
+  text is 'Closing Balance Payable' when closing_balance > 0 (Iravi owes the
+  supplier), 'Closing Balance Receivable' when closing_balance < 0 (the
+  supplier owes Iravi — an advance/overpayment), 'Closing Balance' at zero.
+  Wrapped in its OWN KeepTogether (no Bank Particulars block follows it —
+  per the client's explicit confirmation that suppliers don't pay into
+  Iravi's account, so that block is intentionally omitted here, unlike
+  ledger_statement_pdf.py's customer statement).
+
+₹ / em-dash handling
+---------------------
+- All ₹ amounts route through `_RS` (letterhead.register_fonts()'s inline
+  `<font name="DejaVuSans">₹</font>` markup token), never a bare '₹' char,
+  and are always rendered via reportlab Paragraph so the markup is
+  interpreted (Helvetica/WinAnsiEncoding cannot encode U+20B9 directly).
+- Any placeholder dash uses a plain hyphen '-' (not an em-dash) throughout.
 """
 
 from __future__ import annotations
@@ -34,6 +63,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
+    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -44,19 +74,19 @@ from reportlab.platypus import (
 import letterhead
 
 # ── constants ─────────────────────────────────────────────────────────────────
-_TOTAL_BG    = colors.HexColor('#f0f0f0')   # light grey TOTAL/closing row
-_OPEN_BG     = colors.HexColor('#f0f0f0')   # light grey opening-balance row
+_TOTAL_BG    = colors.HexColor('#f0f0f0')   # light grey Totals row
+_OPEN_BG     = colors.HexColor('#f0f0f0')   # light grey opening/brought-forward row
 _ALT_BG      = colors.HexColor('#fafafa')   # subtle zebra stripe
 _CELL_BORDER = colors.HexColor('#cccccc')
 
+# Kept defined (per spec / parity with ledger_statement_pdf.py) but no longer
+# applied to any balance text — the Balance column is always plain black now.
 _RED   = colors.HexColor('#cc0000')   # Cr balance — supplier advance/overpayment
 _GREEN = colors.HexColor('#1a6e35')   # Dr balance — supplier payable (normal)
 
 _PAGE_W, _PAGE_H = A4                      # 595.27 x 841.89 pt (portrait)
 _MARGIN = 1.0 * cm
 _CONTENT_W = _PAGE_W - 2 * _MARGIN         # ~538 pt usable width
-
-_TITLE = 'SUPPLIER LEDGER STATEMENT'
 
 # Rupee token — Helvetica-primary; DejaVuSans is registered only for this glyph.
 _RS = letterhead.register_fonts()
@@ -102,6 +132,27 @@ def _fmt_date(iso_date: str) -> str:
         return iso_date or '-'
 
 
+def _parse_iso_date(iso_date: str) -> _date:
+    return _datetime.strptime(iso_date, '%Y-%m-%d').date()
+
+
+def _fmt_ddmmyyyy(d: _date) -> str:
+    return d.strftime('%d-%m-%Y')
+
+
+def _fy_start_year(d: _date) -> int:
+    """Indian FY (Apr 1 -> Mar 31) start year containing date `d`."""
+    return d.year if d.month >= 4 else d.year - 1
+
+
+def _fy_bounds(start_year: int) -> tuple[_date, _date]:
+    return _date(start_year, 4, 1), _date(start_year + 1, 3, 31)
+
+
+def _fy_label(start_year: int) -> str:
+    return f'FY {start_year}-{str(start_year + 1)[-2:]}'
+
+
 # ── paragraph style factory ───────────────────────────────────────────────────
 
 def _ps(name: str, font: str, size: float, align: int,
@@ -114,6 +165,14 @@ def _ps(name: str, font: str, size: float, align: int,
         leading=leading or (size + 1),
         textColor=color,
     )
+
+
+def _draw_header_footer(canvas, doc):
+    """Combined onFirstPage/onLaterPages callback — draws the repeating
+    letterhead header (letterhead.draw_header) and the shared footer
+    (letterhead.draw_footer) on every page."""
+    letterhead.draw_header(canvas, doc)
+    letterhead.draw_footer(canvas, doc)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -130,16 +189,12 @@ def render_supplier_ledger_statement_pdf(data: dict) -> bytes:
     -------
     bytes : raw PDF content
     """
-    title = _TITLE
-    # SWAPPED vs the customer statement: Dr -> GREEN (payable), Cr -> RED (advance).
-    dr_color, cr_color = _GREEN, _RED
     account_name    = data['account_name']
     from_date       = data['from_date']
     to_date         = data['to_date']
     opening_balance = data['opening_balance']
     rows            = data['rows']
-    total_debit     = data['total_debit']
-    total_credit    = data['total_credit']
+    city            = data.get('city')
     closing_balance = data['closing_balance']
 
     buffer = BytesIO()
@@ -149,9 +204,13 @@ def render_supplier_ledger_statement_pdf(data: dict) -> bytes:
         pagesize=A4,
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        topMargin=0.6 * cm,
+        # The letterhead header is drawn on the canvas (letterhead.draw_header,
+        # via _draw_header_footer below) so it repeats on every page, not just
+        # the first. topMargin reserves that band plus a small gap so flowing
+        # content (title, tables, ...) never overlaps it.
+        topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
         bottomMargin=1.4 * cm,   # footer draws at 0.46-0.95 cm; 1.4 cm clears it
-        title=f'IAL {title.title()}',
+        title='IAL Supplier Ledger Statement',
         author='IRAVI AGRO LIFE LLP',
     )
 
@@ -159,75 +218,96 @@ def render_supplier_ledger_statement_pdf(data: dict) -> bytes:
     _W = colors.white
     _BASE, _BOLD = letterhead.BASE_FONT, letterhead.BOLD_FONT
 
-    title_sty   = _ps('SLSTitle', _BOLD, 12, TA_LEFT,  color=letterhead.GREEN)
-    right_sty   = _ps('SLSRight', _BASE, 8,  TA_RIGHT, color=letterhead.MUTED)
-    right_bold  = _ps('SLSRightBold', _BOLD, 9, TA_RIGHT, color=letterhead.BODY)
+    title_sty   = _ps('SLSTitle', _BOLD, 13, TA_CENTER, color=letterhead.GREEN)
+    loc_sty     = _ps('SLSLoc', _BOLD, 9, TA_LEFT, color=letterhead.BODY)
+    date_sty    = _ps('SLSDate', _BASE, 8, TA_RIGHT, color=letterhead.MUTED)
+    period_sty  = _ps('SLSPeriod', _BOLD, 9, TA_CENTER, color=letterhead.BODY)
+    fy_head_sty = _ps('SLSFyHead', _BOLD, 10, TA_LEFT, color=letterhead.GREEN)
 
-    hdr_c = _ps('SLSHdrC', _BOLD, 8, TA_CENTER, color=_W)
     hdr_l = _ps('SLSHdrL', _BOLD, 8, TA_LEFT,   color=_W)
     hdr_r = _ps('SLSHdrR', _BOLD, 8, TA_RIGHT,  color=_W)
 
     dat_l = _ps('SLSDatL', _BASE, 8, TA_LEFT)
-    dat_c = _ps('SLSDatC', _BASE, 8, TA_CENTER)
     dat_r = _ps('SLSDatR', _BASE, 8, TA_RIGHT)
 
-    # Color-specific data-row styles for the Balance column (Dr / Cr)
-    dat_r_dr = _ps('SLSDatRDr', _BASE, 8, TA_RIGHT, color=dr_color)
-    dat_r_cr = _ps('SLSDatRCr', _BASE, 8, TA_RIGHT, color=cr_color)
-
     tot_l = _ps('SLSTotL', _BOLD, 8, TA_LEFT)
-    tot_c = _ps('SLSTotC', _BOLD, 8, TA_CENTER)
     tot_r = _ps('SLSTotR', _BOLD, 8, TA_RIGHT)
 
-    tot_r_dr = _ps('SLSTotRDr', _BOLD, 8, TA_RIGHT, color=dr_color)
-    tot_r_cr = _ps('SLSTotRCr', _BOLD, 8, TA_RIGHT, color=cr_color)
-
     open_l = _ps('SLSOpenL', _BOLD, 8, TA_LEFT)
-    open_r_dr = _ps('SLSOpenRDr', _BOLD, 8, TA_RIGHT, color=dr_color)
-    open_r_cr = _ps('SLSOpenRCr', _BOLD, 8, TA_RIGHT, color=cr_color)
-    open_r    = _ps('SLSOpenR', _BOLD, 8, TA_RIGHT)
+    open_r = _ps('SLSOpenR', _BOLD, 8, TA_RIGHT)
 
-    # ── Letterhead + report title row ─────────────────────────────────────────
+    # Closing-balance banner (white-on-green) — the one intentional exception to
+    # the "balance column is black" rule (that rule only governs the per-row
+    # Balance column inside the FY tables).
+    closing_label_sty  = _ps('SLSClosingLabel', _BOLD, 11, TA_LEFT,  color=_W)
+    closing_amount_sty = _ps('SLSClosingAmount', _BOLD, 13, TA_RIGHT, color=_W)
+
+    # ── Letterhead + title block ──────────────────────────────────────────────
     today_str = _date.today().strftime('%d-%m-%Y')
-    period_str = f'{_fmt_date(from_date)} to {_fmt_date(to_date)}'
 
-    title_row = Table(
-        [[Paragraph(title, title_sty),
-          Paragraph(f'Date: {today_str}', right_sty)]],
+    # Header is drawn on the canvas (letterhead.draw_header, every page) —
+    # NOT added here as a flowable, to avoid double-rendering it on page 1.
+    elements: list = [
+        Paragraph(f'{account_name.upper()} ACCOUNT STATEMENT', title_sty),
+        Spacer(1, 5),
+    ]
+
+    loc_date_row = Table(
+        [[Paragraph(f'Location: {city or "-"}', loc_sty),
+          Paragraph(f'Statement Date: {today_str}', date_sty)]],
         colWidths=[_CONTENT_W * 0.6, _CONTENT_W * 0.4],
     )
-    title_row.setStyle(TableStyle([
+    loc_date_row.setStyle(TableStyle([
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
         ('LEFTPADDING',   (0, 0), (-1, -1), 0),
         ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
         ('TOPPADDING',    (0, 0), (-1, -1), 0),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
     ]))
+    elements.append(loc_date_row)
+    elements.append(Spacer(1, 4))
 
-    subtitle_row = Table(
-        [[Paragraph(f'Account: {account_name}', right_bold),
-          Paragraph(f'Statement Period: {period_str}', right_sty)]],
-        colWidths=[_CONTENT_W * 0.6, _CONTENT_W * 0.4],
-    )
-    subtitle_row.setStyle(TableStyle([
-        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 0),
-        ('TOPPADDING',    (0, 0), (-1, -1), 2),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
-    ]))
+    # ── Statement Period line ─────────────────────────────────────────────────
+    from_d = _parse_iso_date(from_date)
+    to_d   = _parse_iso_date(to_date)
+    from_fy_start = _fy_start_year(from_d)
+    to_fy_start   = _fy_start_year(to_d)
 
-    elements: list = list(letterhead.build_header(_CONTENT_W)) + [
-        title_row, subtitle_row, Spacer(1, 6),
-    ]
+    if from_fy_start == to_fy_start:
+        fy_start_date, fy_end_date = _fy_bounds(from_fy_start)
+        period_text = (
+            f'Statement Period: FY {_fmt_ddmmyyyy(fy_start_date)} '
+            f'to {_fmt_ddmmyyyy(fy_end_date)}'
+        )
+    else:
+        fy_start_of_from, _ = _fy_bounds(from_fy_start)
+        period_text = (
+            f'Statement Period: {_fmt_ddmmyyyy(fy_start_of_from)} '
+            f'to {_fmt_ddmmyyyy(to_d)}'
+        )
 
-    # ── Column widths ─────────────────────────────────────────────────────────
+    elements.append(Paragraph(period_text, period_sty))
+    elements.append(Spacer(1, 8))
+
+    # ── Group rows by FY (ascending) ──────────────────────────────────────────
+    fy_groups: dict = {}
+    for row in rows:
+        fy_start = _fy_start_year(_parse_iso_date(row['transaction_date']))
+        fy_groups.setdefault(fy_start, []).append(row)
+
+    if not fy_groups:
+        # No transactions in the period — still show one FY table (the period's
+        # starting FY) carrying just the opening/closing position.
+        fy_groups[from_fy_start] = []
+
+    fy_start_years = sorted(fy_groups.keys())
+
+    # ── Column widths (shared by every FY table) ─────────────────────────────
     date_w, voucher_w, type_w = 65.0, 105.0, 125.0
     remaining = _CONTENT_W - (date_w + voucher_w + type_w)
     amt_w = remaining / 3
     col_widths = [date_w, voucher_w, type_w, amt_w, amt_w, amt_w]
 
-    # ── Header row ─────────────────────────────────────────────────────────────
     header_row = [
         Paragraph('Date', hdr_l),
         Paragraph('Voucher No', hdr_l),
@@ -237,96 +317,117 @@ def render_supplier_ledger_statement_pdf(data: dict) -> bytes:
         Paragraph(f'Balance ({_RS})', hdr_r),
     ]
 
-    table_rows: list = [header_row]
-
-    # Opening balance row
-    if opening_balance > 0:
-        open_bal_para = Paragraph(_bal(opening_balance), open_r_dr)
-    elif opening_balance < 0:
-        open_bal_para = Paragraph(_bal(opening_balance), open_r_cr)
-    else:
-        open_bal_para = Paragraph(_bal(opening_balance), open_r)
-    table_rows.append([
-        Paragraph('', open_l),
-        Paragraph('', open_l),
-        Paragraph('Opening Balance', open_l),
-        Paragraph('-', open_r),
-        Paragraph('-', open_r),
-        open_bal_para,
-    ])
-    opening_row_idx = len(table_rows) - 1
-
-    # ── Data rows with running balance ────────────────────────────────────────
     running = opening_balance
-    color_cmds: list = []
-    for idx, row in enumerate(rows):
-        debit = row['debit']
-        credit = row['credit']
-        running = round(running + debit - credit, 2)
-        tbl_row = len(table_rows)
-        if running > 0:
-            bal_para = Paragraph(_bal(running), dat_r_dr)
-            color_cmds.append(('TEXTCOLOR', (5, tbl_row), (5, tbl_row), dr_color))
-        elif running < 0:
-            bal_para = Paragraph(_bal(running), dat_r_cr)
-            color_cmds.append(('TEXTCOLOR', (5, tbl_row), (5, tbl_row), cr_color))
-        else:
-            bal_para = Paragraph(_bal(running), dat_r)
+
+    for fy_idx, fy_start in enumerate(fy_start_years):
+        fy_rows = fy_groups[fy_start]
+        fy_start_date, fy_end_date = _fy_bounds(fy_start)
+        fy_opening = running
+        opening_label = 'Opening Balance' if fy_idx == 0 else 'Brought Forward'
+
+        table_rows: list = [header_row]
+
         table_rows.append([
-            Paragraph(_fmt_date(row['transaction_date']), dat_l),
-            Paragraph(row['voucher_no'] or '-', dat_l),
-            Paragraph(row['transaction_type'] or '-', dat_l),
-            Paragraph(_amt(debit), dat_r),
-            Paragraph(_amt(credit), dat_r),
-            bal_para,
+            Paragraph('', open_l),
+            Paragraph('', open_l),
+            Paragraph(opening_label, open_l),
+            Paragraph('-', open_r),
+            Paragraph('-', open_r),
+            Paragraph(_bal(fy_opening), open_r),
         ])
+        opening_row_idx = len(table_rows) - 1
 
-    # ── TOTAL / closing row ────────────────────────────────────────────────────
+        fy_total_debit = 0.0
+        fy_total_credit = 0.0
+        for row in fy_rows:
+            debit = row['debit']
+            credit = row['credit']
+            running = round(running + debit - credit, 2)
+            fy_total_debit += debit
+            fy_total_credit += credit
+            table_rows.append([
+                Paragraph(_fmt_date(row['transaction_date']), dat_l),
+                Paragraph(row['voucher_no'] or '-', dat_l),
+                Paragraph(row['transaction_type'] or '-', dat_l),
+                Paragraph(_amt(debit), dat_r),
+                Paragraph(_amt(credit), dat_r),
+                Paragraph(_bal(running), dat_r),
+            ])
+
+        table_rows.append([
+            Paragraph('', tot_l),
+            Paragraph('', tot_l),
+            Paragraph('Totals', tot_l),
+            Paragraph(_amt(round(fy_total_debit, 2)), tot_r),
+            Paragraph(_amt(round(fy_total_credit, 2)), tot_r),
+            Paragraph(_bal(running), tot_r),
+        ])
+        total_row_idx = len(table_rows) - 1
+
+        tbl_cmds: list = [
+            ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
+            ('BACKGROUND', (0, opening_row_idx), (-1, opening_row_idx), _OPEN_BG),
+            ('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG),
+            ('FONTSIZE',      (0, 0), (-1, -1), 8),
+            ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+            ('TOPPADDING',    (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 3),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
+            ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+            ('SPAN', (0, opening_row_idx), (1, opening_row_idx)),
+            ('SPAN', (0, total_row_idx), (1, total_row_idx)),
+        ]
+
+        for i in range(opening_row_idx + 1, total_row_idx):
+            if (i - opening_row_idx - 1) % 2 == 1:
+                tbl_cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+
+        fy_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
+        fy_table.setStyle(TableStyle(tbl_cmds))
+
+        heading_text = (
+            f'{_fy_label(fy_start)}  '
+            f'({_fmt_ddmmyyyy(fy_start_date)} to {_fmt_ddmmyyyy(fy_end_date)})'
+        )
+        fy_section = [
+            Paragraph(heading_text, fy_head_sty),
+            Spacer(1, 3),
+            fy_table,
+            Spacer(1, 10),
+        ]
+        elements.append(KeepTogether(fy_section))
+
+    # ── Closing Balance banner (after the LAST FY table only) ────────────────
+    # NO Bank Particulars block here — the client confirmed it should be
+    # omitted for suppliers (suppliers don't pay into Iravi's account).
+    # Supplier semantics: Dr (positive) -> Iravi owes the supplier (payable);
+    # Cr (negative) -> the supplier owes Iravi (advance/overpayment, receivable).
     if closing_balance > 0:
-        close_para = Paragraph(_bal(closing_balance), tot_r_dr)
+        closing_label = 'Closing Balance Payable'
     elif closing_balance < 0:
-        close_para = Paragraph(_bal(closing_balance), tot_r_cr)
+        closing_label = 'Closing Balance Receivable'
     else:
-        close_para = Paragraph(_bal(closing_balance), tot_r)
-    table_rows.append([
-        Paragraph('', tot_c),
-        Paragraph('', tot_c),
-        Paragraph('TOTAL / Closing Balance', tot_l),
-        Paragraph(_amt(total_debit), tot_r),
-        Paragraph(_amt(total_credit), tot_r),
-        close_para,
-    ])
-    total_row_idx = len(table_rows) - 1
+        closing_label = 'Closing Balance'
 
-    if closing_balance > 0:
-        color_cmds.append(('TEXTCOLOR', (5, total_row_idx), (5, total_row_idx), dr_color))
-    elif closing_balance < 0:
-        color_cmds.append(('TEXTCOLOR', (5, total_row_idx), (5, total_row_idx), cr_color))
-
-    # ── Table style ───────────────────────────────────────────────────────────
-    tbl_cmds: list = [
-        ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
-        ('BACKGROUND', (0, opening_row_idx), (-1, opening_row_idx), _OPEN_BG),
-        ('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG),
-        ('FONTSIZE',      (0, 0), (-1, -1), 8),
-        ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
-        ('TOPPADDING',    (0, 0), (-1, -1), 3),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 3),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
+    closing_banner = Table(
+        [[Paragraph(closing_label, closing_label_sty),
+          Paragraph(_bal(closing_balance), closing_amount_sty)]],
+        colWidths=[_CONTENT_W * 0.55, _CONTENT_W * 0.45],
+    )
+    closing_banner.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, -1), letterhead.GREEN),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-        ('SPAN', (0, opening_row_idx), (1, opening_row_idx)),
-    ] + color_cmds
+        ('LEFTPADDING',   (0, 0), (0, 0), 10),
+        ('RIGHTPADDING',  (-1, 0), (-1, 0), 10),
+        ('LEFTPADDING',   (1, 0), (1, 0), 6),
+        ('RIGHTPADDING',  (0, 0), (0, 0), 6),
+        ('TOPPADDING',    (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+    ]))
 
-    # Zebra stripe on alternate data rows (between opening row and total row)
-    for i in range(opening_row_idx + 1, total_row_idx):
-        if (i - opening_row_idx - 1) % 2 == 1:
-            tbl_cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+    elements.append(KeepTogether([closing_banner]))
 
-    data_tbl = Table(table_rows, colWidths=col_widths, repeatRows=1)
-    data_tbl.setStyle(TableStyle(tbl_cmds))
-    elements.append(data_tbl)
-
-    # ── Build PDF with footer on every page ───────────────────────────────────
-    doc.build(elements, onFirstPage=letterhead.draw_footer, onLaterPages=letterhead.draw_footer)
+    # ── Build PDF with the letterhead header AND footer repeating on every page ─
+    doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
     return buffer.getvalue()

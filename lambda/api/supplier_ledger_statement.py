@@ -18,13 +18,15 @@ absorbed); running balance is Σ(Db − Cr). Sign convention is the raw ledger
 one (Db positive), identical to the customer statement; the UI applies the
 supplier Dr/Cr color swap.
 
-Returns dict shape (unchanged from the pre-refactor inline handler):
+Returns dict shape (unchanged from the pre-refactor inline handler, plus 'city'
+added 2026-07-21 for the redesigned PDF's Location line):
     {
         'account_name': str, 'from_date': str, 'to_date': str,
         'opening_balance': float,
         'rows': [{'transaction_date': 'YYYY-MM-DD', 'voucher_no': str,
                    'transaction_type': str | None, 'debit': float, 'credit': float}, ...],
         'total_debit': float, 'total_credit': float, 'closing_balance': float,
+        'city': str | None,
     }
 """
 
@@ -91,6 +93,20 @@ def compute_supplier_ledger_statement(conn, account_name: str, from_date: str, t
 
     closing_balance = round(opening_balance + total_debit - total_credit, 2)
 
+    # Supplier city, for the statement's Location line (same case-insensitive
+    # match pattern as supplier_balances_fy.py's city lookup, and as
+    # ledger_statement.py's customer_details lookup).
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT city
+            FROM supplier_accounts
+            WHERE UPPER(name) = UPPER(%(account_name)s)
+              AND out_z IS NULL
+            LIMIT 1
+        """, {'account_name': account_name})
+        city_row = cur.fetchone()
+        city = city_row[0] if city_row else None
+
     return {
         'account_name': account_name,
         'from_date': from_date,
@@ -100,4 +116,5 @@ def compute_supplier_ledger_statement(conn, account_name: str, from_date: str, t
         'total_debit': round(total_debit, 2),
         'total_credit': round(total_credit, 2),
         'closing_balance': closing_balance,
+        'city': city,
     }
