@@ -52,8 +52,8 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 | `etl_appendix_b_x11` | S3 `raw/Barcodes*.xlsx` | Barcodes Masters → `appendix_b_x11_stock` (unitemporal) | Complete |
 | `etl_appendix_b_x11_purchase` | S3 `raw/AppendixPurchase*.xlsx` | → `appendix_b_x11_stock_ledger` (In) + `purchases` (N). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-21) | Complete |
 | `etl_appendix_b_x11_purchase_return` | S3 `raw/AppendixPurReturn*.xlsx` | → `stock_ledger` (Out) + `purchases` (Y). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-21) | Complete |
-| `etl_appendix_b_x11_sale` | S3 `raw/AppendixSale*.xlsx` | → `stock_ledger` (Out) + `sales` (N) | Complete |
-| `etl_appendix_b_x11_sale_return` | S3 `raw/AppendixRetSales*.xlsx` | → `stock_ledger` (In) + `sales` (Y) | Complete |
+| `etl_appendix_b_x11_sale` | S3 `raw/AppendixSale*.xlsx` | → `stock_ledger` (Out) + `sales` (N). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
+| `etl_appendix_b_x11_sale_return` | S3 `raw/AppendixRetSales*.xlsx` | → `stock_ledger` (In) + `sales` (Y). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `etl_supplier_accounts` | S3 `raw/Supplier*.xlsx` | Supplier accounts → `supplier_accounts` (unitemporal) | Complete |
 | `etl_supplier_ledger` | EventBridge `raw/Ledger*.xlsx` (read-only S3) | Ledger supplier rows → `supplier_ledger` (unitemporal) | Complete |
 | `whatsapp_notifier` | S3 `notifications/pending/*` | Move to `processed/`; send WhatsApp (phase 2) | Phase 1 |
