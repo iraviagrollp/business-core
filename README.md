@@ -51,7 +51,7 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 | `etl_customer_accounts` | S3 `raw/Customer*.xlsx` | Customer accounts → `customer_details` (upsert) | Complete |
 | `etl_appendix_b_x11` | S3 `raw/Barcodes*.xlsx` | Barcodes Masters → `appendix_b_x11_stock` (unitemporal) | Complete |
 | `etl_appendix_b_x11_purchase` | S3 `raw/AppendixPurchase*.xlsx` | → `appendix_b_x11_stock_ledger` (In) + `purchases` (N). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-21) | Complete |
-| `etl_appendix_b_x11_purchase_return` | S3 `raw/AppendixPurReturn*.xlsx` | → `stock_ledger` (Out) + `purchases` (Y) | Complete |
+| `etl_appendix_b_x11_purchase_return` | S3 `raw/AppendixPurReturn*.xlsx` | → `stock_ledger` (Out) + `purchases` (Y). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-21) | Complete |
 | `etl_appendix_b_x11_sale` | S3 `raw/AppendixSale*.xlsx` | → `stock_ledger` (Out) + `sales` (N) | Complete |
 | `etl_appendix_b_x11_sale_return` | S3 `raw/AppendixRetSales*.xlsx` | → `stock_ledger` (In) + `sales` (Y) | Complete |
 | `etl_supplier_accounts` | S3 `raw/Supplier*.xlsx` | Supplier accounts → `supplier_accounts` (unitemporal) | Complete |
