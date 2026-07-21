@@ -193,7 +193,7 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
     )
 
     # ── Paragraph styles ──────────────────────────────────────────────────────
-    subtitle_style = _ps("IALSubtitle", "Helvetica-Bold", 7, TA_CENTER, leading=9)
+    subtitle_style = _ps("IALSubtitle", "Helvetica-Bold", 11, TA_CENTER, leading=13)
     right_style = _ps("IALRight", "Helvetica", 7, TA_RIGHT, leading=9)
     section_style = ParagraphStyle(
         "IALSection",
@@ -228,10 +228,10 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
     today_str = _date.today().strftime('%d-%m-%Y')
 
     right_col_w = 2.8 * cm
-    title_col_w = _CONTENT_W - right_col_w
 
     title_tbl = Table(
         [[
+            "",
             Paragraph(
                 f"STATE WISE COLLECTION FOR THE MONTH OF {data['month_label']}",
                 subtitle_style,
@@ -241,7 +241,7 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
                 Paragraph("(Value In Lakhs)", right_style),
             ],
         ]],
-        colWidths=[title_col_w, right_col_w],
+        colWidths=[right_col_w, _CONTENT_W - 2 * right_col_w, right_col_w],
     )
     title_tbl.setStyle(TableStyle([
         ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
