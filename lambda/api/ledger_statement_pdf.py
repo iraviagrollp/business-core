@@ -163,6 +163,14 @@ def _ps(name: str, font: str, size: float, align: int,
     )
 
 
+def _draw_header_footer(canvas, doc):
+    """Combined onFirstPage/onLaterPages callback — draws the repeating
+    letterhead header (letterhead.draw_header) and the shared footer
+    (letterhead.draw_footer) on every page."""
+    letterhead.draw_header(canvas, doc)
+    letterhead.draw_footer(canvas, doc)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def render_ledger_statement_pdf(data: dict) -> bytes:
@@ -182,6 +190,7 @@ def render_ledger_statement_pdf(data: dict) -> bytes:
     opening_balance = data['opening_balance']
     rows            = data['rows']
     city            = data.get('city')
+    closing_balance = data['closing_balance']
 
     buffer = BytesIO()
 
@@ -190,7 +199,11 @@ def render_ledger_statement_pdf(data: dict) -> bytes:
         pagesize=A4,
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        topMargin=0.6 * cm,
+        # The letterhead header is now drawn on the canvas (letterhead.draw_header,
+        # via _draw_header_footer below) so it repeats on every page, not just the
+        # first. topMargin reserves that band plus a small gap so flowing content
+        # (title, tables, ...) never overlaps it.
+        topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
         bottomMargin=1.4 * cm,   # footer draws at 0.46-0.95 cm; 1.4 cm clears it
         title='IAL Customer Ledger Statement',
         author='IRAVI AGRO LIFE LLP',
@@ -223,10 +236,18 @@ def render_ledger_statement_pdf(data: dict) -> bytes:
     bank_head_sty  = _ps('LSBankHead', _BOLD, 10, TA_LEFT, color=letterhead.GREEN)
     disclaimer_sty = _ps('LSDisclaimer', _BASE, 8, TA_LEFT, color=letterhead.MUTED)
 
+    # Closing-balance banner (white-on-green) — the one intentional exception to the
+    # "balance column is black" rule (that rule only governs the per-row Balance
+    # column inside the FY tables).
+    closing_label_sty  = _ps('LSClosingLabel', _BOLD, 11, TA_LEFT,  color=_W)
+    closing_amount_sty = _ps('LSClosingAmount', _BOLD, 13, TA_RIGHT, color=_W)
+
     # ── Letterhead + title block ──────────────────────────────────────────────
     today_str = _date.today().strftime('%d-%m-%Y')
 
-    elements: list = list(letterhead.build_header(_CONTENT_W)) + [
+    # Header is drawn on the canvas (letterhead.draw_header, every page) —
+    # NOT added here as a flowable, to avoid double-rendering it on page 1.
+    elements: list = [
         Paragraph(f'{account_name.upper()} ACCOUNT STATEMENT', title_sty),
         Spacer(1, 5),
     ]
@@ -377,7 +398,32 @@ def render_ledger_statement_pdf(data: dict) -> bytes:
         ]
         elements.append(KeepTogether(fy_section))
 
-    # ── Bank Particulars for Payment (after the LAST FY table only) ──────────
+    # ── Closing Balance banner + Bank Particulars for Payment ────────────────
+    # (after the LAST FY table only) — kept together as ONE unit so the banner
+    # is never separated from the bank details across a page break.
+    if closing_balance > 0:
+        closing_label = 'Closing Balance Receivable'
+    elif closing_balance < 0:
+        closing_label = 'Closing Balance Payable'
+    else:
+        closing_label = 'Closing Balance'
+
+    closing_banner = Table(
+        [[Paragraph(closing_label, closing_label_sty),
+          Paragraph(_bal(closing_balance), closing_amount_sty)]],
+        colWidths=[_CONTENT_W * 0.55, _CONTENT_W * 0.45],
+    )
+    closing_banner.setStyle(TableStyle([
+        ('BACKGROUND',    (0, 0), (-1, -1), letterhead.GREEN),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING',   (0, 0), (0, 0), 10),
+        ('RIGHTPADDING',  (-1, 0), (-1, 0), 10),
+        ('LEFTPADDING',   (1, 0), (1, 0), 6),
+        ('RIGHTPADDING',  (0, 0), (0, 0), 6),
+        ('TOPPADDING',    (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+    ]))
+
     bank_rows = [
         [Paragraph('Account Name:', bank_label_sty), Paragraph(_BANK_ACCOUNT_NAME, bank_value_sty)],
         [Paragraph('Account No.:',  bank_label_sty), Paragraph(_BANK_ACCOUNT_NO,   bank_value_sty)],
@@ -394,15 +440,20 @@ def render_ledger_statement_pdf(data: dict) -> bytes:
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
     ]))
 
-    elements.append(Paragraph('Bank Particulars for Payment', bank_head_sty))
-    elements.append(Spacer(1, 4))
-    elements.append(bank_table)
-    elements.append(Spacer(1, 4))
-    elements.append(Paragraph(
-        '<i>Should the payment have already been made, kindly disregard this notice.</i>',
-        disclaimer_sty,
-    ))
+    closing_section = [
+        closing_banner,
+        Spacer(1, 10),
+        Paragraph('Bank Particulars for Payment', bank_head_sty),
+        Spacer(1, 4),
+        bank_table,
+        Spacer(1, 4),
+        Paragraph(
+            '<i>Should the payment have already been made, kindly disregard this notice.</i>',
+            disclaimer_sty,
+        ),
+    ]
+    elements.append(KeepTogether(closing_section))
 
-    # ── Build PDF with footer on every page ───────────────────────────────────
-    doc.build(elements, onFirstPage=letterhead.draw_footer, onLaterPages=letterhead.draw_footer)
+    # ── Build PDF with the letterhead header AND footer repeating on every page ─
+    doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
     return buffer.getvalue()

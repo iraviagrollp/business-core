@@ -118,6 +118,12 @@ business-core/
     │   ├── letterhead.py / pdf_fonts.py / DejaVuSans.ttf / DejaVuSans-Bold.ttf / ial-logo.png
     │   │                        ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/ (see
     │   │                        that package's entries below for full docs — keep both copies in sync).
+    │   │                        letterhead.py gained `draw_header(canvas, doc)` + `HEADER_TOP_PAD`/
+    │   │                        `HEADER_HEIGHT` constants on 2026-07-21 — see "Customer Ledger Statement
+    │   │                        PDF" entry below. NOT byte-identical to alerts_evaluator/letterhead.py
+    │   │                        after this addition (additive-only; `build_header`/`draw_footer`
+    │   │                        unchanged, so every OTHER consumer of this file is unaffected) — flagged
+    │   │                        so a future "keep both copies in sync" pass doesn't silently drop it.
     │   ├── customer_balances_fy_pdf.py / supplier_balances_fy_pdf.py / monthly_sales_pdf.py /
     │   │   monthly_collection_pdf.py ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/
     │   │                        (unmodified — same renderers used for the SES email attachments).
@@ -125,8 +131,10 @@ business-core/
     │   │                        design — see "Customer Ledger Statement PDF — client-approved redesign"
     │   │                        below for full detail (was: 2026-07-20 flat-table Dr=RED/Cr=GREEN layout,
     │   │                        now: per-FY tables, centered title, Location line, always-black balance,
-    │   │                        Bank Particulars block). supplier_ledger_statement_pdf.py NOT touched by
-    │   │                        this change (still the 2026-07-20 flat-table layout, Dr/Cr swapped).
+    │   │                        closing-balance banner, Bank Particulars block, letterhead header
+    │   │                        repeating on every page). supplier_ledger_statement_pdf.py NOT touched by
+    │   │                        this change (still the 2026-07-20 flat-table layout, Dr/Cr swapped,
+    │   │                        single-page-1 flowable header).
     │   ├── supplier_ledger_statement_pdf.py ← NEW (2026-07-20): render_supplier_ledger_statement_pdf(data)
     │   │                        → bytes. Fully self-contained duplicate of ledger_statement_pdf.py with
     │   │                        Dr/Cr SWAPPED (Dr→GREEN, Cr→RED) — supplier semantics, same convention as
@@ -1453,9 +1461,9 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
     opening/closing/per-voucher-netting logic, and JSON response shape for every other key
     are unchanged — the JSON `/ledger/statement` endpoint now also returns `city` (harmless
     additive field, no consumer breaks).
-  - `ledger_statement_pdf.py::render_ledger_statement_pdf` — full layout rewrite (kept the
-    shared `letterhead.build_header`/`draw_footer`, portrait A4, `_RS`/Paragraph ₹ handling,
-    `_fmt_inr`/`_bal`/`_fmt_date` helpers):
+  - `ledger_statement_pdf.py::render_ledger_statement_pdf` — full layout rewrite (kept
+    portrait A4, `_RS`/Paragraph ₹ handling, `_fmt_inr`/`_bal`/`_fmt_date` helpers; letterhead
+    usage changed — see point 7 below):
     1. Centered bold green title `'{ACCOUNT NAME} ACCOUNT STATEMENT'` (was a left-aligned
        fixed `'CUSTOMER LEDGER STATEMENT'` title).
     2. New `Location: {city or '-'}` (left, bold) / `Statement Date: DD-MM-YYYY` (right,
@@ -1474,21 +1482,63 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
        coloring (`dat_r_dr`/`dat_r_cr`/`open_r_*`/`tot_r_*` styles + `color_cmds` TEXTCOLOR
        list) was removed entirely; `_bal()`'s Dr/Cr-suffixed text is unchanged, just rendered
        uncolored. `_RED`/`_GREEN` constants are kept defined (unused) per the design brief.
-    6. New "Bank Particulars for Payment" block after the LAST FY table only — bordered
-       key/value table with hardcoded IAL account details (new module constants
+    6. New **closing-balance banner** (white-on-`letterhead.GREEN`) placed directly above the
+       Bank Particulars block, after the LAST FY table only — a single-row 2-cell `Table`:
+       left cell white-bold-11pt label (`'Closing Balance Receivable'` if
+       `data['closing_balance'] > 0`, `'Closing Balance Payable'` if `< 0`, else
+       `'Closing Balance'`), right cell white-bold-13pt right-aligned `_bal(closing_balance)`
+       (e.g. `₹6,83,976.00 Dr`). Explicit, documented exception to point 5's
+       "balance is always black" rule — that rule only governs the per-row Balance column
+       inside the FY tables, not this banner.
+    7. New "Bank Particulars for Payment" block right after the banner — bordered key/value
+       table with hardcoded IAL account details (new module constants
        `_BANK_ACCOUNT_NAME='IRAVI AGRO LIFE LLP'`, `_BANK_ACCOUNT_NO='925020021374991'`,
        `_BANK_NAME='Axis Bank, Moti Nagar, Hyderabad'`, `_BANK_IFSC='UTIB0001922'`, mirroring
        how `letterhead.py` hardcodes GSTIN/LLPIN/etc.) plus a muted italic disclaimer line
-       (`"Should the payment have already been made, kindly disregard this notice."`).
+       (`"Should the payment have already been made, kindly disregard this notice."`). The
+       **banner + heading + bank table + disclaimer are all one `KeepTogether` unit** (not
+       separate flowables) so the whole group moves to the next page together if it doesn't
+       fit in the remaining space — the banner can never be stranded from its bank details by
+       a page break, and this group is a SEPARATE `KeepTogether` from the last FY table's own
+       (per point 4), not nested inside it.
+    8. **Letterhead header now repeats on every page** — previously `letterhead.build_header()`
+       was added once as a leading flowable (page 1 only; later pages of a multi-page
+       statement had no header). `letterhead.py` gained a new `draw_header(canvas, doc)`
+       page-callback function (additive-only — does NOT touch `build_header()`/`draw_footer()`,
+       so every other consumer of `letterhead.py` — `customer_balances_fy_pdf.py`,
+       `supplier_balances_fy_pdf.py`, `monthly_sales_pdf.py`, `monthly_collection_pdf.py`,
+       `supplier_ledger_statement_pdf.py` — is unaffected) plus two new constants
+       `HEADER_TOP_PAD = 0.35*cm` / `HEADER_HEIGHT = 3.0*cm`. `draw_header` renders
+       `build_header()`'s own flowables into a throwaway `reportlab.platypus.Frame` positioned
+       at the top of the current page — guarantees pixel-identical output to the flowable
+       version (no re-implementation/drift risk) while running on every page via the canvas
+       callback. `ledger_statement_pdf.py`: removed `letterhead.build_header(_CONTENT_W)` from
+       the flowable `elements` list (would otherwise double-render the header on page 1);
+       `SimpleDocTemplate(topMargin=...)` changed from a fixed `0.6*cm` to
+       `letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3*cm` so flowing content
+       (title/location/period/tables) starts below the header band and never overlaps it; new
+       module-level `_draw_header_footer(canvas, doc)` calls `letterhead.draw_header` then
+       `letterhead.draw_footer`, passed as both `onFirstPage`/`onLaterPages` to `doc.build`
+       (was `letterhead.draw_footer` alone).
     - Edge case handled: a period with zero transactions still renders one FY table (the
       period's starting FY) carrying just the opening/closing position, so the PDF is never
       blank.
   - Verified: `python -m py_compile lambda/api/ledger_statement.py
-    lambda/api/ledger_statement_pdf.py` clean. Smoke-tested `render_ledger_statement_pdf`
-    (temp script in `lambda/api/`, deleted afterward along with `__pycache__`) against a
-    synthetic multi-FY dataset (opening balance, rows in FY 2025-26 and FY 2026-27, a
-    same-FY period, and a zero-rows period) — every call returned valid `%PDF`-prefixed
-    bytes (~237 KB) with no exceptions.
+    lambda/api/ledger_statement_pdf.py lambda/api/letterhead.py` clean. Smoke-tested
+    `render_ledger_statement_pdf` (temp scripts in `lambda/api/`, deleted afterward along with
+    `__pycache__`) against (a) a synthetic multi-FY dataset (opening balance, rows in FY
+    2025-26 and FY 2026-27, a same-FY period, and a zero-rows period) — every call returned
+    valid `%PDF`-prefixed bytes (~237 KB) with no exceptions; (b) a ~160-row two-FY dataset
+    sized to force pagination — `pypdf` confirmed **6 pages**, with `'IRAVI AGRO LIFE LLP'`
+    (the letterhead company name) present in the extracted text of BOTH page 1 and the last
+    page, confirming the header now repeats; a negative-closing-balance / zero-row single-page
+    variant confirmed the banner text `'Closing Balance Payable'` renders correctly for a Cr
+    closing balance. Also re-`py_compile`d the five other `letterhead.py`-consuming PDF
+    renderers (`customer_balances_fy_pdf.py`, `supplier_balances_fy_pdf.py`,
+    `monthly_sales_pdf.py`, `monthly_collection_pdf.py`, `supplier_ledger_statement_pdf.py`) —
+    all clean, confirming the additive `letterhead.py` change (new `Frame` import, new
+    `draw_header`, two new constants; `build_header`/`draw_footer` untouched) doesn't break
+    them.
   - No IaC/DB/UI change required — same route (`GET /ledger/statement/pdf`), same cache
     key/params, additive JSON field only.
 
