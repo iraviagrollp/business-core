@@ -689,8 +689,8 @@ same S3 prefix — the filename gate (`_FILE_PREFIX` + `.xlsx` suffix check) is 
 downloaded bytes are now comma-delimited CSV text, never openpyxl-readable. The file is read with
 `csv.DictReader` (`encoding='utf-8-sig'` — handles a possible UTF-8 BOM, same idiom as
 `etl_stocks`), header on line 1, data from line 2, 32 columns, mapped by header **name** (not
-position). `etl_appendix_b_x11_purchase_return` (the returns report) is **unaffected** — still
-xlsx/openpyxl, unchanged.
+position). `etl_appendix_b_x11_purchase_return` (the returns report) got the **same** CSV-content
+treatment on 2026-07-21 (see its own section below) — both purchase-side ETLs are now CSV/openpyxl-free.
 
 **Header-name column mapping (2026-07-21):**
 `ProductId→product/technical_name, Qty→qty, Rate→rate, Gross→gross, AV→av, Barcodes→barcode/barcodes, Narration→narration, Date→purchase_date, BranchId→branch, AccountId→party, RefBillNo→ref_bill_no, RefBillDate→ref_bill_date, VoucherNo→iravi_voucher/voucher_no`
@@ -725,6 +725,59 @@ trailing-comma `Barcodes` string down to a single ledger barcode. `python -m py_
 handler.py` clean. No downstream change (barcode lookup, milestoning upserts, S3
 archive/delete, no EventBridge emission for this Lambda) — only the parsing/extraction layer
 changed.
+
+---
+
+## etl_appendix_b_x11_purchase_return — Purchase Returns Ledger Processing
+
+**Status: complete**
+
+Source file pattern: `AppendixPurReturn*.xlsx` (S3 prefix filter: `raw/AppendixPurReturn`)
+
+**Changed 2026-07-21:** the upstream purchase-returns feed switched from a real xlsx workbook to
+**CSV content** while keeping the same filename pattern (`AppendixPurReturn*.xlsx`) and the same
+S3 prefix — the filename gate (`_FILE_PREFIX = 'AppendixPurReturn'` + `.xlsx` suffix check) is
+unchanged, but the downloaded bytes are now comma-delimited CSV text, never openpyxl-readable.
+Mirrors the `etl_appendix_b_x11_purchase` (base purchase, flag `N`) 2026-07-21 conversion closely:
+`csv.DictReader` (`encoding='utf-8-sig'`, `newline=''`), header on line 1, data from line 2 (no
+leading blank/metadata rows), 29 columns, mapped by header **name** (not position). `openpyxl` and
+the old `ws.iter_rows(min_row=6, ...)` positional-index reader are removed from this handler.
+
+**Header-name column mapping (2026-07-21):**
+`ProductId→product/technical_name, Qty→qty, Rate→rate, Gross→gross, AV→av, Barcodes→barcode/barcodes, Narration→narration, Date→purchase_date, BranchId→branch, AccountId→party, RefBillNo→ref_bill_no, RefBillDate→ref_bill_date, VoucherNo→iravi_voucher/voucher_no`
+(the CSV has 29 columns total; only the above are consumed, the rest are ignored). Extraction is
+in a standalone `_extract_purchase_row(row: dict) -> dict | None` function (same shape as the base
+purchase handler) for testability. Skip (return `None`) if `Date` is blank, `VoucherNo` is blank,
+or `ProductId` is blank. All CSV cells arrive as strings — blank is `''`, never `None`; numeric
+casts (`qty`/`rate`/`gross`/`av`) go through a `_to_float()` helper that treats `None` and
+`''`/whitespace-only as blank → `None`. String fields are `.strip()`ped via
+`str(row.get(...) or '').strip()`. Dates (`Date`, `RefBillDate`) are `DD-MM-YYYY` text, parsed by
+the pre-existing `_parse_date()` (unchanged — already supported that format).
+
+**Transformations:**
+- `product`/`technical_name` — `.strip()` only (the old xlsx-era comma-stripping hack is gone —
+  real CSV quoting already protects embedded commas)
+- `barcode` — `Barcodes` column value (trailing-comma quoted single-barcode string, e.g.
+  `"AK-01/IAL,"`), strip trailing comma, split by `,`; rows with multiple barcodes are skipped
+  **for the ledger table only** (the `purchases` table gets every parsed row regardless of
+  barcode count)
+- `in_out` — hardcoded `'Out'` (this is the RETURNS report — goods leaving/returning to supplier)
+- `mdf_date` / `exp_date` — looked up from `appendix_b_x11_stock WHERE (technical_name, barcode) AND out_z IS NULL`; NULL if no match
+- `purchase_return` — hardcoded `'Y'` (unchanged from before the CSV conversion — this is still the returns handler)
+
+**Writes to two tables per row (unchanged by the CSV conversion):**
+1. `appendix_b_x11_stock_ledger` — milestoning natural key `(purchase_date, iravi_voucher, technical_name, barcode)`; only rows with exactly 1 barcode (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
+2. `purchases` — milestoning natural key/PK `(purchase_date, voucher_no, branch, party, product, COALESCE(barcodes,''))`; every parsed row, `purchase_return='Y'` (DB migration `007_create_purchases.sql`, key widened by `031_add_barcodes_to_purchases_sales_key.sql`)
+
+**Verified 2026-07-21:** a synthetic CSV fixture (real header row + one real sample data row,
+built and deleted in this Lambda's own directory — `__pycache__` cleaned up afterward) confirmed
+`_extract_purchase_row` produces the expected `product`, `qty`, `rate`, `gross`, `av`,
+`purchase_date`, `branch`, `party`, `ref_bill_no` (blank → `None`), `ref_bill_date`, `voucher_no`,
+and `purchase_return='Y'` values, and that the full `_parse()` path correctly splits the
+trailing-comma `Barcodes` string down to a single ledger barcode with `in_out='Out'`. `python -m
+py_compile handler.py` clean. No downstream change (barcode lookup, milestoning upserts, S3
+archive/delete, no EventBridge emission for this Lambda) — only the parsing/extraction layer
+changed, exactly mirroring the base purchase handler's conversion.
 
 ---
 
