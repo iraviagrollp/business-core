@@ -121,8 +121,12 @@ business-core/
     │   ├── customer_balances_fy_pdf.py / supplier_balances_fy_pdf.py / monthly_sales_pdf.py /
     │   │   monthly_collection_pdf.py ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/
     │   │                        (unmodified — same renderers used for the SES email attachments).
-    │   ├── ledger_statement_pdf.py ← NEW (2026-07-20): render_ledger_statement_pdf(data) → bytes.
-    │   │                        Portrait A4, letterhead.py styling, Dr→RED/Cr→GREEN (customer semantics).
+    │   ├── ledger_statement_pdf.py ← REWORKED (2026-07-21) to the client-approved "account statement"
+    │   │                        design — see "Customer Ledger Statement PDF — client-approved redesign"
+    │   │                        below for full detail (was: 2026-07-20 flat-table Dr=RED/Cr=GREEN layout,
+    │   │                        now: per-FY tables, centered title, Location line, always-black balance,
+    │   │                        Bank Particulars block). supplier_ledger_statement_pdf.py NOT touched by
+    │   │                        this change (still the 2026-07-20 flat-table layout, Dr/Cr swapped).
     │   ├── supplier_ledger_statement_pdf.py ← NEW (2026-07-20): render_supplier_ledger_statement_pdf(data)
     │   │                        → bytes. Fully self-contained duplicate of ledger_statement_pdf.py with
     │   │                        Dr/Cr SWAPPED (Dr→GREEN, Cr→RED) — supplier semantics, same convention as
@@ -1438,6 +1442,55 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **Customer Ledger Statement PDF — client-approved redesign (2026-07-21):** reworked
+  `ledger_statement.py` + `ledger_statement_pdf.py` only (`supplier_ledger_statement*.py`
+  untouched — still the 2026-07-20 flat-table layout, Dr/Cr swapped).
+  - `ledger_statement.py::compute_ledger_statement` — added a `city` field to the returned
+    dict via a new LEFT-JOIN-style lookup on `customer_details`
+    (`WHERE UPPER(customer_name) = UPPER(account_name) AND out_z IS NULL`, same
+    case-insensitive match pattern as `customer_balances_fy.py`). Existing cache key,
+    opening/closing/per-voucher-netting logic, and JSON response shape for every other key
+    are unchanged — the JSON `/ledger/statement` endpoint now also returns `city` (harmless
+    additive field, no consumer breaks).
+  - `ledger_statement_pdf.py::render_ledger_statement_pdf` — full layout rewrite (kept the
+    shared `letterhead.build_header`/`draw_footer`, portrait A4, `_RS`/Paragraph ₹ handling,
+    `_fmt_inr`/`_bal`/`_fmt_date` helpers):
+    1. Centered bold green title `'{ACCOUNT NAME} ACCOUNT STATEMENT'` (was a left-aligned
+       fixed `'CUSTOMER LEDGER STATEMENT'` title).
+    2. New `Location: {city or '-'}` (left, bold) / `Statement Date: DD-MM-YYYY` (right,
+       muted) row directly under the title.
+    3. New centered `Statement Period: ...` line — full Indian-FY boundaries
+       (`FY DD-MM-YYYY to DD-MM-YYYY`) when `from_date`/`to_date` share an FY (Apr 1 → Mar
+       31), else `DD-MM-YYYY to DD-MM-YYYY` snapping only the start to that FY's April 1.
+    4. The statement is now split into **one table per financial year** (ascending), each
+       wrapped in `KeepTogether` (heading + table never split across a page boundary unless
+       the table itself exceeds a full page — `repeatRows=1` keeps the header visible on any
+       such continuation). First FY's synthetic first row = `Opening Balance`; every later
+       FY's first row = `Brought Forward` (carries the prior FY's closing balance); each FY
+       ends with a bold `Totals` row (that FY's Σ debit/credit + closing balance). Replaces
+       the previous single flat table (opening → all rows → one grand total).
+    5. **Balance column is now always plain black** — the Dr=RED(`#cc0000`)/Cr=GREEN(`#1a6e35`)
+       coloring (`dat_r_dr`/`dat_r_cr`/`open_r_*`/`tot_r_*` styles + `color_cmds` TEXTCOLOR
+       list) was removed entirely; `_bal()`'s Dr/Cr-suffixed text is unchanged, just rendered
+       uncolored. `_RED`/`_GREEN` constants are kept defined (unused) per the design brief.
+    6. New "Bank Particulars for Payment" block after the LAST FY table only — bordered
+       key/value table with hardcoded IAL account details (new module constants
+       `_BANK_ACCOUNT_NAME='IRAVI AGRO LIFE LLP'`, `_BANK_ACCOUNT_NO='925020021374991'`,
+       `_BANK_NAME='Axis Bank, Moti Nagar, Hyderabad'`, `_BANK_IFSC='UTIB0001922'`, mirroring
+       how `letterhead.py` hardcodes GSTIN/LLPIN/etc.) plus a muted italic disclaimer line
+       (`"Should the payment have already been made, kindly disregard this notice."`).
+    - Edge case handled: a period with zero transactions still renders one FY table (the
+      period's starting FY) carrying just the opening/closing position, so the PDF is never
+      blank.
+  - Verified: `python -m py_compile lambda/api/ledger_statement.py
+    lambda/api/ledger_statement_pdf.py` clean. Smoke-tested `render_ledger_statement_pdf`
+    (temp script in `lambda/api/`, deleted afterward along with `__pycache__`) against a
+    synthetic multi-FY dataset (opening balance, rows in FY 2025-26 and FY 2026-27, a
+    same-FY period, and a zero-rows period) — every call returned valid `%PDF`-prefixed
+    bytes (~237 KB) with no exceptions.
+  - No IaC/DB/UI change required — same route (`GET /ledger/statement/pdf`), same cache
+    key/params, additive JSON field only.
 
 - [x] **Bug fix: Job Work PO showed ₹0.00 total on the PO list (2026-07-20):** root cause —
   `amount`/`gst_amount`/`total_value` in `_PO_SELECT` are computed from the header
