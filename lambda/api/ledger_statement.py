@@ -10,13 +10,15 @@ compute_ledger_statement(conn, account_name, from_date, to_date) -> dict
     this function; the Redis cache-aside + _response wrapping stay in the
     handler (mirrors customer_balances_fy.py / supplier_balances_fy.py).
 
-Returns dict shape (unchanged from the pre-refactor inline handler):
+Returns dict shape (unchanged from the pre-refactor inline handler, plus 'city'
+added 2026-07-21 for the redesigned PDF's Location line):
     {
         'account_name': str, 'from_date': str, 'to_date': str,
         'opening_balance': float,
         'rows': [{'transaction_date': 'YYYY-MM-DD', 'voucher_no': str,
                    'transaction_type': str | None, 'debit': float, 'credit': float}, ...],
         'total_debit': float, 'total_credit': float, 'closing_balance': float,
+        'city': str | None,
     }
 """
 
@@ -83,6 +85,19 @@ def compute_ledger_statement(conn, account_name: str, from_date: str, to_date: s
 
     closing_balance = round(opening_balance + total_debit - total_credit, 2)
 
+    # Customer city, for the statement's Location line (LEFT JOIN-style lookup;
+    # same case-insensitive match pattern as customer_balances_fy.py).
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT city
+            FROM customer_details
+            WHERE UPPER(customer_name) = UPPER(%(account_name)s)
+              AND out_z IS NULL
+            LIMIT 1
+        """, {'account_name': account_name})
+        city_row = cur.fetchone()
+        city = city_row[0] if city_row else None
+
     return {
         'account_name': account_name,
         'from_date': from_date,
@@ -92,4 +107,5 @@ def compute_ledger_statement(conn, account_name: str, from_date: str, to_date: s
         'total_debit': round(total_debit, 2),
         'total_credit': round(total_credit, 2),
         'closing_balance': closing_balance,
+        'city': city,
     }
