@@ -683,14 +683,32 @@ Partial unique index on (transaction_date, voucher_no, account_name, category, s
 
 Source file pattern: `AppendixPurchaseReport*.xlsx` (S3 prefix filter: `raw/AppendixPurchase`)
 
-**Header:** row 5. **Data:** row 6+. Skip if `purchase_date` is None, `iravi_voucher` is empty, or `product`/`technical_name` is empty.
+**Changed 2026-07-21:** the upstream purchase report switched from a real xlsx workbook to
+**CSV content** while keeping the same filename pattern (`AppendixPurchaseReport*.xlsx`) and the
+same S3 prefix — the filename gate (`_FILE_PREFIX` + `.xlsx` suffix check) is unchanged, but the
+downloaded bytes are now comma-delimited CSV text, never openpyxl-readable. The file is read with
+`csv.DictReader` (`encoding='utf-8-sig'` — handles a possible UTF-8 BOM, same idiom as
+`etl_stocks`), header on line 1, data from line 2, 32 columns, mapped by header **name** (not
+position). `etl_appendix_b_x11_purchase_return` (the returns report) is **unaffected** — still
+xlsx/openpyxl, unchanged.
 
-**Column mapping (0-indexed):**
-`[0]=Date→purchase_date, [1]=Voucher No→iravi_voucher/voucher_no, [2]=Branch→branch, [5]=Party→party, [6]=Ref BillNo→supplier_voucher/ref_bill_no, [7]=Ref BillDate→ref_bill_date, [9]=Product→technical_name/product, [10]=Qty→qty, [11]=Rate→rate, [12]=Gross→gross, [17]=AV→av, [25]=Barcodes→barcode/barcodes, [26]=Narration→narration`
+**Header-name column mapping (2026-07-21):**
+`ProductId→product/technical_name, Qty→qty, Rate→rate, Gross→gross, AV→av, Barcodes→barcode/barcodes, Narration→narration, Date→purchase_date, BranchId→branch, AccountId→party, RefBillNo→ref_bill_no, RefBillDate→ref_bill_date, VoucherNo→iravi_voucher/voucher_no`
+(the CSV has 32 columns total; only the above are consumed, the rest are ignored). Extraction is
+in a standalone `_extract_purchase_row(row: dict) -> dict | None` function for testability. Skip
+(return `None`) if `Date` is blank, `VoucherNo` is blank, or `ProductId` is blank. All CSV cells
+arrive as strings — blank is `''`, never `None`; numeric casts (`qty`/`rate`/`gross`/`av`) go
+through a `_to_float()` helper that treats `None` and `''`/whitespace-only as blank → `None`.
+String fields are `.strip()`ped. Dates (`Date`, `RefBillDate`) are `DD-MM-YYYY` text, parsed by
+the pre-existing `_parse_date()` (unchanged — already supported that format).
 
 **Transformations:**
-- `product`/`technical_name` — strip all commas from the product string
-- `barcode` — strip trailing comma, split by `,`; rows with multiple barcodes are skipped **for the ledger table only** (the `purchases` table gets every parsed row regardless of barcode count)
+- `product`/`technical_name` — `.strip()` only (the old xlsx-era comma-stripping hack is no
+  longer needed/applied — real CSV quoting already protects embedded commas, so `ProductId` is
+  taken verbatim, matching how `etl_appendix_b_x11`'s barcode-master product names are stored)
+- `barcode` — `Barcodes` column value (e.g. `"1000000023,"`), strip trailing comma, split by `,`;
+  rows with multiple barcodes are skipped **for the ledger table only** (the `purchases` table
+  gets every parsed row regardless of barcode count)
 - `in_out` — hardcoded `'In'` (purchase report)
 - `mdf_date` / `exp_date` — looked up from `appendix_b_x11_stock WHERE (technical_name, barcode) AND out_z IS NULL`; NULL if no match
 - `purchase_return` — hardcoded `'N'`
@@ -698,6 +716,15 @@ Source file pattern: `AppendixPurchaseReport*.xlsx` (S3 prefix filter: `raw/Appe
 **Writes to two tables per row:**
 1. `appendix_b_x11_stock_ledger` — milestoning natural key `(purchase_date, iravi_voucher, technical_name, barcode)`; only rows with exactly 1 barcode (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
 2. `purchases` — milestoning natural key/PK `(purchase_date, voucher_no, branch, party, product)`; every parsed row (DB migration `007_create_purchases.sql`)
+
+**Verified 2026-07-21:** a synthetic CSV fixture (real header row + one real sample data row,
+built in scratch and deleted afterward) confirmed `_extract_purchase_row` produces the expected
+`product`, `qty`, `rate`, `gross`, `av`, `purchase_date`, `branch`, `party`, `ref_bill_no`,
+`ref_bill_date`, `voucher_no` values, and that the full `_parse()` path correctly splits the
+trailing-comma `Barcodes` string down to a single ledger barcode. `python -m py_compile
+handler.py` clean. No downstream change (barcode lookup, milestoning upserts, S3
+archive/delete, no EventBridge emission for this Lambda) — only the parsing/extraction layer
+changed.
 
 ---
 
