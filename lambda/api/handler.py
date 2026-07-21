@@ -1,6 +1,8 @@
+import base64
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import boto3
@@ -13,6 +15,8 @@ import customer_balances_fy as _cbfy
 import supplier_balances_fy as _sbfy
 import monthly_sales
 import monthly_collection
+import ledger_statement as _ls
+import supplier_ledger_statement as _sls
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -159,6 +163,35 @@ def lambda_handler(event, context):
     if path == '/reports/monthly-collection':
         params = event.get('queryStringParameters') or {}
         return _handle_monthly_collection(params.get('month', ''))
+
+    # ── PDF export routes (server-side reportlab; no Redis caching — always
+    # computed fresh) ─────────────────────────────────────────────────────────
+    if path == '/reports/customer-balances-fy/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_customer_balances_fy_pdf(params.get('fy_count', 'all'))
+    if path == '/reports/supplier-balances-fy/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_supplier_balances_fy_pdf(params.get('fy_count', 'all'))
+    if path == '/reports/monthly-sales/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_monthly_sales_pdf(params.get('month', ''))
+    if path == '/reports/monthly-collection/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_monthly_collection_pdf(params.get('month', ''))
+    if path == '/ledger/statement/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_ledger_statement_pdf(
+            params.get('account_name', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
+    if path == '/supplier-ledger/statement/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_supplier_ledger_statement_pdf(
+            params.get('account_name', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
 
     return _response(404, {'error': 'Not found'})
 
@@ -419,6 +452,13 @@ def _handle_supplier_ledger_data(from_date: str, to_date: str):
 def _handle_supplier_ledger_statement(account_name: str, from_date: str, to_date: str):
     """Per-voucher account statement for one supplier over a date range.
 
+    Computation is delegated to
+    supplier_ledger_statement.compute_supplier_ledger_statement (shared with
+    the /supplier-ledger/statement/pdf route). This wrapper owns:
+      - required-param validation
+      - Redis cache-aside (key iravi:supplier_ledger:statement:{account}:{from}:{to})
+      - _response wrapping
+
     Exact mirror of _handle_ledger_statement on the supplier_ledger table:
     opening balance = Σ(Db − Cr) strictly before from_date; period rows grouped
     by voucher with the two sides netted (roundoff/GST absorbed); running balance
@@ -436,80 +476,13 @@ def _handle_supplier_ledger_statement(account_name: str, from_date: str, to_date
 
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            # Opening balance: all transactions strictly before from_date
-            cur.execute("""
-                SELECT COALESCE(
-                    SUM(CASE WHEN category = 'Db' THEN amount ELSE -amount END), 0
-                )
-                FROM supplier_ledger
-                WHERE out_z IS NULL
-                  AND account_name = %(account_name)s
-                  AND transaction_date < %(from_date)s
-            """, {'account_name': account_name, 'from_date': from_date})
-            opening_balance = float(cur.fetchone()[0])
-
-            # Period transactions grouped by voucher, determine primary sub_category
-            cur.execute("""
-                SELECT
-                    transaction_date,
-                    voucher_no,
-                    MAX(CASE WHEN sub_category NOT IN ('CGST', 'SGST', 'IGST', 'Roundoff')
-                        THEN sub_category END) AS primary_type,
-                    COALESCE(SUM(amount) FILTER (WHERE category = 'Db'), 0) AS debit,
-                    COALESCE(SUM(amount) FILTER (WHERE category = 'Cr'), 0) AS credit
-                FROM supplier_ledger
-                WHERE out_z IS NULL
-                  AND account_name = %(account_name)s
-                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
-                GROUP BY transaction_date, voucher_no
-                ORDER BY transaction_date ASC, voucher_no ASC
-            """, {'account_name': account_name, 'from_date': from_date, 'to_date': to_date})
-            col_names = [d[0] for d in cur.description]
-            raw_rows = cur.fetchall()
+        payload = _sls.compute_supplier_ledger_statement(conn, account_name, from_date, to_date)
     finally:
         conn.close()
 
-    total_debit = 0.0
-    total_credit = 0.0
-    rows = []
-    for raw in raw_rows:
-        row = dict(zip(col_names, raw))
-        raw_debit = float(row['debit'])
-        raw_credit = float(row['credit'])
-        # Net the two sides so roundoff/GST sub-components are absorbed into the
-        # voucher they belong to.  The voucher shows on only one side; the running
-        # balance is numerically unchanged because net = raw_debit − raw_credit.
-        net = raw_debit - raw_credit
-        if net >= 0:
-            debit, credit = net, 0.0
-        else:
-            debit, credit = 0.0, -net
-        total_debit += debit
-        total_credit += credit
-        rows.append({
-            'transaction_date': row['transaction_date'].isoformat(),
-            'voucher_no': row['voucher_no'],
-            'transaction_type': row['primary_type'],
-            'debit': round(debit, 2),
-            'credit': round(credit, 2),
-        })
-
-    closing_balance = round(opening_balance + total_debit - total_credit, 2)
-
-    payload = {
-        'account_name': account_name,
-        'from_date': from_date,
-        'to_date': to_date,
-        'opening_balance': round(opening_balance, 2),
-        'rows': rows,
-        'total_debit': round(total_debit, 2),
-        'total_credit': round(total_credit, 2),
-        'closing_balance': closing_balance,
-    }
     r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
     logger.info('Supplier ledger statement cached: account=%s %s→%s rows=%d',
-                account_name, from_date, to_date, len(rows))
+                account_name, from_date, to_date, len(payload['rows']))
     return _response(200, payload)
 
 
@@ -573,6 +546,14 @@ def _handle_ledger_outstanding(to_date: str):
 
 
 def _handle_ledger_statement(account_name: str, from_date: str, to_date: str):
+    """Per-voucher account statement for one customer over a date range.
+
+    Computation is delegated to ledger_statement.compute_ledger_statement
+    (shared with the /ledger/statement/pdf route). This wrapper owns:
+      - required-param validation
+      - Redis cache-aside (key iravi:ledger:statement:{account}:{from}:{to})
+      - _response wrapping
+    """
     if not account_name or not from_date or not to_date:
         return _response(400, {'error': 'account_name, from_date, and to_date are required'})
 
@@ -584,80 +565,13 @@ def _handle_ledger_statement(account_name: str, from_date: str, to_date: str):
 
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            # Opening balance: all transactions strictly before from_date
-            cur.execute("""
-                SELECT COALESCE(
-                    SUM(CASE WHEN category = 'Db' THEN amount ELSE -amount END), 0
-                )
-                FROM customer_ledger
-                WHERE out_z IS NULL
-                  AND account_name = %(account_name)s
-                  AND transaction_date < %(from_date)s
-            """, {'account_name': account_name, 'from_date': from_date})
-            opening_balance = float(cur.fetchone()[0])
-
-            # Period transactions grouped by voucher, determine primary sub_category
-            cur.execute("""
-                SELECT
-                    transaction_date,
-                    voucher_no,
-                    MAX(CASE WHEN sub_category NOT IN ('CGST', 'SGST', 'IGST', 'Roundoff')
-                        THEN sub_category END) AS primary_type,
-                    COALESCE(SUM(amount) FILTER (WHERE category = 'Db'), 0) AS debit,
-                    COALESCE(SUM(amount) FILTER (WHERE category = 'Cr'), 0) AS credit
-                FROM customer_ledger
-                WHERE out_z IS NULL
-                  AND account_name = %(account_name)s
-                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
-                GROUP BY transaction_date, voucher_no
-                ORDER BY transaction_date ASC, voucher_no ASC
-            """, {'account_name': account_name, 'from_date': from_date, 'to_date': to_date})
-            col_names = [d[0] for d in cur.description]
-            raw_rows = cur.fetchall()
+        payload = _ls.compute_ledger_statement(conn, account_name, from_date, to_date)
     finally:
         conn.close()
 
-    total_debit = 0.0
-    total_credit = 0.0
-    rows = []
-    for raw in raw_rows:
-        row = dict(zip(col_names, raw))
-        raw_debit = float(row['debit'])
-        raw_credit = float(row['credit'])
-        # Net the two sides so roundoff/GST sub-components are absorbed into the
-        # voucher they belong to.  The voucher shows on only one side; the running
-        # balance is numerically unchanged because net = raw_debit − raw_credit.
-        net = raw_debit - raw_credit
-        if net >= 0:
-            debit, credit = net, 0.0
-        else:
-            debit, credit = 0.0, -net
-        total_debit += debit
-        total_credit += credit
-        rows.append({
-            'transaction_date': row['transaction_date'].isoformat(),
-            'voucher_no': row['voucher_no'],
-            'transaction_type': row['primary_type'],
-            'debit': round(debit, 2),
-            'credit': round(credit, 2),
-        })
-
-    closing_balance = round(opening_balance + total_debit - total_credit, 2)
-
-    payload = {
-        'account_name': account_name,
-        'from_date': from_date,
-        'to_date': to_date,
-        'opening_balance': round(opening_balance, 2),
-        'rows': rows,
-        'total_debit': round(total_debit, 2),
-        'total_credit': round(total_credit, 2),
-        'closing_balance': closing_balance,
-    }
     r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
     logger.info('Ledger statement cached: account=%s %s→%s rows=%d',
-                account_name, from_date, to_date, len(rows))
+                account_name, from_date, to_date, len(payload['rows']))
     return _response(200, payload)
 
 
@@ -1291,6 +1205,178 @@ def _handle_monthly_collection(month_raw: str):
     logger.info('Monthly collection cached: month=%s as_on=%s grand=%.2f',
                 month_str, payload['as_on_date'], payload['grand_total']['total'])
     return _response(200, payload)
+
+
+def _handle_customer_balances_fy_pdf(fy_count_raw: str):
+    """GET /reports/customer-balances-fy/pdf?fy_count=all|2|3|4
+
+    Same fy_count parsing as _handle_customer_balances_fy; computes fresh
+    (no Redis caching for PDF exports) and renders via
+    customer_balances_fy_pdf.render_customer_balances_fy_pdf — the same
+    renderer used for the alerts_evaluator email attachment. Local import so a
+    reportlab issue can never break the JSON routes.
+    """
+    fy_count: int | str = 'all'
+    if fy_count_raw and fy_count_raw != 'all':
+        try:
+            n = int(fy_count_raw)
+            if n >= 1:
+                fy_count = n
+        except (ValueError, TypeError):
+            pass
+
+    conn = _get_db_conn()
+    try:
+        payload = _cbfy.compute_customer_balances_fy(conn, fy_count)
+    finally:
+        conn.close()
+
+    import customer_balances_fy_pdf
+    pdf_bytes = customer_balances_fy_pdf.render_customer_balances_fy_pdf(payload)
+    return _pdf_response(pdf_bytes, 'customer_balances_fy.pdf')
+
+
+def _handle_supplier_balances_fy_pdf(fy_count_raw: str):
+    """GET /reports/supplier-balances-fy/pdf?fy_count=all|2|3|4
+
+    Same fy_count parsing as _handle_supplier_balances_fy; computes fresh
+    (no Redis caching) and renders via
+    supplier_balances_fy_pdf.render_supplier_balances_fy_pdf. Local import so
+    a reportlab issue can never break the JSON routes.
+    """
+    fy_count: int | str = 'all'
+    if fy_count_raw and fy_count_raw != 'all':
+        try:
+            n = int(fy_count_raw)
+            if n >= 1:
+                fy_count = n
+        except (ValueError, TypeError):
+            pass
+
+    conn = _get_db_conn()
+    try:
+        payload = _sbfy.compute_supplier_balances_fy(conn, fy_count)
+    finally:
+        conn.close()
+
+    import supplier_balances_fy_pdf
+    pdf_bytes = supplier_balances_fy_pdf.render_supplier_balances_fy_pdf(payload)
+    return _pdf_response(pdf_bytes, 'supplier_balances_fy.pdf')
+
+
+def _handle_monthly_sales_pdf(month_raw: str):
+    """GET /reports/monthly-sales/pdf?month=YYYY-MM
+
+    Same month parsing/IST default as _handle_monthly_sales; computes fresh
+    (no Redis caching) and renders via
+    monthly_sales_pdf.render_monthly_sales_pdf. Local import so a reportlab
+    issue can never break the JSON routes.
+    """
+    from datetime import timedelta as _timedelta
+
+    _IST = timezone(_timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(_IST).date()
+
+    month_str = (month_raw or '').strip()
+    try:
+        parsed_month = datetime.strptime(month_str, '%Y-%m')
+        month_str = parsed_month.strftime('%Y-%m')
+    except (ValueError, AttributeError):
+        month_str = today_ist.strftime('%Y-%m')
+
+    conn = _get_db_conn()
+    try:
+        payload = monthly_sales.compute_monthly_sales(conn, month_str)
+    finally:
+        conn.close()
+
+    import monthly_sales_pdf
+    pdf_bytes = monthly_sales_pdf.render_monthly_sales_pdf(payload)
+    return _pdf_response(pdf_bytes, f'monthly_sales_{month_str}.pdf')
+
+
+def _handle_monthly_collection_pdf(month_raw: str):
+    """GET /reports/monthly-collection/pdf?month=YYYY-MM
+
+    Same month parsing/IST default as _handle_monthly_collection; computes
+    fresh (no Redis caching) and renders via
+    monthly_collection_pdf.render_monthly_collection_pdf. Local import so a
+    reportlab issue can never break the JSON routes.
+    """
+    from datetime import timedelta as _timedelta
+
+    _IST = timezone(_timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(_IST).date()
+
+    month_str = (month_raw or '').strip()
+    try:
+        parsed_month = datetime.strptime(month_str, '%Y-%m')
+        month_str = parsed_month.strftime('%Y-%m')
+    except (ValueError, AttributeError):
+        month_str = today_ist.strftime('%Y-%m')
+
+    conn = _get_db_conn()
+    try:
+        payload = monthly_collection.compute_monthly_collection(conn, month_str)
+    finally:
+        conn.close()
+
+    import monthly_collection_pdf
+    pdf_bytes = monthly_collection_pdf.render_monthly_collection_pdf(payload)
+    return _pdf_response(pdf_bytes, f'monthly_collection_{month_str}.pdf')
+
+
+def _handle_ledger_statement_pdf(account_name: str, from_date: str, to_date: str):
+    """GET /ledger/statement/pdf?account_name=&from_date=&to_date=
+
+    Same required-param validation as _handle_ledger_statement; computes
+    fresh (no Redis caching) via ledger_statement.compute_ledger_statement and
+    renders via ledger_statement_pdf.render_ledger_statement_pdf. Local
+    import so a reportlab issue can never break the JSON routes.
+    """
+    if not account_name or not from_date or not to_date:
+        return _response(400, {'error': 'account_name, from_date, and to_date are required'})
+
+    conn = _get_db_conn()
+    try:
+        payload = _ls.compute_ledger_statement(conn, account_name, from_date, to_date)
+    finally:
+        conn.close()
+
+    import ledger_statement_pdf
+    pdf_bytes = ledger_statement_pdf.render_ledger_statement_pdf(payload)
+    filename = (
+        f'customer_ledger_statement_{_safe_filename_part(account_name)}_'
+        f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
+    )
+    return _pdf_response(pdf_bytes, filename)
+
+
+def _handle_supplier_ledger_statement_pdf(account_name: str, from_date: str, to_date: str):
+    """GET /supplier-ledger/statement/pdf?account_name=&from_date=&to_date=
+
+    Same required-param validation as _handle_supplier_ledger_statement;
+    computes fresh (no Redis caching) via
+    supplier_ledger_statement.compute_supplier_ledger_statement and renders
+    via supplier_ledger_statement_pdf.render_supplier_ledger_statement_pdf.
+    Local import so a reportlab issue can never break the JSON routes.
+    """
+    if not account_name or not from_date or not to_date:
+        return _response(400, {'error': 'account_name, from_date, and to_date are required'})
+
+    conn = _get_db_conn()
+    try:
+        payload = _sls.compute_supplier_ledger_statement(conn, account_name, from_date, to_date)
+    finally:
+        conn.close()
+
+    import supplier_ledger_statement_pdf
+    pdf_bytes = supplier_ledger_statement_pdf.render_supplier_ledger_statement_pdf(payload)
+    filename = (
+        f'supplier_ledger_statement_{_safe_filename_part(account_name)}_'
+        f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
+    )
+    return _pdf_response(pdf_bytes, filename)
 
 
 def _handle_notify(body_str: str) -> dict:
@@ -2414,3 +2500,22 @@ def _response(status: int, body) -> dict:
         'headers': {'Content-Type': 'application/json'},
         'body': json.dumps(body),
     }
+
+
+def _pdf_response(pdf_bytes: bytes, filename: str) -> dict:
+    """Base64-encoded PDF response (copied from procurement_api/handler.py's
+    _pdf_response so the two Lambdas stay byte-compatible in behaviour)."""
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/pdf',
+            'Content-Disposition': f'attachment; filename="{filename}"',
+        },
+        'body': base64.b64encode(pdf_bytes).decode('ascii'),
+        'isBase64Encoded': True,
+    }
+
+
+def _safe_filename_part(value: str) -> str:
+    """Sanitize a query-param value for use inside a Content-Disposition filename."""
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', value or '')
