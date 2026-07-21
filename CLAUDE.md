@@ -80,6 +80,13 @@ business-core/
     │   │                        _handle_supplier_balances_fy refactored (2026-07-06): now delegates to
     │   │                        supplier_balances_fy.compute_supplier_balances_fy (cache-aside unchanged;
     │   │                        endpoint JSON shape unchanged; no code/credit_notes fields)
+    │   │                        _handle_ledger_statement / _handle_supplier_ledger_statement refactored
+    │   │                        (2026-07-20): now delegate to ledger_statement.compute_ledger_statement /
+    │   │                        supplier_ledger_statement.compute_supplier_ledger_statement (cache-aside
+    │   │                        unchanged; endpoint JSON shape unchanged). Added _pdf_response() (copied
+    │   │                        from procurement_api/handler.py) + _safe_filename_part() + 6 new GET
+    │   │                        .../pdf routes, each with a LOCAL `import <module>_pdf` — see
+    │   │                        "api — Server-side PDF exports" section below for full detail.
     │   ├── auth.py           ← PBKDF2 password hashing + HS256 JWT (stdlib only)
     │   ├── alerts_eval.py    ← SHARED: balances evaluation + FIFO aging + field catalog + validation
     │   │                        Added 2026-07-06: FIELD_CATALOG_CUSTOMER_BALANCES_FY (fields=[], not
@@ -102,7 +109,25 @@ business-core/
     │   │                        no fuzzy matching. Fixed alerts_evaluator's city_map query in the same
     │   │                        change — it was missing `WHERE out_z IS NULL` (api/ copy had it; the
     │   │                        two files were not byte-identical before this fix).
-    │   └── requirements.txt
+    │   ├── monthly_sales.py / monthly_collection.py ← SHARED compute modules (unchanged by this task)
+    │   ├── ledger_statement.py ← SHARED (added 2026-07-20): compute_ledger_statement(conn, account_name,
+    │   │                        from_date, to_date) → dict. Extracted verbatim from
+    │   │                        _handle_ledger_statement (per-voucher netting SQL unchanged).
+    │   ├── supplier_ledger_statement.py ← SHARED (added 2026-07-20): compute_supplier_ledger_statement(...)
+    │   │                        → dict. Extracted verbatim from _handle_supplier_ledger_statement.
+    │   ├── letterhead.py / pdf_fonts.py / DejaVuSans.ttf / DejaVuSans-Bold.ttf / ial-logo.png
+    │   │                        ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/ (see
+    │   │                        that package's entries below for full docs — keep both copies in sync).
+    │   ├── customer_balances_fy_pdf.py / supplier_balances_fy_pdf.py / monthly_sales_pdf.py /
+    │   │   monthly_collection_pdf.py ← bundled 2026-07-20: byte-identical copies from alerts_evaluator/
+    │   │                        (unmodified — same renderers used for the SES email attachments).
+    │   ├── ledger_statement_pdf.py ← NEW (2026-07-20): render_ledger_statement_pdf(data) → bytes.
+    │   │                        Portrait A4, letterhead.py styling, Dr→RED/Cr→GREEN (customer semantics).
+    │   ├── supplier_ledger_statement_pdf.py ← NEW (2026-07-20): render_supplier_ledger_statement_pdf(data)
+    │   │                        → bytes. Fully self-contained duplicate of ledger_statement_pdf.py with
+    │   │                        Dr/Cr SWAPPED (Dr→GREEN, Cr→RED) — supplier semantics, same convention as
+    │   │                        customer_balances_fy_pdf.py vs supplier_balances_fy_pdf.py.
+    │   └── requirements.txt  ← added reportlab==4.2.2 (2026-07-20), matches alerts_evaluator's convention
     └── alerts_evaluator/     ← EventBridge-triggered nightly alert evaluator (sends SES emails) [COMPLETE]
         ├── handler.py        ← lambda_handler: load due alerts → evaluate → SES send → alert_runs write
         │                        Added 2026-07-06: customer_balances_fy branch (always fires → PDF attachment)
@@ -134,6 +159,13 @@ business-core/
         │                        used (Helvetica fonts, "Rs." in footer, same as monthly_sales_pdf.py);
         │                        calls pdf_fonts.register_fonts() defensively though not required for
         │                        the current field set. (added 2026-07-12)
+        │                        Restyled 2026-07-20 (see letterhead.py below): shared
+        │                        letterhead.build_header()/draw_footer() replace the old ad-hoc
+        │                        logo+company header row and Kukatpally/AP-TS-legend footer; header
+        │                        band switched #1a3c2b → letterhead.GREEN (#17452f). Report's own
+        │                        subtitle/date/"(Value In Lakhs)" row now sits in its own title_tbl
+        │                        directly under the shared letterhead. No ₹/em-dash glyph work needed
+        │                        (already Helvetica, already no ₹ in body text).
         ├── monthly_sales.py  ← copy of shared module (byte-identical to api/monthly_sales.py)
         ├── monthly_sales_pdf.py ← PDF renderer using reportlab (evaluator-only; not in api package)
         │                        Restyled 2026-07-05: dark-green #1a3c2b headers (white text), #f0f0f0
@@ -153,19 +185,42 @@ business-core/
         │                        CUMULATIVE small tables. Consumes the new targets/YoY keys added to
         │                        monthly_sales.compute_monthly_sales() the same day. See "api —
         │                        GET /reports/monthly-sales" section for the full field list.
+        │                        Restyled 2026-07-20 (see letterhead.py below): shared
+        │                        letterhead.build_header()/draw_footer() replace the old ad-hoc
+        │                        logo+company header row and Kukatpally/AP-TS-legend footer; header
+        │                        band switched #1a3c2b → letterhead.GREEN (#17452f). Report's own
+        │                        subtitle/date/"(Value In Lakhs)" row now sits in its own title_tbl
+        │                        directly under the shared letterhead. No glyph work needed — this
+        │                        renderer was already Helvetica-primary with no ₹ in body text; the
+        │                        one existing `&mdash;` sub-heading entity is safe under
+        │                        Helvetica/WinAnsiEncoding (cp1252 0x97) and was left as-is.
         ├── customer_balances_fy.py ← SHARED: byte-identical copy of api/customer_balances_fy.py
         │                        compute_customer_balances_fy(conn, fy_count) → dict
         │                        (added 2026-07-06)
         ├── customer_balances_fy_pdf.py ← PDF renderer for Customer Balances (FY), landscape A4
         │                        render_customer_balances_fy_pdf(data) → bytes
-        │                        Uses DejaVuSans TTFont (via pdf_fonts.register_fonts()) so ₹/— render
-        │                        without KeyError. Two-row header (repeatRows=2), #1a3c2b headers,
-        │                        #f0f0f0 TOTAL row, always-visible Credit Notes column.
+        │                        Two-row header (repeatRows=2), always-visible Credit Notes column.
         │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
         │                        (added 2026-07-06)
         │                        Dr/Cr balance coloring added 2026-07-01: per-FY Balance(₹),
         │                        Balance Dr, Balance Cr cells colored in data + TOTAL rows.
-        │                        Customer: Dr → RED (#cc0000), Cr → GREEN (#1a6e35).
+        │                        Customer: Dr → RED (#cc0000), Cr → GREEN (#1a6e35). UNCHANGED by the
+        │                        2026-07-20 restyle below.
+        │                        Restyled 2026-07-20 to match the PO house design (see letterhead.py):
+        │                        PRIMARY font switched DejaVuSans → Helvetica/Helvetica-Bold (matches
+        │                        po_pdf.py); DejaVuSans is now registered ONLY for the rupee glyph, via
+        │                        `_RS = letterhead.register_fonts()` — an inline
+        │                        `<font name="DejaVuSans">₹</font>` Paragraph-markup token used
+        │                        everywhere a bare '₹' character used to be concatenated (in `_fmt_inr`
+        │                        and the 'Debit (₹)' etc. header sub-labels) — a raw ₹ char in a
+        │                        Helvetica Paragraph can KeyError. The em-dash '—' zero/blank
+        │                        placeholder (code/city/data cells) was replaced with a plain hyphen
+        │                        '-' (cosmetic only, not a data change) to avoid depending on
+        │                        Helvetica/WinAnsiEncoding's em-dash handling for a placeholder glyph.
+        │                        Header band #1a3c2b → letterhead.GREEN (#17452f); old ad-hoc
+        │                        logo+company+date header row and Kukatpally footer replaced by
+        │                        letterhead.build_header()/draw_footer(); 'CUSTOMER BALANCES' + Date
+        │                        now their own title row under the shared letterhead (not part of it).
         ├── supplier_balances_fy.py ← SHARED: byte-identical copy of api/supplier_balances_fy.py
         │                        compute_supplier_balances_fy(conn, fy_count) → dict
         │                        No code field; no credit_notes field. Sort by party name ascending.
@@ -174,21 +229,47 @@ business-core/
         │                        entry above; identical change applied here to keep both byte-identical.
         ├── supplier_balances_fy_pdf.py ← PDF renderer for Supplier Balances (FY), landscape A4
         │                        render_supplier_balances_fy_pdf(data) → bytes
-        │                        Uses DejaVuSans TTFont (via pdf_fonts.register_fonts()) so ₹/— render
-        │                        without KeyError. Two-row header (repeatRows=2), #1a3c2b headers,
-        │                        #f0f0f0 TOTAL row. No Code column; no Credit Notes column (3 sub-cols
-        │                        per FY: Debit/Credit/Balance). Supplier footer legend:
-        │                        'Dr = Debit (payable); Cr = Credit (advance/overpayment).'
+        │                        Two-row header (repeatRows=2). No Code column; no Credit Notes column
+        │                        (3 sub-cols per FY: Debit/Credit/Balance). Supplier footer legend text
+        │                        ('Dr = Debit (payable); Cr = Credit (advance/overpayment).') was
+        │                        DROPPED by the 2026-07-20 footer restyle (see below) — the Dr/Cr COLOR
+        │                        semantics themselves are unchanged, only the textual footer legend.
         │                        Indian-grouped rupee amounts (₹12,34,567.00). Landscape 1cm margins.
         │                        (added 2026-07-06)
         │                        Dr/Cr balance coloring added 2026-07-01: per-FY Balance(₹),
         │                        Balance Dr, Balance Cr cells colored in data + TOTAL rows.
-        │                        Supplier SWAPPED: Dr → GREEN (#1a6e35), Cr → RED (#cc0000).
+        │                        Supplier SWAPPED: Dr → GREEN (#1a6e35), Cr → RED (#cc0000). UNCHANGED
+        │                        by the 2026-07-20 restyle below.
+        │                        Restyled 2026-07-20 — identical treatment to
+        │                        customer_balances_fy_pdf.py's 2026-07-20 entry above: PRIMARY font
+        │                        Helvetica/Helvetica-Bold, `_RS` inline-font rupee token from
+        │                        letterhead.register_fonts(), em-dash placeholders → hyphen, header
+        │                        band → letterhead.GREEN, shared letterhead.build_header()/
+        │                        draw_footer(), 'SUPPLIER BALANCES' + Date as its own title row.
+        ├── letterhead.py     ← SHARED (added 2026-07-20): IAL letterhead (header + footer) for all 4
+        │                        report PDF renderers above, ported from
+        │                        procurement_api/po_pdf.py's _header()/_draw_footer()/_styles() so
+        │                        every emailed report PDF matches the Purchase Order house design
+        │                        (po_pdf.py itself is untouched — no cross-Lambda import; this is an
+        │                        independent adaptation living in this package). Exposes: palette
+        │                        constants GREEN(#17452f)/GREEN2(#2d5c44)/ORANGE(#c8641e)/MUTED(#555555)/
+        │                        RULE(#c9c9c9)/BODY(#1c1c1c); BASE_FONT/BOLD_FONT = 'Helvetica'/
+        │                        'Helvetica-Bold'; register_fonts() → rupee inline-font token (delegates
+        │                        actual TTFont registration to pdf_fonts.register_fonts()); build_header(dw)
+        │                        → logo + centered company name/tagline/identity-line + green/orange
+        │                        double-rule flowables (callers append their own report title/date row
+        │                        immediately after — not part of the shared letterhead); draw_footer(canvas,
+        │                        doc) → 0.6pt rule + registered-office line + "This document is
+        │                        computer-generated and is valid without signature." (reworded from
+        │                        po_pdf.py's PO-specific wording), reads doc.pagesize/leftMargin/
+        │                        rightMargin so it works on both portrait and landscape documents.
         ├── pdf_fonts.py      ← SHARED: idempotent register_fonts() — registers DejaVuSans and
         │                        DejaVuSans-Bold with reportlab pdfmetrics; falls back to Helvetica
         │                        with warning on failure. Fixes ₹ (U+20B9) + — (U+2014) KeyError
         │                        that crashes Helvetica-based doc.build() on Lambda.
-        │                        Reused by both Customer and Supplier Balances (FY) PDF renderers.
+        │                        Reused by both Customer and Supplier Balances (FY) PDF renderers,
+        │                        and (2026-07-20) by letterhead.py (for the rupee-glyph token used by
+        │                        all 4 report PDF renderers).
         │                        (added 2026-07-06)
         ├── DejaVuSans.ttf    ← bundled Unicode TTF (738 KB); source: matplotlib mpl-data/fonts/ttf
         ├── DejaVuSans-Bold.ttf ← bundled Unicode TTF-Bold (688 KB); same source
@@ -248,7 +329,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
-| api | Python 3.12 | psycopg2-binary, redis, boto3 |
+| api | Python 3.12 | psycopg2-binary, redis, boto3, reportlab (added 2026-07-20 for PDF exports) |
 | alerts_evaluator | Python 3.12 | psycopg2-binary, reportlab (boto3/ses from runtime) |
 
 ---
@@ -734,11 +815,50 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /reports/supplier-balances-fy` | `iravi:reports:supplier_balances_fy:{fy_count}` | Complete |
 | `GET /reports/monthly-sales` | `iravi:reports:monthly_sales:v2:{month}` | Complete (v2 payload — targets + YoY, 2026-07-11) |
 | `GET /ledger/statement` | `iravi:ledger:statement:{account}:{from}:{to}` | Complete |
+| `GET /reports/customer-balances-fy/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /reports/supplier-balances-fy/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /reports/monthly-sales/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /reports/monthly-collection/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /ledger/statement/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /supplier-ledger/statement/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
 **Ledger statement — per-voucher netting (added 2026-06-23):**
 `GET /ledger/statement` already groups rows by voucher before returning. Each voucher's `debit` and `credit` fields are now netted: `net = raw_debit − raw_credit`; if `net >= 0` then `debit=net, credit=0.0`; else `debit=0.0, credit=-net`. This absorbs roundoff/GST sub-components so no phantom opposite-side paise appear on the statement. `total_debit`/`total_credit` are summed from the netted values. `closing_balance` is unchanged because `net = raw_debit − raw_credit`, so `Σ(netted_debit − netted_credit) = Σ(raw_debit − raw_credit)`. Cache flush required after deploy (no re-ingest needed).
+
+---
+
+## api — Server-side PDF exports for 6 dashboard reports (added 2026-07-20)
+
+**Status: complete.** All 6 PDFs use the shared IAL/PO-house letterhead (`letterhead.py`) and never touch the existing JSON endpoints' output — every JSON handler that now backs a PDF route was refactored to delegate to a shared `compute_*` function first (Redis cache-aside + `_response` wrapping stayed in the handler), then the PDF route reuses the same `compute_*` function with a fresh (uncached) DB connection.
+
+**Bundled rendering assets (byte-identical copies from `lambda/alerts_evaluator/`, verified via `filecmp.cmp(..., shallow=False)`):** `letterhead.py`, `pdf_fonts.py`, `DejaVuSans.ttf`, `DejaVuSans-Bold.ttf`, `ial-logo.png`, `customer_balances_fy_pdf.py`, `supplier_balances_fy_pdf.py`, `monthly_sales_pdf.py`, `monthly_collection_pdf.py`. These 4 renderers are unmodified from the alerts_evaluator copies — same house design, same `_RS` inline-font rupee token. Keep both copies byte-identical when either is edited (matches this repo's existing cross-Lambda-shared-file convention — see the `customer_balances_fy.py` / `supplier_balances_fy.py` entries above).
+
+**2 new shared compute modules (extracted from previously-inline handler SQL):**
+- `api/ledger_statement.py::compute_ledger_statement(conn, account_name, from_date, to_date) -> dict` — moved verbatim out of `_handle_ledger_statement`.
+- `api/supplier_ledger_statement.py::compute_supplier_ledger_statement(conn, account_name, from_date, to_date) -> dict` — moved verbatim out of `_handle_supplier_ledger_statement`.
+- `_handle_ledger_statement` / `_handle_supplier_ledger_statement` now just validate params, check Redis, call the `compute_*` function, cache, and return — same cache keys/TTL/log lines as before; JSON shape unchanged (verified by re-reading both handlers post-refactor).
+
+**2 new renderers (portrait A4, styled exactly like the other 4 report PDFs via `letterhead.py`):**
+- `api/ledger_statement_pdf.py::render_ledger_statement_pdf(data) -> bytes` — title `CUSTOMER LEDGER STATEMENT`; Dr → RED (`#cc0000`), Cr → GREEN (`#1a6e35`) — same semantics as `customer_balances_fy_pdf.py`.
+- `api/supplier_ledger_statement_pdf.py::render_supplier_ledger_statement_pdf(data) -> bytes` — title `SUPPLIER LEDGER STATEMENT`; Dr/Cr colors SWAPPED (Dr → GREEN, Cr → RED) — same semantics as `supplier_balances_fy_pdf.py`. Fully self-contained (no cross-import from `ledger_statement_pdf.py`), matching this package's existing convention of NOT sharing code between the paired customer/supplier renderers (see `customer_balances_fy_pdf.py` vs `supplier_balances_fy_pdf.py`).
+- Both: one-row repeating header (`repeatRows=1`) — Date | Voucher No | Type | Debit (₹) | Credit (₹) | Balance (₹); a synthetic "Opening Balance" row first, then one row per statement entry with a running balance (`running += debit − credit`, rounded to 2dp per row), then a "TOTAL / Closing Balance" row. Long statements paginate automatically (the reportlab `Table` flowable splits across pages on its own; verified 400-row stub → 9 pages); `letterhead.draw_footer` is registered as both `onFirstPage` and `onLaterPages` so the footer reprints on every page.
+- ₹ handling: every amount routes through `_RS` (`letterhead.register_fonts()`'s `<font name="DejaVuSans">₹</font>` token), including header sub-labels (`Debit (₹)` etc.) — never a bare `₹` char in a Helvetica Paragraph. Zero/blank placeholders use a plain hyphen `-`, not an em-dash.
+
+**`_pdf_response(pdf_bytes, filename)`** added to `api/handler.py` (copied from `procurement_api/handler.py`) — base64-encodes the PDF body and sets `isBase64Encoded: true` + `Content-Type: application/pdf` + `Content-Disposition: attachment; filename="..."`. A new `_safe_filename_part(value)` helper (regex `[^A-Za-z0-9._-]+` → `_`) sanitizes account names/dates before they go into a `Content-Disposition` filename.
+
+**6 new GET routes**, all in the existing GET-only routing block, each with a **local** `import <module>_pdf` inside its handler function (so a reportlab problem can never break the JSON routes) and **no Redis caching** (PDFs are always computed fresh from a new DB connection — cheap enough at current volume; revisit if PDF traffic grows):
+- `GET /reports/customer-balances-fy/pdf?fy_count=all|2|3|4` → `customer_balances_fy.pdf`
+- `GET /reports/supplier-balances-fy/pdf?fy_count=all|2|3|4` → `supplier_balances_fy.pdf`
+- `GET /reports/monthly-sales/pdf?month=YYYY-MM` → `monthly_sales_<month>.pdf`
+- `GET /reports/monthly-collection/pdf?month=YYYY-MM` → `monthly_collection_<month>.pdf`
+- `GET /ledger/statement/pdf?account_name=&from_date=&to_date=` → `customer_ledger_statement_<account>_<from>_<to>.pdf` (each part sanitized via `_safe_filename_part`)
+- `GET /supplier-ledger/statement/pdf?account_name=&from_date=&to_date=` → `supplier_ledger_statement_<account>_<from>_<to>.pdf` (sanitized)
+
+**`requirements.txt`:** added `reportlab==4.2.2` (matches `alerts_evaluator/requirements.txt`'s convention — the GitHub Actions pipeline `pip install`s this into the Lambda Layer; no local install needed). Also flagged for the iac agent: the api Lambda's Terraform config (`lambda_api.tf`) needs the reportlab layer attached (same layer `alerts_evaluator` already uses) plus these 6 routes registered on the API Gateway HTTP API.
+
+**Verification (2026-07-20):** `python -m py_compile` clean on all 11 changed/added files. All 6 `render_*` functions smoke-tested with representative stub dicts (₹ amounts, negatives, missing city/code/type, a 400-row multi-page statement, a zero-activity edge case) — every call returned valid `%PDF` bytes with no exceptions; the long ledger statement produced 9 pages (`pypdf` page count); `letterhead.register_fonts()` confirmed to return the real DejaVuSans inline-font token, not the `Rs.` fallback (i.e. the bundled TTF loaded correctly). `__pycache__` cleaned up after testing.
 
 ---
 
