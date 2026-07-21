@@ -801,20 +801,62 @@ Line-item purchase ledger populated by both `etl_appendix_b_x11_purchase` (`Appe
 
 Source file patterns: `AppendixSale*.xlsx` (S3 prefix filter: `raw/AppendixSale`, `sales_return='N'`, `in_out='Out'`) and `AppendixRetSales*.xlsx` (S3 prefix filter: `raw/AppendixRetSales`, `sales_return='Y'`, `in_out='In'`).
 
-**Header:** row 5. **Data:** row 6+. Skip if `purchase_date` is None, `iravi_voucher` is empty, or `product`/`technical_name` is empty.
+**Changed 2026-07-22:** both sale-side feeds switched from real xlsx workbooks to **CSV
+content** while keeping the same filename patterns (`AppendixSale*.xlsx` /
+`AppendixRetSales*.xlsx`) and the same S3 prefixes — the filename gates (`_FILE_PREFIX` +
+`.xlsx` suffix check) are unchanged, but the downloaded bytes are now comma-delimited CSV
+text, never openpyxl-readable. Mirrors the `etl_appendix_b_x11_purchase` /
+`etl_appendix_b_x11_purchase_return` 2026-07-21 conversion closely: `csv.DictReader`
+(`encoding='utf-8-sig'`, `newline=''`), header on line 1, data from line 2 (no leading
+blank/metadata rows), mapped by header **name** (not position). `openpyxl` and the old
+`ws.iter_rows(min_row=6, ...)` positional-index reader are removed from both handlers.
 
-**Column mapping (0-indexed, identical for both files):**
-`[0]=Date→purchase_date, [1]=Voucher No→iravi_voucher/voucher_no, [2]=Branch→branch, [3]=Party→party, [4]=Ref BillNo→ref_bill_no, [5]=Ref BillDate→ref_bill_date, [6]=Product→technical_name/product, [7]=Qty→qty, [8]=Rate→rate, [9]=Gross→gross, [14]=AV→av, [22]=Barcodes→barcode/barcodes`
+**Header-name column mapping (2026-07-22, both feeds):**
+`ProductId→product/technical_name, Qty→qty, Rate→rate, Gross→gross, AV→av,
+Barcodes→barcode/barcodes, Date→purchase_date, BranchId→branch, AccountId→party,
+RefBillNo→ref_bill_no, RefBillDate→ref_bill_date, VoucherNo→iravi_voucher/voucher_no`.
+`AppendixSale` has 29 columns, `AppendixRetSales` has 28 (missing `PriceListId`, which
+isn't consumed here anyway) — only the above are consumed from either, the rest are
+ignored, so the column-count difference doesn't affect header-name mapping. **Neither feed
+has a Narration column** — `narration` is always hardcoded `None` in both handlers (same
+as before the CSV conversion). Extraction is in a standalone `_extract_sale_row(row: dict)
+-> dict | None` function (same shape as `etl_appendix_b_x11_purchase`'s
+`_extract_purchase_row`) for testability. Skip (return `None`) if `Date` is blank,
+`VoucherNo` is blank, or `ProductId` is blank. All CSV cells arrive as strings — blank is
+`''`, never `None`; numeric casts (`qty`/`rate`/`gross`/`av`) go through a `_to_float()`
+helper that treats `None` and `''`/whitespace-only as blank → `None`. String fields are
+`.strip()`ped via `str(row.get(...) or '').strip()`. Dates (`Date`, `RefBillDate`) are
+`DD-MM-YYYY` text, parsed by the pre-existing `_parse_date()` (unchanged — already
+supported that format).
 
 **Transformations:**
-- `product`/`technical_name` — strip all commas from the product string
-- `barcode` — strip trailing comma, split by `,`; rows with multiple barcodes are skipped **for the ledger table only** (the `sales` table gets every parsed row regardless of barcode count)
+- `product`/`technical_name` — `.strip()` only (the old xlsx-era comma-stripping hack is
+  gone — real CSV quoting already protects embedded commas, matching the purchase-side
+  handlers' 2026-07-21 conversion)
+- `barcode` — `Barcodes` column value (trailing-comma quoted single-barcode string, e.g.
+  `"BC001,"`), strip trailing comma, split by `,`; rows with multiple barcodes are skipped
+  **for the ledger table only** (the `sales` table gets every parsed row regardless of
+  barcode count)
 - `mdf_date` / `exp_date` — looked up from `appendix_b_x11_stock WHERE (technical_name, barcode) AND out_z IS NULL`; NULL if no match
-- `narration` — always NULL (neither source file has a Narration column)
+- `narration` — always NULL (neither source file has a Narration column; unchanged by the CSV conversion)
+- `in_out` — `'Out'` for `etl_appendix_b_x11_sale`, `'In'` for `etl_appendix_b_x11_sale_return` (unchanged)
+- `sales_return` — `'N'` for `etl_appendix_b_x11_sale`, `'Y'` for `etl_appendix_b_x11_sale_return` (unchanged)
 
 **Writes to two tables per row:**
 1. `appendix_b_x11_stock_ledger` — milestoning natural key `(purchase_date, iravi_voucher, technical_name, barcode)`; only rows with exactly 1 barcode (DB migration `006_create_appendix_b_x11_stock_ledger.sql`)
-2. `sales` — milestoning natural key/PK `(purchase_date, voucher_no, branch, party, product)`; every parsed row (DB migration `008_create_sales.sql`)
+2. `sales` — milestoning natural key/PK `(purchase_date, voucher_no, branch, party, product, COALESCE(barcodes,''))`; every parsed row (DB migration `008_create_sales.sql`; key widened by `031_add_barcodes_to_purchases_sales_key.sql`)
+
+**Verified 2026-07-22:** synthetic CSV fixtures (real header row + one real sample data
+row per feed, built and deleted in each Lambda's own directory — `__pycache__` cleaned up
+afterward) confirmed `_extract_sale_row` produces the expected `product`, `qty`, `rate`,
+`gross`, `av`, `purchase_date`, `branch`, `party`, `ref_bill_no` (blank → `None` for the
+return feed), `ref_bill_date`, `voucher_no`, `narration=None`, and `sales_return` values
+for both feeds, and that the full `_parse()` path correctly splits the trailing-comma
+`Barcodes` string down to a single ledger barcode with the correct `in_out` per feed
+(`Out` for base sale, `In` for sale return). `python -m py_compile handler.py` clean on
+both. No downstream change (barcode lookup, milestoning upserts, S3 archive/delete, no
+EventBridge emission for either Lambda) — only the parsing/extraction layer changed,
+exactly mirroring the purchase-side handlers' conversion.
 
 ---
 
