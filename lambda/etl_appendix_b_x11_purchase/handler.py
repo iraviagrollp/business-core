@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -6,7 +7,6 @@ from datetime import date, datetime
 from urllib.parse import unquote_plus
 
 import boto3
-import openpyxl
 import psycopg2
 
 logger = logging.getLogger()
@@ -20,9 +20,13 @@ _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'AppendixPurchaseReport'
 
-# Column indices (0-based), header in row 5, data from row 6:
-# [0]=Date, [1]=Voucher No, [2]=Branch, [5]=Party, [6]=Ref BillNo, [7]=Ref BillDate,
-# [9]=Product, [10]=Qty, [11]=Rate, [12]=Gross, [17]=AV, [25]=Barcodes, [26]=Narration
+# The upstream export is now comma-delimited CSV *content* (still shipped under a
+# `.xlsx` filename/extension — do NOT try to read it with openpyxl). Header is line 1,
+# data from line 2. Columns are mapped by header NAME (not position):
+# ProductId -> product/technical_name, Qty -> qty, Rate -> rate, Gross -> gross,
+# AV -> av, Barcodes -> barcode/barcodes, Narration -> narration, Date -> purchase_date,
+# BranchId -> branch, AccountId -> party, RefBillNo -> ref_bill_no,
+# RefBillDate -> ref_bill_date, VoucherNo -> iravi_voucher/voucher_no.
 
 
 def _get_db_conn():
@@ -90,76 +94,94 @@ def _load_barcode_dates(conn) -> dict:
         return {(row[0], row[1]): (row[2], row[3]) for row in cur.fetchall()}
 
 
-def _parse(src_path: str, barcode_dates: dict) -> tuple[list[dict], list[dict]]:
-    wb = openpyxl.load_workbook(src_path, data_only=True)
-    ws = wb.active
+def _to_float(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == '':
+        return None
+    return float(s)
 
+
+def _extract_purchase_row(row: dict) -> dict | None:
+    """Map one CSV DictReader row (by header name) to a purchase-row dict, or None to skip."""
+    purchase_date_raw = row.get('Date')
+    iravi_voucher = str(row.get('VoucherNo') or '').strip()
+
+    if purchase_date_raw is None or not str(purchase_date_raw).strip():
+        return None
+    if not iravi_voucher:
+        return None
+
+    product = str(row.get('ProductId') or '').strip()
+    if not product:
+        return None
+
+    purchase_date = _parse_date(purchase_date_raw)
+    if purchase_date is None:
+        logger.warning('Unparseable date %r — skipping row', purchase_date_raw)
+        return None
+
+    branch = str(row.get('BranchId') or '').strip()
+    party = str(row.get('AccountId') or '').strip()
+    ref_bill_no = str(row.get('RefBillNo') or '').strip() or None
+    ref_bill_date = _parse_date(row.get('RefBillDate'))
+    barcode_raw = str(row.get('Barcodes') or '').strip()
+
+    return {
+        'purchase_date': purchase_date,
+        'voucher_no': iravi_voucher,
+        'branch': branch,
+        'party': party,
+        'ref_bill_no': ref_bill_no,
+        'ref_bill_date': ref_bill_date,
+        'product': product,
+        'qty': _to_float(row.get('Qty')),
+        'rate': _to_float(row.get('Rate')),
+        'gross': _to_float(row.get('Gross')),
+        'av': _to_float(row.get('AV')),
+        'barcodes': barcode_raw or None,
+        'narration': str(row.get('Narration') or '').strip() or None,
+        'purchase_return': 'N',
+    }
+
+
+def _parse(src_path: str, barcode_dates: dict) -> tuple[list[dict], list[dict]]:
     ledger_rows = []
     purchase_rows = []
     skipped_multi = 0
-    for row in ws.iter_rows(min_row=6, values_only=True):
-        purchase_date_raw = row[0]
-        iravi_voucher = str(row[1] or '').strip()
 
-        if purchase_date_raw is None:
-            continue
-        if not iravi_voucher:
-            continue
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed = _extract_purchase_row(row)
+            if parsed is None:
+                continue
 
-        # Product: the field is a CSV — strip all commas
-        product = str(row[9] or '').replace(',', '').strip()
-        if not product:
-            continue
+            purchase_rows.append(parsed)
 
-        purchase_date = _parse_date(purchase_date_raw)
-        if purchase_date is None:
-            logger.warning('Unparseable date %r — skipping row', purchase_date_raw)
-            continue
+            barcode_raw = parsed['barcodes'] or ''
+            barcodes = [b.strip() for b in barcode_raw.split(',') if b.strip()]
+            if len(barcodes) != 1:
+                skipped_multi += 1
+                continue
+            barcode = barcodes[0]
 
-        branch = str(row[2] or '').strip()
-        party = str(row[5] or '').strip()
-        ref_bill_no = str(row[6] or '').strip() or None
-        ref_bill_date = _parse_date(row[7])
-        barcode_raw = str(row[25] or '').strip()
+            mdf_date, exp_date = barcode_dates.get((parsed['product'], barcode), (None, None))
 
-        purchase_rows.append({
-            'purchase_date': purchase_date,
-            'voucher_no': iravi_voucher,
-            'branch': branch,
-            'party': party,
-            'ref_bill_no': ref_bill_no,
-            'ref_bill_date': ref_bill_date,
-            'product': product,
-            'qty': float(row[10]) if row[10] is not None else None,
-            'rate': float(row[11]) if row[11] is not None else None,
-            'gross': float(row[12]) if row[12] is not None else None,
-            'av': float(row[17]) if row[17] is not None else None,
-            'barcodes': barcode_raw or None,
-            'narration': str(row[26] or '').strip() or None,
-            'purchase_return': 'N',
-        })
-
-        barcodes = [b.strip() for b in barcode_raw.split(',') if b.strip()]
-        if len(barcodes) != 1:
-            skipped_multi += 1
-            continue
-        barcode = barcodes[0]
-
-        mdf_date, exp_date = barcode_dates.get((product, barcode), (None, None))
-
-        ledger_rows.append({
-            'purchase_date': purchase_date,
-            'iravi_voucher': iravi_voucher,
-            'supplier_voucher': ref_bill_no,
-            'branch': branch or None,
-            'party': party or None,
-            'technical_name': product,
-            'barcode': barcode,
-            'mdf_date': mdf_date,
-            'exp_date': exp_date,
-            'in_out': 'In',
-            'qty': float(row[10]) if row[10] is not None else None,
-        })
+            ledger_rows.append({
+                'purchase_date': parsed['purchase_date'],
+                'iravi_voucher': parsed['voucher_no'],
+                'supplier_voucher': parsed['ref_bill_no'],
+                'branch': parsed['branch'] or None,
+                'party': parsed['party'] or None,
+                'technical_name': parsed['product'],
+                'barcode': barcode,
+                'mdf_date': mdf_date,
+                'exp_date': exp_date,
+                'in_out': 'In',
+                'qty': parsed['qty'],
+            })
 
     if skipped_multi:
         logger.info('Skipped %d rows for ledger (multiple barcodes)', skipped_multi)
@@ -174,6 +196,8 @@ def _parse_date(val) -> date | None:
     if isinstance(val, date):
         return val
     s = str(val).strip()
+    if not s:
+        return None
     for fmt in ('%d-%m-%Y %H:%M:%S', '%d-%m-%Y', '%Y-%m-%d'):
         try:
             return datetime.strptime(s, fmt).date()
