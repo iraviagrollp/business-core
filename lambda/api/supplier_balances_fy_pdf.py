@@ -148,6 +148,14 @@ def _ps(name: str, font: str, size: float, align: int,
     )
 
 
+def _draw_header_footer(canvas, doc):
+    """Combined onFirstPage/onLaterPages callback — draws the repeating
+    letterhead header (letterhead.draw_header) and the shared footer
+    (letterhead.draw_footer) on every page (2026-07-21)."""
+    letterhead.draw_header(canvas, doc)
+    letterhead.draw_footer(canvas, doc)
+
+
 # -- public API ----------------------------------------------------------------
 
 def render_supplier_balances_fy_pdf(data: dict) -> bytes:
@@ -173,7 +181,9 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
         pagesize=landscape(A4),
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        topMargin=0.6 * cm,
+        # Header is drawn on the canvas on every page (letterhead.draw_header,
+        # via _draw_header_footer below) — topMargin reserves that band (2026-07-21).
+        topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
         bottomMargin=1.4 * cm,   # footer draws at 0.46-0.95 cm; 1.4 cm clears it
         title='IAL Supplier Balances FY',
         author='IRAVI AGRO LIFE LLP',
@@ -222,7 +232,9 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
         ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
     ]))
 
-    elements: list = list(letterhead.build_header(_CONTENT_W)) + [title_row, Spacer(1, 5)]
+    # Header is drawn on the canvas (letterhead.draw_header, every page) — NOT
+    # added here as a flowable, to avoid double-rendering it on page 1 (2026-07-21).
+    elements: list = [title_row, Spacer(1, 5)]
 
     # -- Column widths ---------------------------------------------------------
     # Supplier has NO Code column (3 identity cols: S.No, Party, City).
@@ -419,6 +431,6 @@ def render_supplier_balances_fy_pdf(data: dict) -> bytes:
     data_tbl.setStyle(TableStyle(tbl_cmds))
     elements.append(data_tbl)
 
-    # -- Build PDF with footer on every page -------------------------------------
-    doc.build(elements, onFirstPage=letterhead.draw_footer, onLaterPages=letterhead.draw_footer)
+    # -- Build PDF with the letterhead header AND footer repeating on every page --
+    doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
     return buffer.getvalue()

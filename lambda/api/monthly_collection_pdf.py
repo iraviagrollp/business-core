@@ -165,6 +165,14 @@ def _base_tbl_cmds() -> list:
     ]
 
 
+def _draw_header_footer(canvas, doc):
+    """Combined onFirstPage/onLaterPages callback — draws the repeating
+    letterhead header (letterhead.draw_header) and the shared footer
+    (letterhead.draw_footer) on every page (2026-07-21)."""
+    letterhead.draw_header(canvas, doc)
+    letterhead.draw_footer(canvas, doc)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def render_monthly_collection_pdf(data: dict) -> bytes:
@@ -186,7 +194,9 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
         pagesize=A4,
         leftMargin=_MARGIN,
         rightMargin=_MARGIN,
-        topMargin=0.8 * cm,
+        # Header is drawn on the canvas on every page (letterhead.draw_header,
+        # via _draw_header_footer below) — topMargin reserves that band (2026-07-21).
+        topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
         bottomMargin=1.4 * cm,      # footer draws at 0.4-0.7 cm; 1.4 cm leaves clearance
         title=f"IAL Monthly Collection - {data['month_label']}",
         author="IRAVI AGRO LIFE LLP",
@@ -251,7 +261,9 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
 
-    elements: list = list(letterhead.build_header(_CONTENT_W)) + [title_tbl, Spacer(1, 5)]
+    # Header is drawn on the canvas (letterhead.draw_header, every page) — NOT
+    # added here as a flowable, to avoid double-rendering it on page 1 (2026-07-21).
+    elements: list = [title_tbl, Spacer(1, 5)]
 
     # ── Section 2: DAILY NET COLLECTION ──────────────────────────────────────
     as_on = data["as_on_date"]
@@ -436,6 +448,6 @@ def render_monthly_collection_pdf(data: dict) -> bytes:
     ]))
     elements.append(outer_tbl)
 
-    # ── Build PDF with footer on every page ───────────────────────────────────
-    doc.build(elements, onFirstPage=letterhead.draw_footer, onLaterPages=letterhead.draw_footer)
+    # ── Build PDF with the letterhead header AND footer repeating on every page ─
+    doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
     return buffer.getvalue()
