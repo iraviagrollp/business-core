@@ -429,20 +429,35 @@ Source file pattern: `StockReport_<YYYYMMDD>_<HHMMSS>.csv` (S3 prefix filter: `r
 
 Source file pattern: `Ledger All Accounts*.xlsx` (S3 prefix filter: `raw/Ledger`)
 
-**Customer row selection (col[10] — Account Group, 2026-06-27):**
-- Identifies customer rows directly from the ledger file: `account_group = str(row[10] or '').strip()`.
+**Changed 2026-07-22:** the upstream ledger feed switched from a real xlsx workbook (header row 5,
+data from `min_row=6`) to **single-sheet CSV content** while keeping the same filename pattern
+(`Ledger All Accounts*.xlsx`) and the same S3 prefix — the filename gate (`_FILE_PREFIX` + `.xlsx`
+suffix check) is unchanged, but the downloaded bytes are now comma-delimited CSV text, never
+openpyxl-readable. `openpyxl` and the old `wb.active` / `ws.iter_rows(min_row=6, values_only=True)`
+positional-index reader are removed from this handler. The file is read with `csv.DictReader`
+(`encoding='utf-8-sig'`, `newline=''`, same idiom as `etl_appendix_b_x11_purchase` /
+`etl_customer_accounts`), header on line 1, data from line 2 — no leading metadata rows — 28
+columns, mapped by header **name** (not position). A new `_to_amount(v)` helper parses the
+`Debit`/`Credit` string cells to float, treating `None`/`''`/whitespace-only as `0.0` (CSV has no
+"empty cell" sentinel other than an empty string, unlike the old openpyxl reader which returned
+`None` for a truly blank cell). Every other rule below (skip rules, sign normalization, category/
+sub-category logic, milestoning) is unchanged — only the reader/extraction layer changed.
+
+**Customer row selection (AccountGroup column, originally 2026-06-27; column now selected by
+header name after the 2026-07-22 CSV conversion):**
+- Identifies customer rows directly from the ledger file: `account_group = str(row.get('AccountGroup') or '').strip()`.
 - Keeps a row only if `account_group.lower() == 'all customer accounts'`. Case-insensitive comparison for safety. Distinct groups in the file include "All Customer Accounts" (341 rows in sample file), "All Supplier Accounts" (114), "All Sales Accounts", "All Bank Accounts", blank (GL/GST contra-leg rows), etc.
 - Explicit IRAVI exclusion: after the account group check, rows where `'iravi' in account_name.lower()` are dropped. IRAVI own-company accounts appear under "All Customer Accounts" in the ledger and must not land in `customer_ledger`.
 - **Does NOT read `customer_details` at all.** No DB read is required for filtering. This means customers who have ledger rows but no `customer_details` master record (no party code) are now correctly included. The API's `_handle_customer_balances_fy` still LEFT-joins `customer_details` for code/city; customers without a master record show null code and null city (UI renders as a dash).
-- Sample file (2026-06-27): 341 raw "All Customer Accounts" rows → 2 IRAVI rows dropped → remaining skip rules (Brought Forward 213, Default Purchase Account 27, no date 2) → **268 rows written** from 36 distinct customer parties.
+- Sample file (2026-06-27, pre-CSV): 341 raw "All Customer Accounts" rows → 2 IRAVI rows dropped → remaining skip rules (Brought Forward 213, Default Purchase Account 27, no date 2) → **268 rows written** from 36 distinct customer parties.
 
-**Parse rules (rows 6+):**
-- Skip if `transaction_date` is None
-- Skip if `account_name` is empty
-- Skip if `voucher_no == 'Brought Forward'`
+**Parse rules (CSV rows — header on line 1, data from line 2):**
+- Skip if `Date` is blank/unparseable
+- Skip if `account_name` (from `ACCOUNT`) is empty
+- Skip if `voucher_no` (from `VoucherNo`) `== 'Brought Forward'`
 - Skip if `debit == 0 and credit == 0` (evaluated AFTER sign normalization below)
-- Skip if `contra_account == 'Default Purchase Account'`
-- Skip if `account_group != 'All Customer Accounts'` (case-insensitive, col[10])
+- Skip if `contra_account` (from `ContraAccount`) `== 'Default Purchase Account'`
+- Skip if `account_group` (from `AccountGroup`) `!= 'All Customer Accounts'` (case-insensitive)
 - Skip if `'iravi' in account_name.lower()` (explicit IRAVI own-company exclusion)
 
 **Sign normalization (applied immediately after reading debit/credit, before the skip check):**
@@ -460,7 +475,28 @@ if credit < 0:
 Example: EKR INDUSTRIES voucher POSRT2526-7 `Roundoff A/C` row arrives as `debit=-0.48, credit=0`.
 After normalization: `debit=0.0, credit=0.48` → stored as `category='Cr', sub_category='Roundoff A/C', amount=0.48` (correct — reduces the Dr balance). Before this fix, `amount=-0.48` was stored with `category='Cr'`, which ADDED 0.48 to the balance instead of subtracting it (0.48 reconciliation error).
 
-**Column mapping (0-indexed):** `[0]=date, [1]=voucher_no, [2]=transaction_name, [4]=account_name (Account field), [5]=contra_account, [6]=debit, [7]=credit, [10]=account_group`
+**Header-name column mapping (2026-07-22, replaces the old 0-indexed positional mapping):**
+`Date → transaction_date, VoucherNo → voucher_no, TransactionName → transaction_name,
+ACCOUNT → account_name, ContraAccount → contra_account, Debit → debit, Credit → credit,
+AccountGroup → account_group`. The CSV has 28 columns total; only the above are consumed, the rest
+are ignored.
+
+**Re-ingest required after 2026-07-22 CSV-conversion deploy:** the `Ledger All Accounts*.xlsx` file
+must be re-uploaded to S3 `raw/` — as real CSV content — so the updated single-sheet Lambda can
+parse it (the old openpyxl reader would fail/misread CSV bytes, and vice versa). This affects both
+`etl_customer_ledger` and `etl_supplier_ledger` (same source file). After re-ingest, run
+`POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` /
+`iravi:reports:supplier_balances_fy:*` / `iravi:ledger:*` entries from Redis.
+
+**Verified 2026-07-22:** a synthetic 28-column CSV fixture (built and deleted in this Lambda's own
+directory — `__pycache__` cleaned up afterward) confirmed `_parse` produces the expected
+`transaction_date/voucher_no/account_name/category/sub_category/amount` for a matching
+`AccountGroup="All Customer Accounts"` row (`category='Db'`, `sub_category='Sale'` for a
+`ContraAccount="Default Sales Account"` Sales Invoice row), while a `"All Bank Accounts"` row, a
+`VoucherNo="Brought Forward"` row, and an `ACCOUNT` containing "IRAVI" were all correctly excluded.
+`python -m py_compile handler.py` clean. No downstream change (sign normalization, category/
+sub-category maps, milestoning upsert, S3 archive/delete, `ETLCustomerLedgerSuccess` emission) —
+only the parsing/extraction layer changed.
 
 **Category & sub-category logic:**
 | Transaction Name | Category | Sub-category (from Contra Account) |
@@ -660,7 +696,20 @@ Partial unique index on (name) WHERE out_z IS NULL.
 
 **Status: complete**
 
-Source file: same `Ledger All Accounts*.xlsx` used by `etl_customer_ledger`. Reads `wb.active` (sheet named "Invoice"); header row 5; data from `min_row=6`.
+Source file: same `Ledger All Accounts*.xlsx` used by `etl_customer_ledger`.
+
+**Changed 2026-07-22:** the upstream feed switched from a real xlsx workbook (`wb.active`, sheet
+named "Invoice", header row 5, data from `min_row=6`) to **single-sheet CSV content** while keeping
+the same filename pattern (`Ledger All Accounts*.xlsx`) — the filename gate (`_FILE_PREFIX` + `.xlsx`
+suffix check) is unchanged, but the downloaded bytes are now comma-delimited CSV text, never
+openpyxl-readable. `openpyxl` and the old positional-index `ws.iter_rows(min_row=6, ...)` reader are
+removed from this handler (mirrors `etl_customer_ledger`'s 2026-07-22 conversion of the same source
+file — read via `_download_with_fallback`, same as before). The file is read with `csv.DictReader`
+(`encoding='utf-8-sig'`, `newline=''`), header on line 1, data from line 2 — no leading metadata
+rows — 28 columns, mapped by header **name** (not position). The same `_to_amount(v)` helper as
+`etl_customer_ledger` parses `Debit`/`Credit` string cells to float (`None`/`''`/whitespace-only →
+`0.0`). Every other rule below (skip rules, sign normalization, category/sub-category logic,
+milestoning) is unchanged — only the reader/extraction layer changed.
 
 **Trigger:** EventBridge "Object Created" rule (NOT an S3 Records event). Event shape:
 ```
@@ -674,20 +723,39 @@ key    = urllib.parse.unquote(event['detail']['object']['key'])   # %20 not '+';
 - Does NOT emit any EventBridge event.
 - `etl_customer_ledger` owns the file lifecycle entirely.
 
-**Supplier filter (col[10] — Account Group):**
-- Identifies supplier rows directly from the ledger file: `account_group = str(row[10] or '').strip()`.
+**Supplier filter (AccountGroup column, originally 2026-06-27; column now selected by header name
+after the 2026-07-22 CSV conversion):**
+- Identifies supplier rows directly from the ledger file: `account_group = str(row.get('AccountGroup') or '').strip()`.
 - Keeps a row only if `account_group.lower() == 'all supplier accounts'`. Case-insensitive comparison for safety. Distinct groups in the file include "All Customer Accounts", "All Supplier Accounts", "All Sales Accounts", "All Bank Accounts", etc.
 - Explicit IRAVI exclusion: after the account group check, rows where `'iravi' in account_name.lower()` are dropped. IRAVI own-company accounts ("IRAVI AGRO LIFE HYD", "IRAVI AGRO LIFE LLP - GNT") appear under "All Supplier Accounts" in the ledger and must not land in `supplier_ledger`.
 - **Does NOT read `supplier_accounts` at all.** No DB read is required for filtering.
-- Sample file (2026-06-27): 114 raw "All Supplier Accounts" rows → 10 IRAVI rows dropped → remaining skip rules (Brought Forward, zero-value, null-date) → **83 rows written** from 7 distinct suppliers including JAGRUTHI AGRO CHEMICALS (36 rows).
+- Sample file (2026-06-27, pre-CSV): 114 raw "All Supplier Accounts" rows → 10 IRAVI rows dropped → remaining skip rules (Brought Forward, zero-value, null-date) → **83 rows written** from 7 distinct suppliers including JAGRUTHI AGRO CHEMICALS (36 rows).
 
-**Column mapping (0-indexed):** `[0]=transaction_date, [1]=voucher_no, [2]=transaction_name, [4]=account_name (Account field), [5]=contra_account, [6]=debit, [7]=credit, [10]=account_group`
+**Header-name column mapping (2026-07-22, replaces the old 0-indexed positional mapping):**
+`Date → transaction_date, VoucherNo → voucher_no, TransactionName → transaction_name,
+ACCOUNT → account_name, ContraAccount → contra_account, Debit → debit, Credit → credit,
+AccountGroup → account_group`. The CSV has 28 columns total; only the above are consumed, the rest
+are ignored. Identical mapping to `etl_customer_ledger` (same source file).
 
 **Parse / skip rules (identical mechanics to etl_customer_ledger):**
 - Sign normalization applied first: negative debit → add to credit & zero; negative credit → add to debit & zero.
-- Skip if: `transaction_date_raw is None`; `account_name` empty; `voucher_no == 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `account_group.lower() != 'all supplier accounts'`; `'iravi' in account_name.lower()`.
+- Skip if: `Date` blank/unparseable; `account_name` (from `ACCOUNT`) empty; `voucher_no` (from `VoucherNo`) `== 'Brought Forward'`; `debit == 0 and credit == 0` (after normalization); `account_group.lower() != 'all supplier accounts'`; `'iravi' in account_name.lower()`.
 - Date parsed with multi-format `_parse_date` (datetime / date / `%Y-%m-%d` / `%d-%m-%Y` / `%d/%m/%Y`). Unparseable → log warning and skip.
 - **No sales-transaction exclusion.** Sales made TO a supplier (where the supplier is classified under `All Supplier Accounts` in FUSIL but is also an IRAVI customer) are legitimate and must appear in `supplier_ledger` so they show in Supplier Balances FY. The `Default Sales Account` skip and the `transaction_name.startswith('sales')` skip that were added 2026-06-27 have been reverted (2026-06-27).
+
+**Re-ingest required after 2026-07-22 CSV-conversion deploy:** see the `etl_customer_ledger`
+section above — same source file, same re-ingest + `POST /admin/cache/flush` procedure required
+for both Lambdas together.
+
+**Verified 2026-07-22:** a synthetic 28-column CSV fixture (built and deleted in this Lambda's own
+directory — `__pycache__` cleaned up afterward) confirmed `_parse` produces the expected
+`transaction_date/voucher_no/account_name/category/sub_category/amount` for a matching
+`AccountGroup="All Supplier Accounts"` row (`category='Cr'`, `sub_category='Purchase'` for a
+`ContraAccount="Default Purchase Account"` Purchase Voucher row), while a `"All Bank Accounts"`
+row, a `VoucherNo="Brought Forward"` row, and an `ACCOUNT` containing "IRAVI" were all correctly
+excluded. `python -m py_compile handler.py` clean. No downstream change (sign normalization,
+category/sub-category maps, milestoning upsert, read-only S3 behavior, no EventBridge emission) —
+only the parsing/extraction layer changed.
 
 **Sales-side transactions in supplier_ledger (revised 2026-06-27):**
 - MERCO ENERGY SOLUTIONS PRIVATE LIMITED (`All Supplier Accounts`) has Sales Invoice SIA2627-1 with three Debit legs: `Default Sales Account` 1,251,250.00, `CGST Output A/C` 112,612.50, `SGST Output A/C` 112,612.50 (total 1,476,475.00 Db).
@@ -2430,6 +2498,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 > the future **Cognito** authoriser, and **whatsapp_notifier phase 2** (pending WhatsApp Business approval).
 > The per-item boxes below are retained as a historical record of what was built and how it was deployed.
 
+- [ ] **RE-INGEST `Ledger All Accounts*.xlsx` after the CSV-content conversion (2026-07-22)** —
+  the file must be re-uploaded to S3 `raw/` as real CSV text (the old openpyxl reader would
+  fail/misread CSV bytes, and vice versa) so both `etl_customer_ledger` (S3-triggered) and
+  `etl_supplier_ledger` (EventBridge-triggered, reads the same file) can parse it with their new
+  `csv.DictReader` header-name-mapped readers. After re-ingest, run `POST /admin/cache/flush` to
+  clear stale `iravi:reports:customer_balances_fy:*`, `iravi:reports:supplier_balances_fy:*`, and
+  `iravi:ledger:*` entries from Redis.
 - [ ] **RE-INGEST `Supplier Accounts Export File*.xlsx` after the CSV-content conversion
   (2026-07-22)** — the file must be re-uploaded to S3 `raw/` as real CSV text (the old
   openpyxl reader would fail/misread CSV bytes, and vice versa) so the updated
