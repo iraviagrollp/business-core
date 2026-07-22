@@ -486,31 +486,41 @@ Previously the Sales Invoice Returns branch hardcoded `category = 'Cr'` regardle
 
 Source file pattern: `Customer Accounts Export File*.xlsx` (S3 prefix filter: `raw/Customer`)
 
-**Sheets read (both from the same workbook):**
-1. `General` sheet — **authoritative customer list** (col[0]=Name, col[2]=Code, e.g. `ANK001`). Every account in the General sheet produces a row in `customer_details` with its party code. Read by `_build_code_lookup(wb)` → `{UPPER_NAME -> code|None}`.
-2. `Delivery Address` sheet (the workbook's active sheet) — address/contact enrichment. Read by `_build_delivery_lookup(wb)` → `{UPPER_NAME -> {district, city, state, pin, mobile_no}}`. First occurrence of a name wins when duplicates exist. Column mapping (0-indexed, header row 1, data from row 2): `[0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo`.
+**Changed 2026-07-22:** the upstream feed switched from a real two-sheet xlsx workbook to
+**single-sheet CSV content** while keeping the same filename pattern
+(`Customer Accounts Export File*.xlsx`) — the filename gate (`_FILE_PREFIX` + `.xlsx` suffix
+check) is unchanged, but the downloaded bytes are now comma-delimited CSV text (header on
+line 1, data from line 2, one row per customer), never openpyxl-readable. The old
+`General` / `Delivery Address` two-sheet merge (`_build_code_lookup` + `_build_delivery_lookup`
++ name-set union) is **gone** — `openpyxl` is no longer imported. The file is read with
+`csv.DictReader` (`encoding='utf-8-sig'`, `newline=''`, same idiom as
+`etl_appendix_b_x11_purchase`), 27 columns (`MstId` appears twice — harmless, never read),
+mapped by header **name** (not position), via a standalone `_extract_customer_row(row: dict)
+-> dict | None` (skip a row if `Name` is blank). Extraction and parsing (`_parse`) are now a
+single pass — no lookup union.
 
-**Row source (changed 2026-06-27):**
-The master customer list is now the **union** of `General` and `Delivery Address` names
-(`all_names = set(code_lookup) | set(delivery_lookup)`). Previously the row source was
-only the `Delivery Address` sheet, which caused customers without a delivery address to be
-missing from `customer_details` entirely — and therefore to show no code in the Customer
-Balances FY report. Now:
-- **General-only customers** — inserted WITH their code; address fields all NULL.
-- **Delivery-Address-only customers** — inserted with address fields; `customer_code = NULL`.
-- **Customers in both sheets** — inserted WITH their code AND their address fields.
+**Header-name column mapping (2026-07-22):**
+`Name → customer_name, Code → customer_code, Address3 → district, City → city,
+StateName → state (NOT the plain State column, which is blank in this feed), PIN → pin,
+MobileNo → mobile_no`.
 
-No customer is lost relative to the previous behaviour; the union strictly adds rows.
+**Transformations (all preserved byte-for-byte from the pre-CSV two-sheet version, just fed
+from CSV dict rows instead of positional openpyxl tuples):**
+- `customer_name` — uppercased
+- `district` (from `Address3`), `city` (from `City`) — title-cased if non-blank, else `None`
+- `state` (from `StateName`) — mapped via `_STATE_MAP`: `37-Andhra Pradesh` → `AP`,
+  `36-Telangana` → `TG` (plus TN/OR entries flagged unverified); no match → `None`
+- `pin` — stripped string; blank → `None`
+- `mobile_no` — spaces stripped (CSV values are always strings — no more int/float source
+  branch); last 10 digits kept if > 10; blank → `None`
+- `customer_code` (from `Code`) — cast to string and stripped; blank → `None`
 
-**Column mapping — General sheet (0-indexed, header row 1, data from row 2):**
-`[0]=Name, [2]=Code (party code)`
+**Duplicate names:** first occurrence wins (matches the old two-sheet lookup behavior) — `_parse`
+keeps a `dict` keyed by uppercased `Name`, skipping any row whose name was already seen.
 
-**Transformations:**
-- `customer_name` — uppercased (used as join key between both sheets)
-- `district`, `city` — title-cased
-- `state` — mapped: `37-Andhra Pradesh` → `AP`, `36-Telangana` → `TG`
-- `mobile_no` — numeric values cast to string; string values stripped of whitespace; last 10 digits used if > 10
-- `customer_code` — cast to string and stripped; blank/None stored as NULL; looked up by uppercased name from the `General` sheet; if no match the customer row is still inserted with `customer_code = NULL`
+**Row source:** every row in the single CSV (one row per customer) produces one
+`customer_details` row — there is no longer a two-sheet union; blank cells (`''`, not `None`
+from `csv.DictReader`) are converted to `None` where the old code produced `NULL`.
 
 **Upsert strategy (changed 2026-07-12): uni-temporal milestoning (close-then-insert), replacing the previous `ON CONFLICT` dimension upsert.**
 Natural key = `customer_name`. Partial unique index `uix_customer_details_active ON customer_details (customer_name) WHERE out_z IS NULL` (IaC migration TBD, same migration that added `id BIGSERIAL`/`in_z`/`out_z` to `customer_details`) ensures at most one active row per customer at any time. For each parsed row:
@@ -533,7 +543,16 @@ Names passed are exactly the uppercased values produced by `_parse()`. Freshly-i
 
 **Migration dependency:** `customer_code VARCHAR(20)` column added by IaC migration `011`. The milestoning columns (`id BIGSERIAL`, `in_z`, `out_z`) and the partial unique index `uix_customer_details_active` are added by a separate IaC migration (2026-07-12) — must be applied before deploying this handler version.
 
-**Re-ingest required after 2026-06-27 deploy:** the `Customer Accounts Export File*.xlsx` must be re-uploaded to S3 `raw/` so the updated Lambda can insert General-only customers and backfill codes for existing rows. After re-ingest, run `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries from Redis.
+**Re-ingest required after 2026-07-22 CSV-conversion deploy:** the `Customer Accounts Export File*.xlsx` must be re-uploaded to S3 `raw/` — as real CSV content — so the updated single-sheet Lambda can parse it (the old openpyxl reader would fail/misread CSV bytes, and vice versa). After re-ingest, run `POST /admin/cache/flush` to clear stale `iravi:reports:customer_balances_fy:*` entries from Redis.
+
+**Verified 2026-07-22:** a synthetic single-sheet CSV fixture (real 27-column header row + one
+real sample data row, built and deleted in this Lambda's own directory — `__pycache__` cleaned
+up afterward) confirmed `_extract_customer_row`/`_parse` produce `customer_name="ADITYA AGRO
+CHEMICALS"`, `customer_code="PAL004"`, `district="Palnadu"`, `city="Gurazala"`, `state="AP"`,
+`pin="522415"`, `mobile_no="7013263948"` — matching the pre-CSV two-sheet transformations
+exactly. `python -m py_compile handler.py` clean. No downstream change (milestoning upsert,
+retire-absent, empty-file guard, S3 archive/delete) — only the parsing/extraction layer
+changed, mirroring the purchase-side handlers' 2026-07-21 CSV conversion.
 
 ---
 
@@ -543,18 +562,68 @@ Names passed are exactly the uppercased values produced by `_parse()`. Freshly-i
 
 Source file pattern: `Supplier Accounts Export File*.xlsx` (S3 prefix filter: `raw/Supplier`)
 
-**Workbook layout:** Sheet `General` (header row 1, data from row 2). A second empty `Sheet1` exists — it is ignored.
+**Changed 2026-07-22:** the upstream feed switched from a real two-sheet xlsx workbook
+(`General` + empty `Sheet1`) to **single-sheet CSV content** while keeping the same filename
+pattern (`Supplier Accounts Export File*.xlsx`) — the filename gate (`_FILE_PREFIX` + `.xlsx`
+suffix check) is unchanged, but the downloaded bytes are now comma-delimited CSV text (header
+on line 1, data from line 2, one row per supplier), never openpyxl-readable. `openpyxl` and the
+old `wb['General']` / `ws.iter_rows(min_row=2, values_only=True)` positional-index reader are
+removed from this handler. The file is read with `csv.DictReader`
+(`encoding='utf-8-sig'`, `newline=''`, same idiom as `etl_customer_accounts` /
+`etl_appendix_b_x11_purchase`), 46 columns, mapped by header **name** (not position), via a
+standalone `_extract_supplier_row(row: dict) -> dict | None` helper (returns `None` if `Name`
+is blank after the prefix strip below, or if the row is an IRAVI own-company row). Extraction
+and parsing (`_parse`) are a single pass, first-occurrence-wins on duplicate names (mirrors
+`etl_customer_accounts`'s `_parse`).
 
-**Column mapping (0-indexed):**
-`[0]=Name, [6]=GST, [7]=GSTValid, [12]=City, [13]=State`
+**Header-name column mapping (2026-07-22):**
+`Name → name (prefix-stripped — see below), GST → gst, GSTValid → gst_valid,
+City → city, StateName → state (NOT the plain State column, which holds a numeric master id)`.
+Several headers in the 46-column feed are DUPLICATED (`MstId` ×4, `EntityId`/`MenuItemId`/
+`TransId` ×2) — `csv.DictReader` collapses duplicates to last-wins, which is harmless since
+none of the 5 mapped fields are duplicated.
 
-**Transforms (applied in order per row):**
-- `name` = `str(row[0] or '').strip()` — blank row → SKIP.
-- IRAVI FILTER: `'iravi' in name.lower()` → SKIP (drops "IRAVI AGRO LIFE HYD" and "IRAVI AGRO LIFE LLP - GNT").
-- `gst` = `str(row[6] or '').strip() or None`
-- `gst_valid`: `row[7] is None` → `None` (NULL); else `bool(int(row[7]))` — 1 → `True`, 0 → `False`. None and 0 are distinct: None = no GST registered; False = GST present but invalid.
-- `city` = `str(row[12] or '').strip().title() or None` (source casing inconsistent; normalised to title case).
-- `state`: raw = `str(row[13] or '').strip()`; if `'-'` in raw → take the part after the first `'-'` (e.g. `"36-Telangana"` → `"Telangana"`); else keep raw; blank → `None`.
+**New transform — numeric name-prefix strip (2026-07-22, user-approved):** some names carry a
+stray leading `"<digits> - "` prefix, e.g. `"29 - CLICKTECH RETAIL PRIVATE LIMITED"` →
+`"CLICKTECH RETAIL PRIVATE LIMITED"`. `_NAME_PREFIX_RE = re.compile(r'^\s*\d+\s*-\s*')` strips
+that pattern from `Name` BEFORE it's used as the natural key (`_NAME_PREFIX_RE.sub('',
+name_raw).strip()`); names without the pattern (e.g. `"AGROKING PESTICIDES PVT. LTD."`) are
+left unchanged. Blank after stripping → skip row. The `'iravi' in name.lower()` self-filter is
+applied AFTER the prefix strip (unchanged filter semantics, just re-ordered to run on the
+cleaned name).
+
+**Transforms (applied in order per row, inside `_extract_supplier_row`):**
+- `name` — leading numeric prefix stripped (above), then `.strip()`'d; blank → SKIP.
+- IRAVI FILTER: `'iravi' in name.lower()` (post-strip) → SKIP (drops "IRAVI AGRO LIFE HYD" and
+  "IRAVI AGRO LIFE LLP - GNT").
+- `gst` — stripped string from `GST`; blank or the literal string `"NULL"` (case-insensitive)
+  → `None`.
+- `gst_valid` — tri-state from `GSTValid`: blank or literal `"NULL"` → `None`; else
+  `bool(int(...))` — `"1"`/`1` → `True`, `"0"`/`0` → `False`. `None` and `False` are distinct:
+  `None` = no GST registered; `False` = GST present but invalid. (CSV values are strings, cast
+  via `int()` after the blank/NULL check — unlike the old openpyxl reader, which received the
+  cell as `None` or a numeric type directly.)
+- `city` — stripped string from `City`, title-cased if non-blank else `None` (source casing
+  inconsistent; normalised to title case — unchanged transform, now CSV-sourced).
+- `state` — from `StateName` (NOT the plain `State` column, which holds a numeric master id):
+  blank or literal `"NULL"` → `None`; else if `'-'` in the value → take the part after the
+  FIRST `'-'` (e.g. `"29-Karnataka"` → `"Karnataka"`); else keep the value as-is (e.g. bare
+  `"Karnataka"` stays `"Karnataka"`). Same split logic as before the CSV conversion, now with
+  an added `"NULL"`-string guard (blank cells from `csv.DictReader` are `''`, never `None`).
+
+**Verified 2026-07-22:** a synthetic single-sheet CSV fixture (real 46-column header row +
+two data rows, built and deleted in this Lambda's own directory — `__pycache__` cleaned up
+afterward) confirmed `_extract_supplier_row`/`_parse` produce, for
+`Name="29 - CLICKTECH RETAIL PRIVATE LIMITED", City="Bengaluru", StateName="29-Karnataka",
+GST="29AAJCC9783E1Z3", GSTValid="1"`: `name="CLICKTECH RETAIL PRIVATE LIMITED"` (prefix
+stripped), `gst="29AAJCC9783E1Z3"`, `gst_valid=True`, `city="Bengaluru"`,
+`state="Karnataka"`; and for `Name="BB POLYMERS", City="Somewhere", StateName="NULL",
+GST="", GSTValid="0"`: `name="BB POLYMERS"` (no prefix to strip), `gst=None`,
+`gst_valid=False`, `city="Somewhere"`, `state=None` (`"NULL"` treated as `None`).
+`python -m py_compile handler.py` clean. No downstream change (milestoning upsert,
+retire-absent, empty-file guard, S3 archive/delete, no EventBridge emission) — only the
+parsing/extraction layer changed, mirroring `etl_customer_accounts`'s 2026-07-22 CSV
+conversion.
 
 **Milestoning upsert (uni-temporal, close-then-insert):**
 Natural key = `name`. Partial unique index on `(name) WHERE out_z IS NULL`.
@@ -2361,6 +2430,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 > the future **Cognito** authoriser, and **whatsapp_notifier phase 2** (pending WhatsApp Business approval).
 > The per-item boxes below are retained as a historical record of what was built and how it was deployed.
 
+- [ ] **RE-INGEST `Supplier Accounts Export File*.xlsx` after the CSV-content conversion
+  (2026-07-22)** — the file must be re-uploaded to S3 `raw/` as real CSV text (the old
+  openpyxl reader would fail/misread CSV bytes, and vice versa) so the updated
+  single-sheet `csv.DictReader` handler parses it, applies the new numeric name-prefix
+  strip, and the retire-absent step correctly closes suppliers no longer present. After
+  re-ingest, run `POST /admin/cache/flush` to clear any stale
+  `iravi:reports:supplier_balances_fy:*` entries from Redis.
 - [ ] **IaC: `customer_details` milestoning migration (2026-07-12)** — add `in_z TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `out_z TIMESTAMPTZ`, `id BIGSERIAL PK` (replacing whatever the current PK is), and partial unique index `uix_customer_details_active ON customer_details (customer_name) WHERE out_z IS NULL` to `customer_details`. Must be applied via psql/SSM BEFORE re-deploying `etl_customer_accounts` (its `_upsert` now writes `in_z`/`out_z`-aware milestoning rows and no longer uses `ON CONFLICT`) and BEFORE the API's `/customers/names` / `/customers/details` `WHERE out_z IS NULL` filters will return anything (they'll error/return nothing on the old schema). `supplier_accounts` already has this shape (migration 016) — no equivalent migration needed there.
 - [ ] **RE-INGEST after `customer_details` milestoning migration lands** — re-upload `Customer Accounts Export File*.xlsx` and `Supplier Accounts Export File*.xlsx` to S3 `raw/` so the retire-absent logic actually closes rows for customers/suppliers no longer in the export; then `POST /admin/cache/flush` to clear `iravi:customers:*` and `iravi:reports:supplier_balances_fy:*` Redis entries.
 - [ ] **IaC: API Gateway route GET /reports/monthly-sales** — add `GET /reports/monthly-sales` route + CORS allow-method in `lambda_api.tf`; add `app_screens` seed migration row for `reports.monthly_sales` (screen_key, label, sort_order). No new Lambda, layer, or DB migration needed — existing `sales` and `customer_details` tables are used.
