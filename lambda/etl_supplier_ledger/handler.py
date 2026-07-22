@@ -2,9 +2,16 @@
 etl_supplier_ledger — EventBridge-triggered Lambda.
 
 Reads the same "Ledger All Accounts*.xlsx" export used by etl_customer_ledger
-but keeps ONLY rows where col[10] (Account Group) == 'All Supplier Accounts'.
+but keeps ONLY rows where the AccountGroup column == 'All Supplier Accounts'.
 Applies purchase-side AND sales-side category/sub-category logic and writes to
 the supplier_ledger table using uni-temporal milestoning.
+
+The upstream feed is now single-sheet CSV *content* under the same .xlsx
+filename (header on line 1, data from line 2 — no leading metadata rows).
+Read with csv.DictReader, header row mapped by NAME (not position):
+  Date -> transaction_date, VoucherNo -> voucher_no, TransactionName -> transaction_name,
+  ACCOUNT -> account_name, ContraAccount -> contra_account, Debit -> debit, Credit -> credit,
+  AccountGroup -> account_group.
 
 Sales made TO a supplier (i.e. the supplier is also a customer of IRAVI) are
 legitimate and must appear in supplier_ledger so they show in Supplier Balances
@@ -32,6 +39,7 @@ Environment variables:
   PROCESSED_PREFIX – S3 prefix for processed/   (default: 'processed/')
 """
 
+import csv
 import json
 import logging
 import os
@@ -41,7 +49,6 @@ from urllib.parse import unquote  # EventBridge encodes spaces as %20, not '+'
 
 import boto3
 import botocore.exceptions
-import openpyxl
 import psycopg2
 
 logger = logging.getLogger()
@@ -184,93 +191,111 @@ def _download_with_fallback(bucket: str, primary_key: str, fallback_key: str, de
 # Parse
 # ---------------------------------------------------------------------------
 
-def _parse(src_path: str) -> list[dict]:
-    """Parse the active sheet of the Ledger All Accounts workbook.
+def _to_amount(v) -> float:
+    """Parse a Debit/Credit CSV cell (always a string, possibly blank) to float.
 
-    Column layout (0-indexed), data from min_row=6:
-      [0] transaction_date   [1] voucher_no      [2] transaction_name
-      [4] account_name       [5] contra_account  [6] debit   [7] credit
-      [10] account_group
+    Blank / None / whitespace-only -> 0.0 (CSV has no empty-cell sentinel other
+    than an empty string, unlike the old openpyxl reader which returned None).
+    """
+    if v is None:
+        return 0.0
+    s = str(v).strip()
+    if s == '':
+        return 0.0
+    return float(s)
+
+
+def _parse(src_path: str) -> list[dict]:
+    """Parse the single-sheet CSV export of the Ledger All Accounts feed.
+
+    Header on line 1, data from line 2 — no leading metadata rows. 28 columns;
+    only the following are consumed, mapped by header NAME (not position):
+      Date -> transaction_date        VoucherNo -> voucher_no
+      TransactionName -> transaction_name
+      ACCOUNT -> account_name         ContraAccount -> contra_account
+      Debit -> debit                  Credit -> credit
+      AccountGroup -> account_group
 
     Only rows where account_group == 'All Supplier Accounts' (case-insensitive)
     are kept.  IRAVI own-company rows within that group are explicitly dropped.
     No database read is required for filtering — the ledger file itself carries
-    the account group in col[10].
+    the account group in the AccountGroup column.
     """
-    wb = openpyxl.load_workbook(src_path, data_only=True)
-    ws = wb.active  # Sheet is named "Invoice" in the real export
-
     rows = []
-    for row in ws.iter_rows(min_row=6, values_only=True):
-        transaction_date_raw = row[0]
-        voucher_no           = str(row[1] or '').strip()
-        transaction_name     = str(row[2] or '').strip()
-        account_name         = str(row[4] or '').strip()
-        contra_account       = str(row[5] or '').strip()
-        debit                = float(row[6] or 0)
-        credit               = float(row[7] or 0)
-        account_group        = str(row[10] or '').strip()
 
-        # --- Sign normalization (identical to etl_customer_ledger) ---
-        # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on
-        # one side.  A negative debit is economically a credit of its magnitude.
-        if debit < 0:
-            credit += -debit
-            debit = 0.0
-        if credit < 0:
-            debit += -credit
-            credit = 0.0
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            transaction_date_raw = row.get('Date')
+            voucher_no           = str(row.get('VoucherNo') or '').strip()
+            transaction_name     = str(row.get('TransactionName') or '').strip()
+            account_name         = str(row.get('ACCOUNT') or '').strip()
+            contra_account       = str(row.get('ContraAccount') or '').strip()
+            debit                = _to_amount(row.get('Debit'))
+            credit               = _to_amount(row.get('Credit'))
+            account_group        = str(row.get('AccountGroup') or '').strip()
 
-        # --- Skip rules ---
-        if transaction_date_raw is None:
-            continue
-        if not account_name:
-            continue
-        if voucher_no == 'Brought Forward':
-            continue
-        if debit == 0 and credit == 0:
-            continue
-        # Account Group filter: keep only supplier rows identified by the
-        # ledger file itself (col[10]).  Case-insensitive comparison for safety.
-        if account_group.lower() != 'all supplier accounts':
-            continue
-        # Explicit IRAVI exclusion: IRAVI own-company accounts appear under
-        # 'All Supplier Accounts' in the ledger but must not land in
-        # supplier_ledger.
-        if 'iravi' in account_name.lower():
-            continue
+            # --- Sign normalization (identical to etl_customer_ledger) ---
+            # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on
+            # one side.  A negative debit is economically a credit of its magnitude.
+            if debit < 0:
+                credit += -debit
+                debit = 0.0
+            if credit < 0:
+                debit += -credit
+                credit = 0.0
 
-        transaction_date = _parse_date(transaction_date_raw)
-        if transaction_date is None:
-            logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
-            continue
+            # --- Skip rules ---
+            if transaction_date_raw is None or not str(transaction_date_raw).strip():
+                continue
+            if not account_name:
+                continue
+            if voucher_no == 'Brought Forward':
+                continue
+            if debit == 0 and credit == 0:
+                continue
+            # Account Group filter: keep only supplier rows identified by the
+            # ledger file itself (AccountGroup column).  Case-insensitive comparison
+            # for safety.
+            if account_group.lower() != 'all supplier accounts':
+                continue
+            # Explicit IRAVI exclusion: IRAVI own-company accounts appear under
+            # 'All Supplier Accounts' in the ledger but must not land in
+            # supplier_ledger.
+            if 'iravi' in account_name.lower():
+                continue
 
-        # --- Category (purchase-side and sales-side semantics) ---
-        # Purchase Vouchers credit the supplier (liability increases): category = 'Cr'
-        # Bank/Cash Payments debit the supplier (liability decreases):  category = 'Db'
-        # Sales Invoices TO the supplier debit the supplier (receivable): category = 'Db'
-        category = 'Cr' if credit > 0 else 'Db'
-        amount   = credit if credit > 0 else debit
+            transaction_date = _parse_date(transaction_date_raw)
+            if transaction_date is None:
+                logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
+                continue
 
-        # --- Sub-category resolution order ---
-        # 1. Contra account mapping (purchase-side + sales-side, see _CONTRA_SUBCATEGORY)
-        # 2. Transaction name mapping (Bank Payment / Cash Payment / etc.)
-        # 3. Fallback: transaction_name then contra_account
-        sub_category = (
-            _CONTRA_SUBCATEGORY.get(contra_account)
-            or _TXN_SUBCATEGORY.get(transaction_name)
-            or transaction_name
-            or contra_account
-        )
+            # --- Category (purchase-side and sales-side semantics) ---
+            # Purchase Vouchers credit the supplier (liability increases): category = 'Cr'
+            # Bank/Cash Payments debit the supplier (liability decreases):  category = 'Db'
+            # Sales Invoices TO the supplier debit the supplier (receivable): category = 'Db'
+            category = 'Cr' if credit > 0 else 'Db'
+            amount   = credit if credit > 0 else debit
 
-        rows.append({
-            'transaction_date': transaction_date,
-            'voucher_no':       voucher_no,
-            'account_name':     account_name,
-            'category':         category,
-            'sub_category':     sub_category,
-            'amount':           amount,
-        })
+            # --- Sub-category resolution order ---
+            # 1. Contra account mapping (purchase-side + sales-side, see _CONTRA_SUBCATEGORY)
+            # 2. Transaction name mapping (Bank Payment / Cash Payment / etc.)
+            # 3. Fallback: transaction_name then contra_account
+            sub_category = (
+                _CONTRA_SUBCATEGORY.get(contra_account)
+                or _TXN_SUBCATEGORY.get(transaction_name)
+                or transaction_name
+                or contra_account
+            )
+
+            rows.append({
+                'transaction_date': transaction_date,
+                'voucher_no':       voucher_no,
+                'account_name':     account_name,
+                'category':         category,
+                'sub_category':     sub_category,
+                'amount':           amount,
+            })
 
     return rows
 

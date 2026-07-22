@@ -47,7 +47,7 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 |---|---|---|---|
 | `etl_stocks` | S3 `raw/Current*.xlsx` | Stock balances → `snapshot_stock` (unitemporal) → emit `ETLStocksSuccess` | Complete |
 | `etl_sales` | S3 `raw/RGF Sales Book*.xlsx` | Sales → `fact_sales` + `dim_customers` | Stub |
-| `etl_customer_ledger` | S3 `raw/Ledger*.xlsx` | Ledger entries → `customer_ledger` (unitemporal) → emit `ETLCustomerLedgerSuccess`. Sales Invoice Returns branch now classifies category by column (`Cr if credit > 0 else Db`) so return roundoffs that land on the debit side after sign-normalization are stored as `Db` (not forced to `Cr`). | Complete |
+| `etl_customer_ledger` | S3 `raw/Ledger*.xlsx` | Ledger entries → `customer_ledger` (unitemporal) → emit `ETLCustomerLedgerSuccess`. Sales Invoice Returns branch classifies category by column (`Cr if credit > 0 else Db`) so return roundoffs that land on the debit side after sign-normalization are stored as `Db` (not forced to `Cr`). Source is now single-sheet CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `etl_customer_accounts` | S3 `raw/Customer*.xlsx` | Customer accounts → `customer_details` (unitemporal). Source is now single-sheet CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `etl_appendix_b_x11` | S3 `raw/Barcodes*.xlsx` | Barcodes Masters → `appendix_b_x11_stock` (unitemporal) | Complete |
 | `etl_appendix_b_x11_purchase` | S3 `raw/AppendixPurchase*.xlsx` | → `appendix_b_x11_stock_ledger` (In) + `purchases` (N). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-21) | Complete |
@@ -55,7 +55,7 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 | `etl_appendix_b_x11_sale` | S3 `raw/AppendixSale*.xlsx` | → `stock_ledger` (Out) + `sales` (N). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `etl_appendix_b_x11_sale_return` | S3 `raw/AppendixRetSales*.xlsx` | → `stock_ledger` (In) + `sales` (Y). Source is now CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `etl_supplier_accounts` | S3 `raw/Supplier*.xlsx` | Supplier accounts → `supplier_accounts` (unitemporal). Source is now single-sheet CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping incl. a numeric-name-prefix strip and blank/"NULL"-aware GST/GSTValid/StateName handling (2026-07-22) | Complete |
-| `etl_supplier_ledger` | EventBridge `raw/Ledger*.xlsx` (read-only S3) | Ledger supplier rows → `supplier_ledger` (unitemporal) | Complete |
+| `etl_supplier_ledger` | EventBridge `raw/Ledger*.xlsx` (read-only S3) | Ledger supplier rows → `supplier_ledger` (unitemporal). Source is now single-sheet CSV content (comma-delimited, header row 1, `.xlsx` filename retained), header-name-based mapping (2026-07-22) | Complete |
 | `whatsapp_notifier` | S3 `notifications/pending/*` | Move to `processed/`; send WhatsApp (phase 2) | Phase 1 |
 | `redis_updater` | EventBridge (ETL success events) | Pull RDS → write Redis cache | Stocks + ledger done |
 | `alerts_evaluator` | EventBridge `rate(15 min)` | Evaluate due alerts → send SES email (Monthly Sales / FY reports as PDF) | Complete |
@@ -73,11 +73,11 @@ Each Lambda directory contains `handler.py` + `requirements.txt` (plus `process.
 |---|---|---|
 | etl_stocks | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_sales | Python 3.12 | psycopg2-binary, openpyxl, boto3 |
-| etl_customer_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_customer_ledger | Python 3.12 | openpyxl (unused since 2026-07-22 CSV conversion; kept in requirements.txt per repo convention), psycopg2-binary, boto3 |
 | etl_customer_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_appendix_b_x11 (×5) | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
-| etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_supplier_ledger | Python 3.12 | openpyxl (unused since 2026-07-22 CSV conversion; kept in requirements.txt per repo convention), psycopg2-binary, boto3 |
 | whatsapp_notifier | Python 3.12 | boto3 (+ requests in phase 2) |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | alerts_evaluator | Python 3.12 | psycopg2-binary, reportlab (boto3/SES from runtime) |

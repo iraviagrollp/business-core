@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -6,7 +7,6 @@ from datetime import date, datetime, timezone
 from urllib.parse import unquote_plus
 
 import boto3
-import openpyxl
 import psycopg2
 
 logger = logging.getLogger()
@@ -103,84 +103,101 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Emitted ETLCustomerLedgerSuccess rows=%d', len(rows))
 
 
-def _parse(src_path: str) -> list[dict]:
-    """Parse the active sheet of the Ledger All Accounts workbook.
+def _to_amount(v) -> float:
+    """Parse a Debit/Credit CSV cell (always a string, possibly blank) to float.
 
-    Column layout (0-indexed), header row 5, data from min_row=6:
-      [0] transaction_date   [1] voucher_no      [2] transaction_name
-      [4] account_name       [5] contra_account  [6] debit   [7] credit
-      [10] account_group
+    Blank / None / whitespace-only -> 0.0 (CSV has no empty-cell sentinel other
+    than an empty string, unlike the old openpyxl reader which returned None).
+    """
+    if v is None:
+        return 0.0
+    s = str(v).strip()
+    if s == '':
+        return 0.0
+    return float(s)
+
+
+def _parse(src_path: str) -> list[dict]:
+    """Parse the single-sheet CSV export of the Ledger All Accounts feed.
+
+    Header on line 1, data from line 2 — no leading metadata rows. 28 columns;
+    only the following are consumed, mapped by header NAME (not position):
+      Date -> transaction_date        VoucherNo -> voucher_no
+      TransactionName -> transaction_name
+      ACCOUNT -> account_name         ContraAccount -> contra_account
+      Debit -> debit                  Credit -> credit
+      AccountGroup -> account_group
 
     Only rows where account_group == 'All Customer Accounts' (case-insensitive)
     are kept.  IRAVI own-company rows within that group are explicitly dropped.
     No database read is required for filtering — the ledger file itself carries
-    the account group in col[10].
+    the account group in the AccountGroup column.
     """
-    wb = openpyxl.load_workbook(src_path, data_only=True)
-    ws = wb.active
-
     rows = []
-    for row in ws.iter_rows(min_row=6, values_only=True):
-        transaction_date_raw = row[0]
-        voucher_no = str(row[1] or '').strip()
-        transaction_name = str(row[2] or '').strip()
-        account_name = str(row[4] or '').strip()
-        contra_account = str(row[5] or '').strip()
-        debit = float(row[6] or 0)
-        credit = float(row[7] or 0)
-        account_group = str(row[10] or '').strip()
 
-        # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on one side.
-        # A negative debit is economically a credit of its magnitude, and vice-versa.
-        if debit < 0:
-            credit += -debit
-            debit = 0.0
-        if credit < 0:
-            debit += -credit
-            credit = 0.0
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            transaction_date_raw = row.get('Date')
+            voucher_no = str(row.get('VoucherNo') or '').strip()
+            transaction_name = str(row.get('TransactionName') or '').strip()
+            account_name = str(row.get('ACCOUNT') or '').strip()
+            contra_account = str(row.get('ContraAccount') or '').strip()
+            debit = _to_amount(row.get('Debit'))
+            credit = _to_amount(row.get('Credit'))
+            account_group = str(row.get('AccountGroup') or '').strip()
 
-        if transaction_date_raw is None:
-            continue
-        if not account_name:
-            continue
-        if voucher_no == 'Brought Forward':
-            continue
-        if debit == 0 and credit == 0:
-            continue
-        if contra_account == 'Default Purchase Account':
-            continue
-        # Account Group filter: keep only customer rows identified by col[10].
-        # Case-insensitive for safety; distinct groups include "All Customer Accounts",
-        # "All Supplier Accounts", "All Sales Accounts", "All Bank Accounts", plus blank
-        # for GL/GST contra-leg rows.
-        if account_group.lower() != 'all customer accounts':
-            continue
-        # Explicit IRAVI exclusion: IRAVI own-company accounts must not land in
-        # customer_ledger (previously provided implicitly by the customer_details join).
-        if 'iravi' in account_name.lower():
-            continue
+            # FUSIL writes some adjustments (e.g. Roundoff) as a negative value on one side.
+            # A negative debit is economically a credit of its magnitude, and vice-versa.
+            if debit < 0:
+                credit += -debit
+                debit = 0.0
+            if credit < 0:
+                debit += -credit
+                credit = 0.0
 
-        transaction_date = _parse_date(transaction_date_raw)
-        if transaction_date is None:
-            logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
-            continue
+            if transaction_date_raw is None or not str(transaction_date_raw).strip():
+                continue
+            if not account_name:
+                continue
+            if voucher_no == 'Brought Forward':
+                continue
+            if debit == 0 and credit == 0:
+                continue
+            if contra_account == 'Default Purchase Account':
+                continue
+            # Account Group filter: keep only customer rows identified by the
+            # AccountGroup column. Case-insensitive for safety; distinct groups
+            # include "All Customer Accounts", "All Supplier Accounts", "All Sales
+            # Accounts", "All Bank Accounts", plus blank for GL/GST contra-leg rows.
+            if account_group.lower() != 'all customer accounts':
+                continue
+            # Explicit IRAVI exclusion: IRAVI own-company accounts must not land in
+            # customer_ledger (previously provided implicitly by the customer_details join).
+            if 'iravi' in account_name.lower():
+                continue
 
-        if transaction_name == 'Sales Invoice Returns':
-            category = 'Cr' if credit > 0 else 'Db'
-            sub_category = _SALES_RETURN_SUBCATEGORY.get(contra_account, contra_account)
-        else:
-            category = 'Cr' if credit > 0 else 'Db'
-            sub_category = _map_sub_category(transaction_name, contra_account)
-        amount = credit if credit > 0 else debit
+            transaction_date = _parse_date(transaction_date_raw)
+            if transaction_date is None:
+                logger.warning('Unparseable date %r — skipping row', transaction_date_raw)
+                continue
 
-        rows.append({
-            'transaction_date': transaction_date,
-            'voucher_no': voucher_no,
-            'account_name': account_name,
-            'category': category,
-            'sub_category': sub_category,
-            'amount': amount,
-        })
+            if transaction_name == 'Sales Invoice Returns':
+                category = 'Cr' if credit > 0 else 'Db'
+                sub_category = _SALES_RETURN_SUBCATEGORY.get(contra_account, contra_account)
+            else:
+                category = 'Cr' if credit > 0 else 'Db'
+                sub_category = _map_sub_category(transaction_name, contra_account)
+            amount = credit if credit > 0 else debit
+
+            rows.append({
+                'transaction_date': transaction_date,
+                'voucher_no': voucher_no,
+                'account_name': account_name,
+                'category': category,
+                'sub_category': sub_category,
+                'amount': amount,
+            })
 
     return rows
 
