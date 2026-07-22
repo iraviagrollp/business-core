@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -5,7 +6,6 @@ import tempfile
 from urllib.parse import unquote_plus
 
 import boto3
-import openpyxl
 import psycopg2
 
 logger = logging.getLogger()
@@ -19,9 +19,19 @@ _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'Customer Accounts Export File'
 
-# Column indices (0-based), row 1 is header, data starts row 2
-# Delivery Address sheet: [0]=Name, [3]=DLAddress3, [4]=DLCity, [5]=DLState, [7]=DLPIN, [9]=DLMobileNo
-# General sheet: [0]=Name, [2]=Code (party code, e.g. "ANK001")
+# The upstream export is now comma-delimited CSV *content* (still shipped under a
+# `.xlsx` filename/extension — do NOT try to read it with openpyxl). Header is line 1,
+# data from line 2, one row per customer (single sheet — the old General / Delivery
+# Address two-sheet merge is gone). 27 columns; `MstId` appears twice (harmless — never
+# read). Columns are mapped by header NAME (not position):
+#   Name       -> customer_name (uppercased)
+#   Code       -> customer_code
+#   Address3   -> district (title-cased)
+#   City       -> city (title-cased)
+#   StateName  -> state (mapped via _STATE_MAP; NOTE: not the plain `State` column,
+#                 which is blank in this feed)
+#   PIN        -> pin
+#   MobileNo   -> mobile_no (last 10 digits if > 10)
 
 _STATE_MAP = {
     '37-Andhra Pradesh': 'AP',
@@ -84,121 +94,70 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Archived source to s3://%s/%s', bucket, archive_key)
 
 
-def _build_code_lookup(wb) -> dict:
-    """Return uppercase-name -> party code dict from the 'General' sheet.
+def _extract_customer_row(row: dict) -> dict | None:
+    """Map one CSV DictReader row (by header name) to a customer_details row dict.
 
-    General sheet layout (0-indexed, header row 1, data from row 2):
-      [0]=Name, [2]=Code (party code, e.g. "ANK001")
+    Returns None if `Name` is blank (row is skipped).
 
-    Names are uppercased to match the normalization applied to customer_name
-    in _parse(). Code is cast to str and stripped; blank/None -> None (NULL).
+    Transformations mirror the pre-CSV two-sheet behavior exactly:
+      - customer_name: uppercased
+      - customer_code: stripped string; blank -> None
+      - district (from Address3): title-cased; blank -> None
+      - city: title-cased; blank -> None
+      - state (from StateName, NOT the blank `State` column): mapped via _STATE_MAP;
+        no match -> None
+      - pin: stripped string; blank -> None
+      - mobile_no: strip spaces; last 10 digits if > 10; blank -> None
     """
-    ws = wb['General']
-    lookup = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        name = str(row[0] or '').strip().upper()
-        if not name:
-            continue
-        code_raw = row[2]
-        if code_raw is None:
-            code = None
-        else:
-            code = str(code_raw).strip() or None
-        lookup[name] = code
-    logger.info('Built code lookup: %d entries (%d with a code)',
-                len(lookup), sum(1 for c in lookup.values() if c is not None))
-    return lookup
+    name = str(row.get('Name') or '').strip()
+    if not name:
+        return None
 
+    code_raw = str(row.get('Code') or '').strip()
+    code = code_raw or None
 
-def _build_delivery_lookup(wb) -> dict:
-    """Return uppercase-name -> address-fields dict from the 'Delivery Address' sheet.
+    district_raw = str(row.get('Address3') or '').strip()
+    city_raw = str(row.get('City') or '').strip()
+    state_raw = str(row.get('StateName') or '').strip()
+    pin_raw = str(row.get('PIN') or '').strip()
 
-    Delivery Address sheet layout (0-indexed, header row 1, data from row 2):
-      [0]=Name, [3]=DLAddress3 (district), [4]=DLCity, [5]=DLState,
-      [7]=DLPIN, [9]=DLMobileNo
+    mobile_raw = str(row.get('MobileNo') or '').replace(' ', '').strip()
+    mobile_no = mobile_raw or None
+    if mobile_no and len(mobile_no) > 10:
+        mobile_no = mobile_no[-10:]
 
-    Names are uppercased to match the normalization applied elsewhere.
-    All address transforms are identical to those previously applied in _parse():
-      - district/city: title-cased, blank -> None
-      - state: mapped via _STATE_MAP, missing key -> None
-      - pin: str-stripped, blank -> None
-      - mobile_no: int/float -> str(int()), str -> strip spaces; last 10 digits if > 10
-
-    First occurrence of a name wins when the same name appears more than once.
-    """
-    ws = wb.active
-    lookup = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        name = str(row[0] or '').strip()
-        if not name:
-            continue
-        upper_name = name.upper()
-        if upper_name in lookup:
-            # first occurrence wins
-            continue
-
-        district = str(row[3] or '').strip()
-        city = str(row[4] or '').strip()
-        state_raw = str(row[5] or '').strip()
-        pin = str(row[7]).strip() if row[7] is not None else None
-        mobile_raw = row[9]
-        if mobile_raw is None:
-            mobile_no = None
-        elif isinstance(mobile_raw, (int, float)):
-            mobile_no = str(int(mobile_raw))
-        else:
-            mobile_no = str(mobile_raw).replace(' ', '') or None
-        if mobile_no and len(mobile_no) > 10:
-            mobile_no = mobile_no[-10:]
-
-        lookup[upper_name] = {
-            'district': district.title() if district else None,
-            'city': city.title() if city else None,
-            'state': _STATE_MAP.get(state_raw),
-            'pin': pin or None,
-            'mobile_no': mobile_no,
-        }
-
-    logger.info('Built delivery lookup: %d entries', len(lookup))
-    return lookup
+    return {
+        'customer_name': name.upper(),
+        'district': district_raw.title() if district_raw else None,
+        'city': city_raw.title() if city_raw else None,
+        'state': _STATE_MAP.get(state_raw),
+        'pin': pin_raw or None,
+        'mobile_no': mobile_no,
+        'customer_code': code,
+    }
 
 
 def _parse(src_path: str) -> list[dict]:
-    wb = openpyxl.load_workbook(src_path, data_only=True)
+    """Parse the single-sheet CSV into one customer_details row dict per customer.
 
-    # Build party-code lookup from the General sheet — this is the authoritative
-    # customer list: every account in General gets a row WITH its code.
-    code_lookup = _build_code_lookup(wb)
+    First occurrence of a name wins on duplicate names (matches the old behavior of
+    both `_build_code_lookup` and `_build_delivery_lookup`).
+    """
+    rows_by_name: dict[str, dict] = {}
 
-    # Build address lookup from the Delivery Address sheet (wb.active).
-    # Used for enrichment only; customers absent from here still get inserted.
-    delivery_lookup = _build_delivery_lookup(wb)
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed = _extract_customer_row(row)
+            if parsed is None:
+                continue
+            name = parsed['customer_name']
+            if name in rows_by_name:
+                continue
+            rows_by_name[name] = parsed
 
-    logger.info(
-        'Customer counts — General: %d, Delivery Address: %d',
-        len(code_lookup), len(delivery_lookup),
-    )
-
-    # Union of both sets: no customer is lost regardless of which sheet they
-    # appear on.  General-only customers get address fields = None.
-    # Delivery-only customers get customer_code = None.
-    all_names = set(code_lookup) | set(delivery_lookup)
-    logger.info('Total unique customers after union: %d', len(all_names))
-
-    rows = []
-    for name in sorted(all_names):
-        addr = delivery_lookup.get(name, {})
-        rows.append({
-            'customer_name': name,
-            'district': addr.get('district'),
-            'city': addr.get('city'),
-            'state': addr.get('state'),
-            'pin': addr.get('pin'),
-            'mobile_no': addr.get('mobile_no'),
-            'customer_code': code_lookup.get(name),
-        })
-
-    return rows
+    logger.info('Total unique customers parsed: %d', len(rows_by_name))
+    return [rows_by_name[name] for name in sorted(rows_by_name)]
 
 
 def _upsert(conn, rows: list[dict]):

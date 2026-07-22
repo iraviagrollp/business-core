@@ -1,11 +1,12 @@
+import csv
 import json
 import logging
 import os
+import re
 import tempfile
 from urllib.parse import unquote_plus
 
 import boto3
-import openpyxl
 import psycopg2
 
 logger = logging.getLogger()
@@ -19,8 +20,24 @@ _RAW_PREFIX = os.environ.get('RAW_PREFIX', 'raw/')
 _PROCESSED_PREFIX = os.environ.get('PROCESSED_PREFIX', 'processed/')
 _FILE_PREFIX = 'Supplier Accounts Export File'
 
-# Column indices (0-based), General sheet, row 1 is header, data starts row 2
-# [0]=Name, [6]=GST, [7]=GSTValid, [12]=City, [13]=State
+# The upstream export is now comma-delimited CSV *content* (still shipped under a
+# `.xlsx` filename/extension — do NOT try to read it with openpyxl). Header is line 1,
+# data from line 2, one row per supplier (single sheet — the old General / Sheet1
+# two-sheet workbook is gone; Sheet1 was always empty). 46 columns; several headers are
+# DUPLICATED (MstId x4, EntityId/MenuItemId/TransId x2 — csv.DictReader collapses
+# duplicates to last-wins; harmless because none of the 5 fields we map are duplicated).
+# Columns are mapped by header NAME (not position):
+#   Name      -> name (leading "<digits> - " prefix stripped first, e.g.
+#                "29 - CLICKTECH RETAIL PRIVATE LIMITED" -> "CLICKTECH RETAIL PRIVATE
+#                LIMITED"; names without that pattern are left unchanged)
+#   GST       -> gst (blank/"NULL" -> None)
+#   GSTValid  -> gst_valid (tri-state: blank/"NULL" -> None; else bool(int(...)))
+#   City      -> city (title-cased if non-blank, else None)
+#   StateName -> state (NOT the plain `State` column, which holds a numeric master id;
+#                "29-Karnataka" -> "Karnataka" via split on the FIRST '-'; blank/"NULL"
+#                -> None)
+
+_NAME_PREFIX_RE = re.compile(r'^\s*\d+\s*-\s*')
 
 
 def _get_db_conn():
@@ -72,59 +89,90 @@ def _process(bucket: str, key: str, filename: str):
     logger.info('Archived source to s3://%s/%s', bucket, archive_key)
 
 
+def _extract_supplier_row(row: dict) -> dict | None:
+    """Map one CSV DictReader row (by header name) to a supplier_accounts row dict.
+
+    Returns None if `Name` is blank after stripping a leading "<digits> - " prefix, or
+    if the row is an IRAVI own-company row.
+
+    Transformations mirror the pre-CSV single-sheet ('General') behavior, plus the new
+    numeric-prefix strip on the name:
+      - name: strip a leading `^\\s*\\d+\\s*-\\s*` prefix (e.g. "29 - CLICKTECH RETAIL
+        PRIVATE LIMITED" -> "CLICKTECH RETAIL PRIVATE LIMITED"; "AGROKING PESTICIDES
+        PVT. LTD." is left unchanged), then strip whitespace; blank -> skip row
+      - IRAVI FILTER: 'iravi' in name.lower() (applied AFTER the prefix strip) -> skip
+      - gst: stripped string; blank or literal "NULL" -> None
+      - gst_valid: tri-state — blank/"NULL" -> None; else bool(int(...)) (1 -> True,
+        0 -> False)
+      - city: title-cased if non-blank, else None
+      - state (from StateName, NOT the blank/numeric-id `State` column): if it contains
+        '-', take everything after the FIRST '-' (e.g. "29-Karnataka" -> "Karnataka");
+        bare "Karnataka" stays; blank or literal "NULL" -> None
+    """
+    name_raw = str(row.get('Name') or '')
+    name = _NAME_PREFIX_RE.sub('', name_raw).strip()
+    if not name:
+        return None
+
+    # IRAVI FILTER: drop own-company rows (applied after the prefix strip)
+    if 'iravi' in name.lower():
+        return None
+
+    # --- gst ---
+    gst_raw = str(row.get('GST') or '').strip()
+    gst = gst_raw if gst_raw and gst_raw.upper() != 'NULL' else None
+
+    # --- gst_valid ---
+    gst_valid_raw = str(row.get('GSTValid') or '').strip()
+    if not gst_valid_raw or gst_valid_raw.upper() == 'NULL':
+        gst_valid = None
+    else:
+        gst_valid = bool(int(gst_valid_raw))
+
+    # --- city (title-case; source casing is inconsistent) ---
+    city_raw = str(row.get('City') or '').strip()
+    city = city_raw.title() if city_raw else None
+
+    # --- state ---
+    # "29-Karnataka" -> "Karnataka"; bare "Karnataka" -> "Karnataka"; blank/"NULL" -> None
+    state_raw = str(row.get('StateName') or '').strip()
+    if state_raw and state_raw.upper() != 'NULL':
+        if '-' in state_raw:
+            state = state_raw.split('-', 1)[1].strip() or None
+        else:
+            state = state_raw or None
+    else:
+        state = None
+
+    return {
+        'name': name,
+        'gst': gst,
+        'gst_valid': gst_valid,
+        'city': city,
+        'state': state,
+    }
+
+
 def _parse(src_path: str) -> list[dict]:
-    wb = openpyxl.load_workbook(src_path, data_only=True)
+    """Parse the single-sheet CSV into one supplier_accounts row dict per supplier.
 
-    # Source data is in the 'General' sheet; 'Sheet1' is empty — ignore it.
-    ws = wb['General']
+    First occurrence of a name wins on duplicate names.
+    """
+    rows_by_name: dict[str, dict] = {}
 
-    rows = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        # --- name ---
-        name = str(row[0] or '').strip()
-        if not name:
-            continue
+    with open(src_path, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed = _extract_supplier_row(row)
+            if parsed is None:
+                continue
+            name = parsed['name']
+            if name in rows_by_name:
+                continue
+            rows_by_name[name] = parsed
 
-        # IRAVI FILTER: drop own-company rows (e.g. "IRAVI AGRO LIFE HYD", "IRAVI AGRO LIFE LLP - GNT")
-        if 'iravi' in name.lower():
-            logger.debug('Skipping IRAVI own-company row: %s', name)
-            continue
-
-        # --- gst ---
-        gst = str(row[6] or '').strip() or None
-
-        # --- gst_valid ---
-        # row[7] is None -> NULL; else cast to int: 1 -> True, 0 -> False.
-        # Treat 0 and None distinctly: None means no GST registered; 0 means present-but-invalid.
-        gst_valid_raw = row[7]
-        if gst_valid_raw is None:
-            gst_valid = None
-        else:
-            gst_valid = bool(int(gst_valid_raw))
-
-        # --- city (title-case; source casing is inconsistent) ---
-        city = str(row[12] or '').strip().title() or None
-
-        # --- state ---
-        # "29-Karnataka" -> "Karnataka"; bare "Karnataka" -> "Karnataka"; blank -> None
-        state_raw = str(row[13] or '').strip()
-        if state_raw:
-            if '-' in state_raw:
-                state = state_raw.split('-', 1)[1].strip() or None
-            else:
-                state = state_raw or None
-        else:
-            state = None
-
-        rows.append({
-            'name': name,
-            'gst': gst,
-            'gst_valid': gst_valid,
-            'city': city,
-            'state': state,
-        })
-
-    return rows
+    logger.info('Total unique suppliers parsed: %d', len(rows_by_name))
+    return [rows_by_name[name] for name in sorted(rows_by_name)]
 
 
 def _upsert(conn, rows: list[dict]):
