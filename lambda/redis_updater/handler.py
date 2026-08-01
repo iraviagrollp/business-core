@@ -55,17 +55,44 @@ def _update_stocks_cache():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
+            # snapshot_stock is now one row per distinct expiry_date (natural key
+            # gained expiry_date) — GROUP BY back down to the pre-expiry grain so
+            # iravi:stocks:current / iravi:stocks:summary are unchanged.
+            # conversion_factor/rate are per-product constants (MAX is a
+            # no-op pick, not a real aggregation); quantity/valuation columns
+            # are summed.
             cur.execute("""
                 SELECT
                     brand, technical, packing_size, packing_configuration,
-                    available_nos, conversion_factor, available_cases, available_qty,
-                    branch, special_packing_mention, entry_date, rate, stock_valuation
+                    SUM(available_nos) AS available_nos,
+                    MAX(conversion_factor) AS conversion_factor,
+                    SUM(available_cases) AS available_cases,
+                    SUM(available_qty) AS available_qty,
+                    branch, special_packing_mention, entry_date,
+                    MAX(rate) AS rate,
+                    SUM(stock_valuation) AS stock_valuation
                 FROM snapshot_stock
                 WHERE out_z IS NULL
+                GROUP BY brand, technical, packing_size, packing_configuration,
+                         branch, special_packing_mention, entry_date
                 ORDER BY brand, technical, packing_size, branch
             """)
             col_names = [d[0] for d in cur.description]
             raw_rows = cur.fetchall()
+
+            # Un-aggregated rows (one per distinct expiry_date) for the new
+            # Stock Expiry page — no rate/valuation.
+            cur.execute("""
+                SELECT
+                    brand, technical, packing_size, packing_configuration,
+                    available_nos, conversion_factor, available_cases, available_qty,
+                    branch, special_packing_mention, entry_date, expiry_date
+                FROM snapshot_stock
+                WHERE out_z IS NULL
+                ORDER BY expiry_date ASC NULLS LAST, brand, technical, branch
+            """)
+            expiry_col_names = [d[0] for d in cur.description]
+            expiry_raw_rows = cur.fetchall()
     finally:
         conn.close()
 
@@ -122,10 +149,32 @@ def _update_stocks_cache():
         'updated_at': datetime.now(timezone.utc).isoformat(),
     }
 
+    expiry_rows = []
+    for raw in expiry_raw_rows:
+        row = dict(zip(expiry_col_names, raw))
+        e_packing_size_num = float(row['packing_size'] or 0)
+        e_packing_config = row['packing_configuration'] or ''
+        expiry_rows.append({
+            'brand': row['brand'],
+            'technical': row['technical'],
+            'packing_size': e_packing_size_num,
+            'packing_configuration': e_packing_config,
+            'packing_display': _packing_display(e_packing_size_num, e_packing_config),
+            'available_nos': float(row['available_nos'] or 0),
+            'conversion_factor': float(row['conversion_factor'] or 0),
+            'available_cases': float(row['available_cases'] or 0),
+            'available_qty': float(row['available_qty'] or 0),
+            'branch': row['branch'],
+            'special_packing_mention': row['special_packing_mention'],
+            'entry_date': row['entry_date'].isoformat() if row['entry_date'] else None,
+            'expiry_date': row['expiry_date'].isoformat() if row['expiry_date'] else None,
+        })
+
     r = _get_redis()
     pipe = r.pipeline()
     pipe.set('iravi:stocks:summary', json.dumps(summary), ex=_TTL)
     pipe.set('iravi:stocks:current', json.dumps(current), ex=_TTL)
+    pipe.set('iravi:stocks:expiry', json.dumps(expiry_rows), ex=_TTL)
     pipe.execute()
 
     logger.info(

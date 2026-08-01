@@ -119,8 +119,8 @@ def _upsert_snapshot_stock(conn, rows: list[dict]):
                 INSERT INTO snapshot_stock (
                     brand, technical, packing_size, packing_configuration,
                     available_nos, conversion_factor, available_cases, available_qty,
-                    branch, special_packing_mention, entry_date, rate, stock_valuation
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    branch, special_packing_mention, entry_date, expiry_date, rate, stock_valuation
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     row['brand'], row['technical'], row['packing_size'],
@@ -128,7 +128,7 @@ def _upsert_snapshot_stock(conn, rows: list[dict]):
                     row['conversion_factor'], row['available_cases'],
                     row['available_qty'] / 1000, row['branch'],
                     row['special_packing_mention'], row['entry_date'],
-                    row['rate'], row['stock_valuation'],
+                    row['expiry_date'], row['rate'], row['stock_valuation'],
                 ),
             )
 
