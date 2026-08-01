@@ -1,7 +1,7 @@
 import csv
 import re
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
@@ -26,7 +26,7 @@ _UNIT_RE = re.compile(
 _OUTPUT_HEADERS = [
     'Brand', 'Technical', 'Packing Size', 'Packing Configuration',
     'Available Nos', 'Conversion Factor', 'Available Cases', 'Available Qty',
-    'Branch', 'Special Packing Mention', 'Entry Date',
+    'Branch', 'Special Packing Mention', 'Entry Date', 'Expiry Date',
     'Rate', 'Stock Valuation',
 ]
 
@@ -44,6 +44,25 @@ def _load_rates(rates_path: str) -> dict[str, float]:
             rates[str(prod).strip()] = float(rate)
     logger.info("Loaded %d product rates from %s", len(rates), rates_path)
     return rates
+
+
+def _parse_date(val) -> date | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    for fmt in ('%d-%m-%Y %H:%M:%S', '%d-%m-%Y', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    logger.warning('Unparseable date string %r', val)
+    return None
 
 
 def _to_int_if_whole(value: float) -> int | float:
@@ -134,6 +153,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             brand = row.get('BrandId')
             qty_raw = row.get(_QTY_COLUMN)
             cf_raw = row.get('CF')
+            expiry_date = _parse_date(row.get('ExpiryDate'))
 
             if not brand or not str(brand).strip():
                 continue
@@ -148,7 +168,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             available_nos = float(qty_raw) if qty_raw not in (None, '') else 0
             conversion_factor = float(cf_raw) if cf_raw not in (None, '') else 0
 
-            key = (brand, technical, packing_size, packing_config, branch_str, packing_spec)
+            key = (brand, technical, packing_size, packing_config, branch_str, packing_spec, expiry_date)
 
             if key in merged:
                 merged[key]['nos'] += available_nos
@@ -162,7 +182,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
 
     rows = []
     for key, agg in merged.items():
-        brand, technical, packing_size, packing_config, branch_str, packing_spec = key
+        brand, technical, packing_size, packing_config, branch_str, packing_spec, expiry_date = key
         total_nos = agg['nos']
         cf = agg['cf']
         available_cases = (total_nos / cf) if cf else 0
@@ -182,6 +202,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             'branch': branch_str,
             'special_packing_mention': packing_spec,
             'entry_date': entry_date,
+            'expiry_date': expiry_date,
             'rate': rate,
             'stock_valuation': stock_valuation,
         })
@@ -198,6 +219,7 @@ def process_stock_file(src_path: str, dst_path: str, entry_date: datetime = None
             branch_str,
             packing_spec,
             entry_date,
+            expiry_date,
             rate,
             stock_valuation,
         ])

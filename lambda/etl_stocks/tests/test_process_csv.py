@@ -12,8 +12,13 @@ Covers:
      the untouched _parse_product().
   4. available_nos = float(Qty), conversion_factor = float(CF).
   5. Row-merge: two rows sharing the same
-     (brand, technical, packing_size, packing_config, branch, spec) are summed.
+     (brand, technical, packing_size, packing_config, branch, spec, expiry_date) are summed.
+  6. ExpiryDate (44th column) parsed to a date via _parse_date.
+  7. Empty ExpiryDate -> expiry_date is None (row still processed, not dropped).
+  8. Two rows identical except for ExpiryDate no longer merge — each keeps its
+     own available_nos.
 """
+import datetime
 import os
 import sys
 import tempfile
@@ -45,9 +50,10 @@ with tempfile.TemporaryDirectory() as tmp:
     dst_path = os.path.join(tmp, 'Stock - Processed.xlsx')
     rows = process_stock_file(_FIXTURE, dst_path, rates_path=None)
 
-    # Blank-brand LEAFLET row skipped + two GULFONID rows merged into one
-    # + one VIVAYA PLUS row => 2 output rows total.
-    check("row count (merge + skip applied)", 2, len(rows))
+    # Blank-brand LEAFLET row skipped. GULFONID pair merges (same expiry).
+    # RIVAL pair stays separate (different expiry) => 2 rows. Plus VIVAYA PLUS
+    # + ZERION (blank expiry) => 5 output rows total.
+    check("row count (merge + skip + expiry-split applied)", 5, len(rows))
 
     by_key = {(r['brand'], r['branch']): r for r in rows}
 
@@ -61,6 +67,7 @@ with tempfile.TemporaryDirectory() as tmp:
         check("GULFONID conversion_factor = float(CF)", 20.0, gulfonid['conversion_factor'])
         check("GULFONID available_qty (packing_size * nos)", 500.0 * 1980.0, gulfonid['available_qty'])
         check("GULFONID branch preserved (incl. &amp; entity)", 'Guntur C &amp; F', gulfonid['branch'])
+        check("GULFONID expiry_date parsed", datetime.date(2027, 8, 21), gulfonid['expiry_date'])
 
     vivaya = by_key.get(('VIVAYA PLUS', 'Vijayawada'))
     check("VIVAYA PLUS row present", True, vivaya is not None)
@@ -70,9 +77,32 @@ with tempfile.TemporaryDirectory() as tmp:
         check("VIVAYA PLUS packing_configuration", 'gms', vivaya['packing_configuration'])
         check("VIVAYA PLUS available_nos = float(Qty)", 250.0, vivaya['available_nos'])
         check("VIVAYA PLUS conversion_factor = float(CF)", 1.0, vivaya['conversion_factor'])
+        check("VIVAYA PLUS expiry_date parsed", datetime.date(2026, 3, 15), vivaya['expiry_date'])
 
     # LEAFLET (blank BrandId) must not appear at all
     check("blank-brand LEAFLET row skipped", False, any(r['technical'] == 'SOME LABEL' for r in rows))
+
+    # ZERION: empty ExpiryDate must be tolerated -> None, row still processed (not dropped).
+    zerion = by_key.get(('ZERION', 'Chennai'))
+    check("ZERION row present (empty ExpiryDate not dropped)", True, zerion is not None)
+    if zerion:
+        check("ZERION expiry_date is None for blank ExpiryDate", None, zerion['expiry_date'])
+        check("ZERION available_nos", 50.0, zerion['available_nos'])
+
+    # RIVAL: two rows, identical product/branch/packing but DIFFERENT expiry
+    # dates — must stay as two separate rows (not merged), each with its own
+    # available_nos preserved.
+    rival_rows = [r for r in rows if r['brand'] == 'RIVAL']
+    check("RIVAL rows stay separate (different expiry dates)", 2, len(rival_rows))
+    rival_by_expiry = {r['expiry_date']: r for r in rival_rows}
+    rival_a = rival_by_expiry.get(datetime.date(2027, 1, 10))
+    rival_b = rival_by_expiry.get(datetime.date(2027, 6, 10))
+    check("RIVAL row (expiry 2027-01-10) present", True, rival_a is not None)
+    check("RIVAL row (expiry 2027-06-10) present", True, rival_b is not None)
+    if rival_a:
+        check("RIVAL row (expiry 2027-01-10) available_nos NOT merged", 100.0, rival_a['available_nos'])
+    if rival_b:
+        check("RIVAL row (expiry 2027-06-10) available_nos NOT merged", 200.0, rival_b['available_nos'])
 
 print(f"\n  PASS: {PASS}   FAIL: {FAIL}")
 if FAIL > 0:

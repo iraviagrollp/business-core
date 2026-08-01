@@ -95,6 +95,8 @@ def lambda_handler(event, context):
         return _handle_stocks_summary()
     if path == '/stocks/current':
         return _handle_stocks_current()
+    if path == '/stocks/expiry':
+        return _handle_stocks_expiry()
     if path == '/ledger/range':
         return _handle_ledger_range()
     if path == '/ledger/outstanding':
@@ -192,6 +194,9 @@ def lambda_handler(event, context):
             params.get('from_date', ''),
             params.get('to_date', ''),
         )
+    if path == '/stocks/expiry/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_stocks_expiry_pdf(params)
 
     return _response(404, {'error': 'Not found'})
 
@@ -255,13 +260,25 @@ def _handle_stocks_current():
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
+            # snapshot_stock is now one row per distinct expiry_date (natural key
+            # gained expiry_date) — GROUP BY back down to the pre-expiry grain so
+            # this endpoint's shape/totals are unchanged. conversion_factor/rate
+            # are per-product constants (MAX is a no-op pick, not a real
+            # aggregation); every quantity/valuation column is summed.
             cur.execute("""
                 SELECT
                     brand, technical, packing_size, packing_configuration,
-                    available_nos, conversion_factor, available_cases, available_qty,
-                    branch, special_packing_mention, entry_date, rate, stock_valuation
+                    SUM(available_nos) AS available_nos,
+                    MAX(conversion_factor) AS conversion_factor,
+                    SUM(available_cases) AS available_cases,
+                    SUM(available_qty) AS available_qty,
+                    branch, special_packing_mention, entry_date,
+                    MAX(rate) AS rate,
+                    SUM(stock_valuation) AS stock_valuation
                 FROM snapshot_stock
                 WHERE out_z IS NULL
+                GROUP BY brand, technical, packing_size, packing_configuration,
+                         branch, special_packing_mention, entry_date
                 ORDER BY brand, technical, packing_size, branch
             """)
             col_names = [d[0] for d in cur.description]
@@ -293,6 +310,146 @@ def _handle_stocks_current():
 
     r.set('iravi:stocks:current', json.dumps(current), ex=_REDIS_TTL)
     return _response(200, current)
+
+
+def _handle_stocks_expiry():
+    """GET /stocks/expiry — un-aggregated snapshot_stock rows (one per distinct
+    expiry_date), no rate/valuation. Standard cache-aside, same 24h TTL/key
+    convention as the other /stocks/* endpoints."""
+    r = _get_redis()
+    cached = r.get('iravi:stocks:expiry')
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    brand, technical, packing_size, packing_configuration,
+                    available_nos, conversion_factor, available_cases, available_qty,
+                    branch, special_packing_mention, entry_date, expiry_date
+                FROM snapshot_stock
+                WHERE out_z IS NULL
+                ORDER BY expiry_date ASC NULLS LAST, brand, technical, branch
+            """)
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    expiry_rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        packing_size_num = float(row['packing_size'] or 0)
+        packing_config = row['packing_configuration'] or ''
+        expiry_rows.append({
+            'brand': row['brand'],
+            'technical': row['technical'],
+            'packing_size': packing_size_num,
+            'packing_configuration': packing_config,
+            'packing_display': _packing_display(packing_size_num, packing_config),
+            'available_nos': float(row['available_nos'] or 0),
+            'conversion_factor': float(row['conversion_factor'] or 0),
+            'available_cases': float(row['available_cases'] or 0),
+            'available_qty': float(row['available_qty'] or 0),
+            'branch': row['branch'],
+            'special_packing_mention': row['special_packing_mention'],
+            'entry_date': row['entry_date'].isoformat() if row['entry_date'] else None,
+            'expiry_date': row['expiry_date'].isoformat() if row['expiry_date'] else None,
+        })
+
+    r.set('iravi:stocks:expiry', json.dumps(expiry_rows), ex=_REDIS_TTL)
+    return _response(200, expiry_rows)
+
+
+def _add_months(d, months: int):
+    """Add `months` calendar months to date `d`, clamping the day to the
+    target month's length (e.g. 31-Jan + 1 month -> 28/29-Feb)."""
+    import calendar
+
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return d.replace(year=year, month=month, day=day)
+
+
+def _handle_stocks_expiry_pdf(params: dict):
+    """GET /stocks/expiry/pdf?brand=&expires_before_months=
+
+    Computed fresh (no Redis caching, same convention as the other report PDF
+    routes) so filters always reflect the live DB. brand is a case-insensitive
+    substring filter; expires_before_months is one of '3'/'6'/'9'/'12'
+    (anything else, including absent/'all', means no month filter — matches
+    the UI's own filtering so the PDF mirrors what's on screen).
+    """
+    brand_filter = (params.get('brand') or '').strip()
+    months_raw = (params.get('expires_before_months') or '').strip().lower()
+
+    cutoff_date = None
+    if months_raw in ('3', '6', '9', '12'):
+        today = datetime.now(timezone.utc).date()
+        cutoff_date = _add_months(today, int(months_raw))
+    else:
+        months_raw = 'all'
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            query = """
+                SELECT
+                    brand, technical, packing_size, packing_configuration,
+                    available_nos, conversion_factor, available_cases, available_qty,
+                    branch, special_packing_mention, entry_date, expiry_date
+                FROM snapshot_stock
+                WHERE out_z IS NULL
+            """
+            query_params: list = []
+            if brand_filter:
+                query += " AND brand ILIKE %s"
+                query_params.append(f'%{brand_filter}%')
+            if cutoff_date is not None:
+                query += " AND expiry_date IS NOT NULL AND expiry_date <= %s"
+                query_params.append(cutoff_date)
+            query += " ORDER BY expiry_date ASC NULLS LAST, brand, technical, branch"
+            cur.execute(query, query_params)
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        packing_size_num = float(row['packing_size'] or 0)
+        packing_config = row['packing_configuration'] or ''
+        rows.append({
+            'brand': row['brand'],
+            'technical': row['technical'],
+            'packing_display': _packing_display(packing_size_num, packing_config),
+            'available_nos': float(row['available_nos'] or 0),
+            'conversion_factor': float(row['conversion_factor'] or 0),
+            'available_cases': float(row['available_cases'] or 0),
+            'available_qty': float(row['available_qty'] or 0),
+            'branch': row['branch'],
+            'special_packing_mention': row['special_packing_mention'],
+            'entry_date': row['entry_date'].isoformat() if row['entry_date'] else None,
+            'expiry_date': row['expiry_date'].isoformat() if row['expiry_date'] else None,
+        })
+
+    payload = {
+        'rows': rows,
+        'brand_filter': brand_filter or None,
+        'cutoff_date': cutoff_date.isoformat() if cutoff_date else None,
+    }
+
+    import stocks_expiry_pdf
+    pdf_bytes = stocks_expiry_pdf.render_stocks_expiry_pdf(payload)
+    filename = (
+        f'stock_expiry_{_safe_filename_part(brand_filter) or "all"}_{months_raw}.pdf'
+    )
+    return _pdf_response(pdf_bytes, filename)
 
 
 def _handle_ledger_range():
