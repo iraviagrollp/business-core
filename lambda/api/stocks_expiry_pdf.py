@@ -4,7 +4,8 @@ stocks_expiry_pdf — PDF renderer for the Stock Expiry report.
 Public surface
 --------------
 render_stocks_expiry_pdf(data: dict) -> bytes
-    data    : {'rows': [...], 'brand_filter': str|None, 'cutoff_date': 'YYYY-MM-DD'|None}
+    data    : {'rows': [...], 'brand_filter': str|None, 'branch_filter': str|None,
+               'cutoff_date': 'YYYY-MM-DD'|None}
               (built by handler._handle_stocks_expiry_pdf from raw, un-aggregated
               snapshot_stock rows — one row per distinct expiry_date, no rate/valuation)
     returns : raw PDF bytes (landscape A4)
@@ -21,9 +22,9 @@ supplier_balances_fy_pdf.py / monthly_sales_pdf.py / monthly_collection_pdf.py):
   data rows, repeatRows=1 so the header repeats on every page.
 - Report title ('STOCK EXPIRY REPORT') + Date on their own row directly under
   the shared letterhead, followed by a subtitle line describing any active
-  filters (Brand / Expiring-before-cutoff), e.g.
-  'Brand: GULFONID · Expiring before 21-11-2026' — or 'All Stock' when no
-  filter is active.
+  filters (Branch / Brand / Expiring-before-cutoff), e.g.
+  'Branch: Auto Nagar · Brand: GULFONID · Expiring before 21-11-2026' — or
+  'All Stock' when no filter is active.
 
 Columns (NO rate / NO valuation — this report is for expiry tracking only):
   Brand | Technical | Packing | Branch | Special Packing | Available Nos |
@@ -121,7 +122,8 @@ def render_stocks_expiry_pdf(data: dict) -> bytes:
 
     Parameters
     ----------
-    data : {'rows': [...], 'brand_filter': str|None, 'cutoff_date': 'YYYY-MM-DD'|None}
+    data : {'rows': [...], 'brand_filter': str|None, 'branch_filter': str|None,
+            'cutoff_date': 'YYYY-MM-DD'|None}
 
     Returns
     -------
@@ -129,6 +131,7 @@ def render_stocks_expiry_pdf(data: dict) -> bytes:
     """
     rows = data.get('rows') or []
     brand_filter = data.get('brand_filter')
+    branch_filter = data.get('branch_filter')
     cutoff_date = data.get('cutoff_date')
 
     buffer = BytesIO()
@@ -178,6 +181,8 @@ def render_stocks_expiry_pdf(data: dict) -> bytes:
     ]))
 
     filter_parts = []
+    if branch_filter:
+        filter_parts.append(f'Branch: {branch_filter}')
     if brand_filter:
         filter_parts.append(f'Brand: {brand_filter}')
     if cutoff_date:

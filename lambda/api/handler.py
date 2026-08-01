@@ -376,15 +376,19 @@ def _add_months(d, months: int):
 
 
 def _handle_stocks_expiry_pdf(params: dict):
-    """GET /stocks/expiry/pdf?brand=&expires_before_months=
+    """GET /stocks/expiry/pdf?brand=&expires_before_months=&branch=
 
     Computed fresh (no Redis caching, same convention as the other report PDF
     routes) so filters always reflect the live DB. brand is a case-insensitive
     substring filter; expires_before_months is one of '3'/'6'/'9'/'12'
     (anything else, including absent/'all', means no month filter — matches
-    the UI's own filtering so the PDF mirrors what's on screen).
+    the UI's own filtering so the PDF mirrors what's on screen). branch is an
+    EXACT match (same convention as /sales/list and /purchases/list — the UI
+    populates its dropdown from distinct branch values, so it always sends an
+    exact value); absent/empty means no branch filter (all branches).
     """
     brand_filter = (params.get('brand') or '').strip()
+    branch_filter = (params.get('branch') or '').strip()
     months_raw = (params.get('expires_before_months') or '').strip().lower()
 
     cutoff_date = None
@@ -409,6 +413,9 @@ def _handle_stocks_expiry_pdf(params: dict):
             if brand_filter:
                 query += " AND brand ILIKE %s"
                 query_params.append(f'%{brand_filter}%')
+            if branch_filter:
+                query += " AND branch = %s"
+                query_params.append(branch_filter)
             if cutoff_date is not None:
                 query += " AND expiry_date IS NOT NULL AND expiry_date <= %s"
                 query_params.append(cutoff_date)
@@ -441,13 +448,15 @@ def _handle_stocks_expiry_pdf(params: dict):
     payload = {
         'rows': rows,
         'brand_filter': brand_filter or None,
+        'branch_filter': branch_filter or None,
         'cutoff_date': cutoff_date.isoformat() if cutoff_date else None,
     }
 
     import stocks_expiry_pdf
     pdf_bytes = stocks_expiry_pdf.render_stocks_expiry_pdf(payload)
     filename = (
-        f'stock_expiry_{_safe_filename_part(brand_filter) or "all"}_{months_raw}.pdf'
+        f'stock_expiry_{_safe_filename_part(branch_filter) or "all"}_'
+        f'{_safe_filename_part(brand_filter) or "all"}_{months_raw}.pdf'
     )
     return _pdf_response(pdf_bytes, filename)
 
