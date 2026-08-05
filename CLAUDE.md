@@ -1129,6 +1129,12 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /reports/monthly-collection/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
 | `GET /ledger/statement/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
 | `GET /supplier-ledger/statement/pdf` | — (no cache; always fresh) | Complete (added 2026-07-20) |
+| `GET /sales/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /purchases/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /reports/customer-aging/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /reports/supplier-aging/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /pdc` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /pdc/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
@@ -1167,6 +1173,48 @@ Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 **`requirements.txt`:** added `reportlab==4.2.2` (matches `alerts_evaluator/requirements.txt`'s convention — the GitHub Actions pipeline `pip install`s this into the Lambda Layer; no local install needed). Also flagged for the iac agent: the api Lambda's Terraform config (`lambda_api.tf`) needs the reportlab layer attached (same layer `alerts_evaluator` already uses) plus these 6 routes registered on the API Gateway HTTP API.
 
 **Verification (2026-07-20):** `python -m py_compile` clean on all 11 changed/added files. All 6 `render_*` functions smoke-tested with representative stub dicts (₹ amounts, negatives, missing city/code/type, a 400-row multi-page statement, a zero-activity edge case) — every call returned valid `%PDF` bytes with no exceptions; the long ledger statement produced 9 pages (`pypdf` page count); `letterhead.register_fonts()` confirmed to return the real DejaVuSans inline-font token, not the `Rs.` fallback (i.e. the bundled TTF loaded correctly). `__pycache__` cleaned up after testing.
+
+---
+
+## api — Server-side PDF exports slice 2: Sales/Purchases Registers, Customer/Supplier Aging, Issued PDC (added 2026-08-05)
+
+**Status: complete.** 6 new endpoints on the main `api` Lambda, following the exact same house PDF convention as the slice-1 reports above (`letterhead.py` header/footer repeating every page, `_RS = letterhead.register_fonts()` rupee token, no Redis cache on PDF routes, local `import <module>_pdf` inside each handler).
+
+**New shared modules:**
+- `aging.py::compute_aging(conn, table, invoice_category, payment_subcats, age1, age2, age3, as_of) -> list[dict]` — FIFO aging engine ported from the UI's `CustomerBalances.tsx`/`SupplierBalances.tsx` client-side algorithm (r2 rounding, oldest-invoice-first credit application, 3 age buckets + net). Parameterised by `table` (`customer_ledger`|`supplier_ledger`), the ledger `category` that represents an invoice for that party type (`Db` for customers, `Cr` for suppliers), and the `sub_category` set that counts as a "last receipt/payment" (`{'Bank Receipt'}` for customers, `{'Bank Payment','Cash Payment'}` for suppliers). Does NOT do the `customer_details`/`supplier_accounts` city join — callers attach `city` per row after calling this (same pattern as the other FY/statement compute modules' city lookups).
+- `aging_pdf.py::render_aging_pdf(payload, *, title, party_label, last_label, negative_suffix, positive_color, negative_color) -> bytes` — shared landscape-A4 renderer (single-row GREEN header, `repeatRows=1`, zebra, TOTAL row = bucket sums + Σ(net>0) only). Net Amount cell text is intentionally NOT the FY-report's Dr/Cr-both-sides convention: `net <= 0` → `'{abs(net)} {negative_suffix}'` colored GREEN; `net > 0` → `'{net}'` (no suffix) colored RED — verbatim per the task spec. `customer_aging_pdf.py`/`supplier_aging_pdf.py` are thin wrappers supplying `party_label`/`last_label`/`negative_suffix` (`'Cr'` for customers, `'Dr'` for suppliers — both use the same RED/GREEN colors, only the suffix word differs).
+- `transactions_register_pdf.py::render_register_pdf(payload) -> bytes` — shared landscape-A4 renderer for the Sales Register and Purchases Register (identical 9-column table: Date | Voucher No | Party | Product | Qty | Rate (₹) | Amount (₹) | Type | Branch, + TOTAL row summing Qty/Amount). Purely presentational — takes an already-filtered, already-ordered row list plus pre-built title/meta-lines/totals; ALL filtering/business logic lives in `handler.py`. `sales_register_pdf.py`/`purchases_register_pdf.py` are thin wrappers.
+- `issued_pdc_pdf.py::render_issued_pdc_pdf(data) -> bytes` — standalone (not shared, only one caller) 16-column landscape-A4 renderer for Issued PDC, 7pt body font with Paragraph-wrapped Supplier/Product/Brand cells so the wide table fits; TOTAL row sums Gross/GST/Amount/Disc/Adv/Bal/PDC Amt.
+
+**Deviation from the task's literal spec text (cosmetic only, no functional change):** the task prose uses en-dash/em-dash characters (`0–30 days`, `—` for blank cells); every new renderer here uses plain ASCII hyphens instead (`0-30 days`, `-` for blanks) — matching this package's already-established convention (see `customer_balances_fy_pdf.py`'s 2026-07-20 em-dash→hyphen change) of avoiding non-ASCII glyphs in Helvetica-styled placeholder text wherever a plain hyphen reads identically.
+
+**1. `GET /sales/pdf?branch=&from_date=&to_date=&type=&customer_filter=&exclude_internal=&search=&period_label=`**
+Source rows: the same query `_handle_sales_list` uses (branch + date range on `sales`), computed fresh (no cache). Filters applied in Python, in this exact order: (a) `type` (`sales_return` exact match), (b) `customer_filter` (`customer`|`non-customer`, against `LOWER(customer_details.customer_name)` where `out_z IS NULL`), (c) `exclude_internal` (drops `'iravi' in party.lower()`), (d) `search` (substring on party OR voucher_no, case-insensitive). Row order is NEVER changed from the SQL query order (`purchase_date DESC, voucher_no`). Title `Sales Register`; meta line always shows `Period: …` (with `period_label` prefix if given, else just the date range) and `Branch: … | All Branches`, plus `Type:`/`Customers:`/`Exclude Internal: Yes`/`Search:` only when those params are set. `Type` column cell is `Return`/`Sale`. Filename `Sales_Register_{from_date}_to_{to_date}.pdf` (each date sanitized via `_safe_filename_part`).
+
+**2. `GET /purchases/pdf?branch=&from_date=&to_date=&type=&product_filter=&exclude_internal=&search=&period_label=`**
+Identical to #1 except: source is `purchases` (`purchase_return` column for `type`), `product_filter` (`technical`|`non-technical`, tests `'%' in product`) replaces `customer_filter`, meta label is `Products: Technical|Non-Technical`, filename `Purchases_Register_{from_date}_to_{to_date}.pdf`. Per the task's literal instructions, the `Type:` meta line and the table's `Type` column text are UNCHANGED from #1 (`Type: Sales|Returns`, cell `Sale`/`Return`) even though this is the purchases side — only the bullet-listed differences above were applied.
+
+**3. `GET /reports/customer-aging/pdf?age1=&age2=&age3=&as_of=`**
+`age1`/`age2`/`age3` default 30/60/90 (positive ints; invalid/non-positive falls back to default). `as_of` defaults to today in IST (`UTC+5:30`, computed the same way as `_handle_monthly_sales_pdf` etc. — NOT a naive UTC `date.today()`). Calls `aging.compute_aging(conn, table='customer_ledger', invoice_category='Db', payment_subcats={'Bank Receipt'}, …)`, then attaches `city` from `customer_details` (`UPPER(customer_name)` match, `out_z IS NULL`). Title `Customer Aging`; meta lines `Aged as of: …` and `Buckets: 0-{age1} / {age1+1}-{age2} / {age2+1}-{age3} days`. Columns: Party | City | 3 bucket cols | Net Amount | Last Receipt Date | Last Receipt Age | Last Receipt Amt. Filename `Customer_Aging_{as_of}.pdf`.
+
+**4. `GET /reports/supplier-aging/pdf?age1=&age2=&age3=&as_of=`**
+Mirror of #3 on `supplier_ledger`/`supplier_accounts`: `invoice_category='Cr'`, `payment_subcats={'Bank Payment','Cash Payment'}`, city from `supplier_accounts` (`UPPER(name)` match, `out_z IS NULL`). Title `Supplier Aging`; columns use `Supplier`/`Last Payment …` labels; Net Amount `net<=0` suffix is `Dr` (not `Cr`) — see `aging_pdf.py`'s docstring for the full color/suffix semantics. Filename `Supplier_Aging_{as_of}.pdf`.
+
+**5. `GET /pdc`** — read-only JSON array mirroring the procurement PDC screen (`procurement.pdc` LEFT JOIN `procurement.supplier_companies`/`procurement.technicals`), reusing `procurement_api/handler.py`'s `_PDC_SELECT` verbatim (module constant `_PDC_SELECT` in `handler.py`, shared by `_handle_pdc`/`_handle_pdc_pdf`). GET only — this Lambda never writes to `procurement.*`; create/update/delete stays exclusively in `procurement_api`. No Redis cache. **DB credential check (per task requirement):** `api/handler.py` and `procurement_api/handler.py` have byte-identical `_get_db_conn()` implementations, both reading `os.environ['DB_SECRET_ARN']` — and per this project's IaC docs there is only ONE database secret in the whole system (`iravi/dashboard/db`, `IaC/terraform/environments/production/secrets.tf`). Strong code-level evidence (identical connection code, single documented DB secret, no second secret referenced anywhere in this repo) says both Lambdas connect as the SAME Postgres user, so no GRANT is needed for `api` to read the `procurement` schema. This agent cannot inspect `IaC/` directly to give a 100%-certain confirmation (out of scope/fenced) — **flagged for the `iac` agent to do a final one-line confirmation** that `lambda_api.tf` and the procurement module's Lambda both reference the same `db_secret_arn` Terraform output before relying on this in production.
+
+**6. `GET /pdc/pdf?supplier=&product=&pdc_from=&pdc_to=`** — `supplier`/`product` are EXACT matches on `company_name`/`technical_name`; `pdc_from`/`pdc_to` are an inclusive range on `pdc_date`; all optional, applied server-side via the same `_PDC_SELECT` base query. Title `Issued PDC`; meta line lists whichever filters are set, else `All records`. 16 columns (PO, Date, Supplier, Product, Brand, Cr.Days, Qty, Rate, Gross, GST, Amount, Disc, Adv, Bal, PDC Amt, PDC Date) — Qty/Rate are plain numbers, the 7 money columns are ₹ Indian-grouped 2dp, dates DD-MM-YYYY, `None` → `-`. TOTAL row sums the 7 money columns. Filename `Issued_PDC.pdf`.
+
+**Verification (2026-08-05):** `python -m py_compile handler.py aging.py aging_pdf.py customer_aging_pdf.py supplier_aging_pdf.py transactions_register_pdf.py sales_register_pdf.py purchases_register_pdf.py issued_pdc_pdf.py` clean. Smoke-tested (scratchpad-only script, not committed) with `reportlab` 5.0.0 + `pypdf`: Sales/Purchases Register at 200 synthetic rows (None qty/rate/amount/branch/party sprinkled in, one intentionally very long party name, negative amounts) → 10 pages each, plus a 0-row edge case → 1 page; Customer/Supplier Aging at 80 synthetic rows (mixed positive/negative nets, missing cities, missing last-receipt data) → 4 pages each, plus 0-row edge cases → 1 page each (confirmed `'Cr'`/`'Dr'` suffix text present via `pypdf` extraction); Issued PDC at 60 rows (None brand/technical_name/company_name/credit_days/disc/adv sprinkled in) → 5 pages, a supplier-filtered 5-row case → 1 page, and a 0-row case → 1 page. Every call returned non-empty `%PDF`-prefixed bytes with no exceptions. Routes verified reachable by re-reading the routing block in `handler.py` after editing.
+
+**Exact routes + query params (for the `iac` agent — API Gateway HTTP API route resources):**
+- `GET /sales/pdf` — `branch, from_date, to_date, type, customer_filter, exclude_internal, search, period_label`
+- `GET /purchases/pdf` — `branch, from_date, to_date, type, product_filter, exclude_internal, search, period_label`
+- `GET /reports/customer-aging/pdf` — `age1, age2, age3, as_of`
+- `GET /reports/supplier-aging/pdf` — `age1, age2, age3, as_of`
+- `GET /pdc` — no query params
+- `GET /pdc/pdf` — `supplier, product, pdc_from, pdc_to`
+
+All 6 need CORS allow-method entries alongside the other GET routes in `lambda_api.tf`; none need a new DB migration, new Lambda, or new layer (same `api` Lambda, same `reportlab==4.2.2` already in `requirements.txt`, same `procurement` schema already used by `procurement_api`).
 
 ---
 
@@ -1746,6 +1794,23 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **6 new server-side PDF/JSON exports — Sales/Purchases Registers, Customer/Supplier Aging,
+  Issued PDC (2026-08-05):** see the full "api — Server-side PDF exports slice 2" section above
+  for endpoint-by-endpoint detail. New files: `aging.py` (shared FIFO aging engine, ported from
+  the UI's CustomerBalances.tsx/SupplierBalances.tsx), `aging_pdf.py` (shared renderer) +
+  `customer_aging_pdf.py`/`supplier_aging_pdf.py` (thin wrappers), `transactions_register_pdf.py`
+  (shared renderer) + `sales_register_pdf.py`/`purchases_register_pdf.py` (thin wrappers),
+  `issued_pdc_pdf.py` (standalone renderer). `handler.py` gained `_handle_sales_pdf`,
+  `_handle_purchases_pdf`, `_handle_customer_aging_pdf`, `_handle_supplier_aging_pdf`,
+  `_handle_pdc`, `_handle_pdc_pdf`, and the `_PDC_SELECT` module constant (reused verbatim from
+  `procurement_api/handler.py`), plus 6 new GET routes. No new DB migration, Lambda, or
+  dependency — `reportlab` and the `procurement` schema access were already in place.
+  **IaC needed:** register the 6 routes + CORS in `lambda_api.tf` (exact route strings/params
+  listed in the section above); confirm (one-line Terraform check, not expected to require a
+  change) that `lambda_api.tf`'s `db_secret_arn` reference is the same one the procurement module
+  uses, so `GET /pdc`/`GET /pdc/pdf` can read `procurement.*` — see that section for why this is
+  believed to already be true.
 
 - [x] **Supplier Ledger Statement PDF — mirrors the customer redesign, supplier semantics, no
   Bank Particulars block (2026-07-21):** follow-up to the Customer Ledger Statement redesign
@@ -2519,6 +2584,20 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   fallback). No IaC/DB change — same route, same JSON-only exclusion for `/stocks/expiry`.
 
 ## What Is Next (build in this order)
+
+- [ ] **IaC: API Gateway routes for the 6 new PDF/JSON exports (2026-08-05)** — `GET /sales/pdf`,
+  `GET /purchases/pdf`, `GET /reports/customer-aging/pdf`, `GET /reports/supplier-aging/pdf`,
+  `GET /pdc`, `GET /pdc/pdf` + CORS in `lambda_api.tf` (exact query params listed in the "api —
+  Server-side PDF exports slice 2" section above). No DB migration, new Lambda, or new dependency
+  needed. Also: a one-line confirmation that `lambda_api.tf`'s Lambda references the same
+  `db_secret_arn` output the procurement module's Lambda uses (expected to already be true — see
+  that section for the reasoning) so `/pdc`/`/pdc/pdf` can read the `procurement` schema.
+- [ ] **UI slice for the 6 new exports** — wire "Export PDF" buttons/links on the Sales, Purchases,
+  Customer Balances (aging), and Supplier Balances (aging) screens to the new `/sales/pdf`,
+  `/purchases/pdf`, `/reports/customer-aging/pdf`, `/reports/supplier-aging/pdf` routes (passing
+  through whatever filters are currently active in the UI, matching the exact param names above);
+  add a read-only Issued PDC view/export for main-dashboard finance users backed by `GET /pdc` +
+  `GET /pdc/pdf` (no create/update/delete — that stays in `procurement-ui`).
 
 > **Reconciliation note (2026-07-11): all of it is LIVE on AWS.** Every code deliverable below is
 > deployed — migrations `010`–`019` are applied to RDS; the supplier/alerts/SES Terraform is applied;
