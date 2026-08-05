@@ -2124,6 +2124,45 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **`GET`/`POST /config/borrowing-rates` — admin-only config API for per-account borrowing
+  interest rates (added 2026-08-05):** new `_route_config()` branch in `lambda/api/handler.py`
+  (`/config/borrowing-rates`), mirroring `_handle_config_monthly_targets_get/_post` exactly —
+  `_require_admin(event, cur)` inside the cursor block, close-then-insert milestoning on the new
+  table `borrowing_rate` (natural key `account`; migration `054`, owned by the `iac` agent, in
+  progress in parallel — schema: `id BIGSERIAL PK, account TEXT NOT NULL, rate NUMERIC(6,3) NOT
+  NULL, in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ`, partial unique index on
+  `(account) WHERE out_z IS NULL`).
+  - **`GET /config/borrowing-rates`** — `{rows: [{account, rate}]}`, one row per DISTINCT active
+    (`out_z IS NULL`) `borrowings.account`, LEFT-joined to any configured `borrowing_rate`, PLUS
+    any account that exists in `borrowing_rate` but no longer appears in `borrowings` (so a
+    configured rate can never become invisible/un-editable). Implemented as a
+    `FULL OUTER JOIN` between two subqueries — `(SELECT DISTINCT account FROM borrowings WHERE
+    out_z IS NULL) b` and `(SELECT account, rate FROM borrowing_rate WHERE out_z IS NULL) r`,
+    `ON b.account = r.account` — with `account = COALESCE(b.account, r.account)`. **The `out_z IS
+    NULL` predicate on `borrowing_rate` is inside the subquery, not in an outer WHERE clause** —
+    putting it in an outer WHERE would silently demote the FULL OUTER JOIN to an INNER JOIN
+    (dropping every unconfigured account, the exact bug this task called out as most likely).
+    `rate` is `null` (JSON) for accounts with no configured rate. Sort: `ORDER BY LOWER(COALESCE(
+    b.account, r.account))` on the OUTER query, which has no `DISTINCT` — so this is NOT the
+    `SELECT DISTINCT ... ORDER BY LOWER(...)` bug that hit `/borrowings/meta` in production; the
+    only `DISTINCT` in this query is on the inner `b` subquery, which has no `ORDER BY` of its
+    own.
+  - **`POST /config/borrowing-rates`** — body `{account, rate}`; validates `account` non-empty
+    string (400 `{'error': 'account is required'}`) and `rate` numeric 0–100 (400 `{'error':
+    'rate must be numeric'}` / `{'error': 'rate must be between 0 and 100'}` — same error-shape
+    convention as `_handle_config_monthly_targets_post`); close-then-insert on `account`; returns
+    `{account, rate}`. **No clear-the-rate semantics** — `rate` is required and must be a number;
+    chosen because neither existing config POST (`monthly-targets`, `monthly-collection-targets`)
+    has a null/clear precedent (both require a numeric `target_lakhs`), so this endpoint follows
+    the same simple, no-precedent-breaking pattern rather than inventing new semantics.
+  - Verified: `python -m py_compile handler.py` clean. No new dependency, no new Lambda, no Redis
+    caching (admin config route, matches the other `/config/*` endpoints' uncached convention).
+  - **IaC needed:** migration `054` (schema above, owned by the `iac` agent per the task) must be
+    applied before this route returns real data; API Gateway route `GET|POST
+    /config/borrowing-rates` + CORS in `lambda_api.tf`. **UI needed:** admin config page (not
+    built here — out of `business-core` scope) to list/edit rates using the exact JSON contract
+    above.
+
 - [x] **New Lambda `etl_borrowings` + `GET /borrowings/meta`/`GET /borrowings` API endpoints
   (2026-08-05):** see the full "etl_borrowings — Borrowings Ledger Processing" and "api — GET
   /borrowings/meta, GET /borrowings" sections above for complete detail. New files:
@@ -2941,6 +2980,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: `borrowing_rate` table + `/config/borrowing-rates` routes (2026-08-05)** — migration
+  `054` (schema in the "`GET`/`POST /config/borrowing-rates`" section above — `borrowing_rate`,
+  natural key `account`, partial unique index on `(account) WHERE out_z IS NULL`); API Gateway
+  routes `GET /config/borrowing-rates` + `POST /config/borrowing-rates` + CORS in `lambda_api.tf`.
+  No new Lambda or dependency. **UI slice:** admin page to list/edit rates per account, calling
+  `GET /config/borrowing-rates` → `{rows: [{account, rate}]}` and `POST /config/borrowing-rates`
+  with `{account, rate}`.
 - [ ] **IaC: `borrowings` table + `etl_borrowings` Lambda + API routes (2026-08-05)** — migration
   `052_create_borrowings.sql` (schema in the "etl_borrowings" section above); new
   `lambda_etl_borrowings.tf` (Lambda + S3 prefix-filter fan-out entry `raw/Borrowings` added to

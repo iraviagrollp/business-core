@@ -2185,6 +2185,12 @@ def _route_config(event, method, path):
         if method == 'POST':
             return _handle_config_monthly_collection_targets_post(event)
         return _response(405, {'error': 'Method not allowed'})
+    if path == '/config/borrowing-rates':
+        if method == 'GET':
+            return _handle_config_borrowing_rates_get(event)
+        if method == 'POST':
+            return _handle_config_borrowing_rates_post(event)
+        return _response(405, {'error': 'Method not allowed'})
     return _response(404, {'error': 'Not found'})
 
 
@@ -2382,6 +2388,80 @@ def _handle_config_monthly_collection_targets_post(event):
     finally:
         conn.close()
     return _response(200, {'state': state, 'month': month, 'yr': yr, 'target_lakhs': target_lakhs})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG — Borrowing Interest Rates (admin-only)
+#
+# Table borrowing_rate (unitemporal milestoning), natural key (account):
+#   id BIGSERIAL PK, account TEXT NOT NULL, rate NUMERIC(6,3) NOT NULL,
+#   in_z TIMESTAMPTZ NOT NULL DEFAULT NOW(), out_z TIMESTAMPTZ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _handle_config_borrowing_rates_get(event):
+    """GET /config/borrowing-rates — admin-only.
+
+    Returns one row per DISTINCT active borrowings account, LEFT-joined to any
+    configured rate — plus any account that exists in borrowing_rate but no
+    longer appears in borrowings (a FULL OUTER JOIN of the two account sets),
+    so a configured rate can never become invisible/un-editable. rate is null
+    for accounts with no rate configured yet.
+    """
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                SELECT COALESCE(b.account, r.account) AS account, r.rate AS rate
+                FROM (SELECT DISTINCT account FROM borrowings WHERE out_z IS NULL) b
+                FULL OUTER JOIN (SELECT account, rate FROM borrowing_rate WHERE out_z IS NULL) r
+                    ON b.account = r.account
+                ORDER BY LOWER(COALESCE(b.account, r.account))
+            """)
+            rows = [
+                {'account': row[0], 'rate': float(row[1]) if row[1] is not None else None}
+                for row in cur.fetchall()
+            ]
+    finally:
+        conn.close()
+    return _response(200, {'rows': rows})
+
+
+def _handle_config_borrowing_rates_post(event):
+    """POST /config/borrowing-rates — admin-only; milestoning upsert on (account)."""
+    body = _json_body(event)
+
+    account = (body.get('account') or '').strip()
+    if not account:
+        return _response(400, {'error': 'account is required'})
+
+    raw_rate = body.get('rate')
+    if isinstance(raw_rate, bool):
+        return _response(400, {'error': 'rate must be numeric'})
+    try:
+        rate = float(raw_rate)
+    except (TypeError, ValueError):
+        return _response(400, {'error': 'rate must be numeric'})
+    if rate < 0 or rate > 100:
+        return _response(400, {'error': 'rate must be between 0 and 100'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            _require_admin(event, cur)
+            cur.execute("""
+                UPDATE borrowing_rate
+                SET out_z = NOW()
+                WHERE account = %s AND out_z IS NULL
+            """, (account,))
+            cur.execute("""
+                INSERT INTO borrowing_rate (account, rate)
+                VALUES (%s, %s)
+            """, (account, rate))
+            conn.commit()
+    finally:
+        conn.close()
+    return _response(200, {'account': account, 'rate': rate})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
