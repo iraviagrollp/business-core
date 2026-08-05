@@ -121,6 +121,7 @@ def lambda_handler(event, context):
             params.get('account', ''),
             params.get('from_date', ''),
             params.get('to_date', ''),
+            _parse_bool_param(params.get('include_interest')),
         )
     if path == '/supplier-ledger/range':
         return _handle_supplier_ledger_range()
@@ -212,6 +213,7 @@ def lambda_handler(event, context):
             params.get('account', ''),
             params.get('from_date', ''),
             params.get('to_date', ''),
+            _parse_bool_param(params.get('include_interest')),
         )
     if path == '/stocks/expiry/pdf':
         params = event.get('queryStringParameters') or {}
@@ -603,23 +605,49 @@ def _handle_borrowings_meta():
     return _response(200, payload)
 
 
-def _handle_borrowings_data(account: str, from_date: str, to_date: str):
-    """GET /borrowings?account=&from_date=&to_date= — borrowings rows in a date
-    range, optionally filtered to one account. `account` is optional (empty/
-    absent = all accounts), mirroring the optional-branch pattern used by
-    _handle_purchases_summary.
+def _handle_borrowings_data(account: str, from_date: str, to_date: str, include_interest: bool = False):
+    """GET /borrowings?account=&from_date=&to_date=&include_interest= —
+    borrowings rows in a date range, optionally filtered to one account.
+    `account` is optional (empty/absent = all accounts), mirroring the
+    optional-branch pattern used by _handle_purchases_summary.
 
-    Delegates the SQL/row-building to borrowings.compute_borrowings_rows()
-    (added 2026-08-05, shared with GET /borrowings/pdf so the PDF export can
-    never disagree with this JSON endpoint) — cache-aside + _response
-    wrapping stay here, mirroring how _handle_ledger_statement delegates to
-    ledger_statement.compute_ledger_statement.
+    include_interest OFF (default): UNCHANGED from 2026-08-05 — delegates to
+    borrowings.compute_borrowings_rows() (shared with GET /borrowings/pdf's
+    OFF case), returns a bare JSON array, same cache key/TTL as before —
+    byte-identical to the pre-interest response.
+
+    include_interest ON (added 2026-08-06): delegates to the SAME
+    borrowings.compute_borrowings_interest() function GET /borrowings/pdf
+    uses when include_interest is ON, so the screen and the PDF can never
+    disagree. Returns a JSON OBJECT {rows, missing_rate_accounts} — a
+    deliberately different shape from the bare-array OFF case (see the
+    module/task docs: the object shape was chosen, ON-variant only, so the
+    UI can warn about accounts with no configured rate). Uses a SEPARATE
+    Redis cache key/namespace (":interest:") so the two variants never
+    collide; same TTL.
     """
     account = (account or '').strip()
     if not from_date or not to_date:
         return _response(400, {'error': 'from_date and to_date are required'})
 
-    cache_key = f'iravi:borrowings:data:{account or "all"}:{from_date}:{to_date}'
+    if not include_interest:
+        cache_key = f'iravi:borrowings:data:{account or "all"}:{from_date}:{to_date}'
+        r = _get_redis()
+        cached = r.get(cache_key)
+        if cached:
+            return _response(200, json.loads(cached))
+
+        conn = _get_db_conn()
+        try:
+            rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
+        finally:
+            conn.close()
+
+        r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
+        logger.info('Borrowings data cached: key=%s rows=%d', cache_key, len(rows))
+        return _response(200, rows)
+
+    cache_key = f'iravi:borrowings:data:interest:{account or "all"}:{from_date}:{to_date}'
     r = _get_redis()
     cached = r.get(cache_key)
     if cached:
@@ -627,25 +655,32 @@ def _handle_borrowings_data(account: str, from_date: str, to_date: str):
 
     conn = _get_db_conn()
     try:
-        rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
+        payload = _brw.compute_borrowings_interest(conn, account, from_date, to_date)
     finally:
         conn.close()
 
-    r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
-    logger.info('Borrowings data cached: key=%s rows=%d', cache_key, len(rows))
-    return _response(200, rows)
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Borrowings (with interest) cached: key=%s rows=%d', cache_key, len(payload['rows']))
+    return _response(200, payload)
 
 
-def _handle_borrowings_pdf(account: str, from_date: str, to_date: str):
-    """GET /borrowings/pdf?account=&from_date=&to_date=
+def _handle_borrowings_pdf(account: str, from_date: str, to_date: str, include_interest: bool = False):
+    """GET /borrowings/pdf?account=&from_date=&to_date=&include_interest=
 
     Same required-param validation as _handle_borrowings_data (`account` is
     OPTIONAL — empty/absent = all accounts); computes fresh (no Redis
-    caching, matching every other PDF export route in this Lambda) via the
-    SAME borrowings.compute_borrowings_rows() helper GET /borrowings itself
-    calls, so the PDF can never disagree with the on-screen table, then
-    renders via borrowings_pdf.render_borrowings_pdf. Local import so a
-    reportlab issue can never break the JSON routes.
+    caching, matching every other PDF export route in this Lambda).
+
+    include_interest OFF: SAME borrowings.compute_borrowings_rows() helper
+    GET /borrowings itself calls (OFF case), rendered via
+    borrowings_pdf.render_borrowings_pdf — unchanged from 2026-08-05.
+
+    include_interest ON: SAME borrowings.compute_borrowings_interest()
+    function GET /borrowings itself calls (ON case) — the screen and the PDF
+    can never disagree — rendered via
+    borrowings_pdf.render_borrowings_interest_pdf.
+
+    Local import so a reportlab issue can never break the JSON routes.
     """
     account = (account or '').strip()
     if not from_date or not to_date:
@@ -653,12 +688,20 @@ def _handle_borrowings_pdf(account: str, from_date: str, to_date: str):
 
     conn = _get_db_conn()
     try:
-        rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
+        if include_interest:
+            payload = _brw.compute_borrowings_interest(conn, account, from_date, to_date)
+        else:
+            rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
     finally:
         conn.close()
 
     import borrowings_pdf
-    pdf_bytes = borrowings_pdf.render_borrowings_pdf(rows, account, from_date, to_date)
+    if include_interest:
+        pdf_bytes = borrowings_pdf.render_borrowings_interest_pdf(
+            payload['rows'], payload['missing_rate_accounts'], account, from_date, to_date,
+        )
+    else:
+        pdf_bytes = borrowings_pdf.render_borrowings_pdf(rows, account, from_date, to_date)
     filename = (
         f'borrowings_{_safe_filename_part(account) or "all"}_'
         f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
@@ -3347,3 +3390,9 @@ def _pdf_response(pdf_bytes: bytes, filename: str) -> dict:
 def _safe_filename_part(value: str) -> str:
     """Sanitize a query-param value for use inside a Content-Disposition filename."""
     return re.sub(r'[^A-Za-z0-9._-]+', '_', value or '')
+
+
+def _parse_bool_param(value) -> bool:
+    """Truthy query-param parsing ('1'/'true', case-insensitive) — default OFF
+    for any other value (absent, '', '0', 'false', ...)."""
+    return str(value or '').strip().lower() in ('1', 'true')

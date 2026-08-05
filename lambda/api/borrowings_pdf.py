@@ -83,6 +83,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
+    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -154,6 +155,19 @@ def _parse_iso_date(iso_date: str) -> _date:
 
 def _fmt_ddmmyyyy(d: _date) -> str:
     return d.strftime('%d-%m-%Y')
+
+
+def _fy_start_year(d: _date) -> int:
+    """Indian FY (1 April - 31 March) start year containing date `d`."""
+    return d.year if d.month >= 4 else d.year - 1
+
+
+def _fy_bounds(start_year: int) -> tuple:
+    return _date(start_year, 4, 1), _date(start_year + 1, 3, 31)
+
+
+def _fy_label(start_year: int) -> str:
+    return f'FY {start_year}-{str(start_year + 1)[-2:]}'
 
 
 # ── paragraph style factory ───────────────────────────────────────────────────
@@ -322,6 +336,314 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
     brw_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
     brw_table.setStyle(TableStyle(tbl_cmds))
     elements.append(brw_table)
+
+    # ── Build PDF with the letterhead header AND footer repeating on every page ─
+    doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
+    return buffer.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# render_borrowings_interest_pdf — include_interest=ON report (added 2026-08-06)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# rows : list[dict] returned by borrowings.compute_borrowings_interest()['rows']
+#        — the SAME data GET /borrowings?include_interest=1 returns; this
+#        renderer never queries the DB or recomputes anything itself, so the
+#        screen and this PDF can never disagree (per the task's hard
+#        requirement).
+#
+# Design
+# ------
+# - Gains an Interest column (per the task spec) on top of every column the
+#   plain (interest-OFF) report has.
+# - Sectioned into FINANCIAL-YEAR blocks, reusing ledger_statement_pdf.py's
+#   per-FY KeepTogether-wrapped-table approach (heading + repeatRows=1
+#   table), adapted here since compute_borrowings_interest() already
+#   provides each row's real running `balance` directly (single-account
+#   mode) — no separate running-balance recomputation is needed in this
+#   renderer, unlike ledger_statement_pdf.py.
+# - After each FY block: three summary lines — Total Principal Amount (that
+#   FY's closing principal — i.e. the LAST row's `balance` in the block),
+#   Total Interest Amount (sum of that FY's interest-row `interest` values),
+#   Total Amount (= principal + interest). This is exactly the figure the
+#   compute engine itself capitalizes into the next FY's opening balance
+#   (borrowings.compute_interest_segments, step 6 of the task spec) — so the
+#   "Brought Forward" row that opens the NEXT FY block is this same Total
+#   Amount, self-consistent with the underlying data (no re-derivation of
+#   the engine's internal capitalization math is needed here).
+# - single-account mode (an `account` was given): the 7th column is a real
+#   running Balance, and the 3-line FY summary/Brought-Forward mechanism
+#   above applies exactly as the task describes.
+# - "all accounts" mode (`account` blank): `compute_borrowings_interest`
+#   deliberately returns `balance: null` on every row once accounts are
+#   mixed (a running/closing PRINCIPAL is not a meaningful single number
+#   across different accounts — see that function's docstring). The task's
+#   "Total Principal Amount" / "Total Amount" / "Brought Forward" concept is
+#   inherently a PER-ACCOUNT capitalization figure, so it has no well-defined
+#   analogue when accounts are merged; rather than fabricate a misleading
+#   number, this mode still sections by FY (per the task's literal ask) but
+#   the 7th column is Account (not Balance) and the per-FY summary is
+#   reduced to Total Debit / Total Credit / Total Interest only — no
+#   Brought-Forward row. This is a deliberate, documented interpretation
+#   (flagged in the task write-up) rather than an oversight.
+# - Zero-row case: same graceful 'No records for the selected period.'
+#   message as the plain report.
+
+
+def render_borrowings_interest_pdf(
+    rows: list, missing_rate_accounts: list, account: str, from_date: str, to_date: str,
+) -> bytes:
+    """Render the Borrowings Statement WITH interest as a portrait A4 PDF.
+
+    Parameters
+    ----------
+    rows : list[dict] returned by borrowings.compute_borrowings_interest()['rows']
+    missing_rate_accounts : list[str] returned by the same call — accounts in
+        scope with no configured borrowing_rate row (0% was used for them);
+        surfaced as a one-line note under the subtitle when non-empty (an
+        additive, non-spec-mandated touch for auditability — the JSON
+        contract for warning the UI is the `missing_rate_accounts` field
+        itself, per the task; this PDF note is just a courtesy mirror of it).
+    account : '' / None for "all accounts", else the single account name
+    from_date, to_date : 'YYYY-MM-DD' strings
+
+    Returns
+    -------
+    bytes : raw PDF content
+    """
+    account = (account or '').strip()
+    single_account = bool(account)
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=_MARGIN,
+        rightMargin=_MARGIN,
+        topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
+        bottomMargin=1.4 * cm,
+        title='IAL Borrowings Statement (with Interest)',
+        author='IRAVI AGRO LIFE LLP',
+    )
+
+    _W = colors.white
+    _BASE, _BOLD = letterhead.BASE_FONT, letterhead.BOLD_FONT
+
+    title_sty    = _ps('BRWITitle', _BOLD, 13, TA_CENTER, color=letterhead.GREEN)
+    subtitle_sty = _ps('BRWISubtitle', _BOLD, 9, TA_CENTER, color=letterhead.BODY)
+    note_sty     = _ps('BRWINote', _BASE, 7.5, TA_CENTER, color=letterhead.MUTED)
+    empty_sty    = _ps('BRWIEmpty', _BASE, 9.5, TA_CENTER, color=letterhead.MUTED)
+    fy_head_sty  = _ps('BRWIFyHead', _BOLD, 10, TA_LEFT, color=letterhead.GREEN)
+    summary_sty  = _ps('BRWISummary', _BASE, 8.5, TA_LEFT, color=letterhead.BODY)
+    summary_b_sty = _ps('BRWISummaryB', _BOLD, 8.5, TA_LEFT, color=letterhead.BODY)
+
+    hdr_l = _ps('BRWIHdrL', _BOLD, 7.5, TA_LEFT,  color=_W)
+    hdr_r = _ps('BRWIHdrR', _BOLD, 7.5, TA_RIGHT, color=_W)
+
+    dat_l = _ps('BRWIDatL', _BASE, 7.5, TA_LEFT)
+    dat_r = _ps('BRWIDatR', _BASE, 7.5, TA_RIGHT)
+    dat_i = _ps('BRWIDatI', _BASE, 7.5, TA_LEFT, color=letterhead.GREEN2)  # interest-row emphasis
+
+    open_l = _ps('BRWIOpenL', _BOLD, 7.5, TA_LEFT)
+    open_r = _ps('BRWIOpenR', _BOLD, 7.5, TA_RIGHT)
+
+    elements: list = [
+        Paragraph('BORROWINGS STATEMENT (WITH INTEREST)', title_sty),
+        Spacer(1, 5),
+    ]
+
+    period_text = f'Period: {_fmt_date(from_date)} to {_fmt_date(to_date)}'
+    account_text = f'Account: {account}' if single_account else 'Account: All accounts'
+    elements.append(Paragraph(f'{period_text}  |  {account_text}', subtitle_sty))
+
+    if missing_rate_accounts:
+        note_text = (
+            'Rate not configured (0% used): ' + ', '.join(missing_rate_accounts)
+        )
+        elements.append(Spacer(1, 3))
+        elements.append(Paragraph(note_text, note_sty))
+
+    elements.append(Spacer(1, 10))
+
+    if not rows:
+        elements.append(Paragraph('No records for the selected period.', empty_sty))
+        doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
+        return buffer.getvalue()
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    if single_account:
+        date_w, voucher_w, name_w = 55.0, 72.0, 108.0
+        remaining = _CONTENT_W - (date_w + voucher_w + name_w)
+        amt_w = remaining / 4
+        col_widths = [date_w, voucher_w, name_w, amt_w, amt_w, amt_w, amt_w]
+        seventh_header = f'Balance ({_RS})'
+    else:
+        date_w, voucher_w, name_w, acct_w = 50.0, 62.0, 92.0, 95.0
+        remaining = _CONTENT_W - (date_w + voucher_w + name_w + acct_w)
+        amt_w = remaining / 3
+        col_widths = [date_w, voucher_w, name_w, acct_w, amt_w, amt_w, amt_w]
+        seventh_header = None  # 4th column is Account, not a trailing 7th
+
+    def _header_row():
+        if single_account:
+            return [
+                Paragraph('Date', hdr_l),
+                Paragraph('Voucher No', hdr_l),
+                Paragraph('Transaction Name', hdr_l),
+                Paragraph(f'Debit ({_RS})', hdr_r),
+                Paragraph(f'Credit ({_RS})', hdr_r),
+                Paragraph(f'Interest ({_RS})', hdr_r),
+                Paragraph(seventh_header, hdr_r),
+            ]
+        return [
+            Paragraph('Date', hdr_l),
+            Paragraph('Voucher No', hdr_l),
+            Paragraph('Transaction Name', hdr_l),
+            Paragraph('Account', hdr_l),
+            Paragraph(f'Debit ({_RS})', hdr_r),
+            Paragraph(f'Credit ({_RS})', hdr_r),
+            Paragraph(f'Interest ({_RS})', hdr_r),
+        ]
+
+    def _row_cells(row):
+        name_sty = dat_i if row['row_type'] == 'interest' else dat_l
+        name_text = row['transaction_name'] or ('Opening balance' if row['row_type'] == 'opening' else '-')
+        if single_account:
+            bal_text = _bal(row['balance']) if row['balance'] is not None else '-'
+            return [
+                Paragraph(_fmt_date(row['transaction_date']), dat_l),
+                Paragraph(row['voucher_no'] or '-', dat_l),
+                Paragraph(name_text, name_sty),
+                Paragraph(_amt(row['debit']), dat_r),
+                Paragraph(_amt(row['credit']), dat_r),
+                Paragraph(_fmt_inr(row['interest']) if row['interest'] else '-', dat_r),
+                Paragraph(bal_text, dat_r),
+            ]
+        return [
+            Paragraph(_fmt_date(row['transaction_date']), dat_l),
+            Paragraph(row['voucher_no'] or '-', dat_l),
+            Paragraph(name_text, name_sty),
+            Paragraph(row['account'] or '-', dat_l),
+            Paragraph(_amt(row['debit']), dat_r),
+            Paragraph(_amt(row['credit']), dat_r),
+            Paragraph(_fmt_inr(row['interest']) if row['interest'] else '-', dat_r),
+        ]
+
+    # ── Group rows by financial year (ascending) ──────────────────────────────
+    fy_groups: dict = {}
+    for row in rows:
+        fy_start = _fy_start_year(_parse_iso_date(row['transaction_date']))
+        fy_groups.setdefault(fy_start, []).append(row)
+    fy_start_years = sorted(fy_groups.keys())
+
+    brought_forward = None  # single-account mode only
+
+    for fy_idx, fy_start in enumerate(fy_start_years):
+        fy_rows = fy_groups[fy_start]
+        fy_start_date, fy_end_date = _fy_bounds(fy_start)
+
+        table_rows: list = [_header_row()]
+
+        if single_account and fy_idx > 0 and brought_forward is not None:
+            bf_cells = [
+                Paragraph('', open_l), Paragraph('', open_l),
+                Paragraph('Brought Forward', open_l),
+                Paragraph('-', open_r), Paragraph('-', open_r), Paragraph('-', open_r),
+                Paragraph(_bal(brought_forward), open_r),
+            ]
+            table_rows.append(bf_cells)
+
+        opening_row_idx = len(table_rows) - 1 if len(table_rows) > 1 else None
+
+        for row in fy_rows:
+            if row['row_type'] == 'opening' and single_account:
+                # Style the opening row like a Brought-Forward row (bold).
+                cells = [
+                    Paragraph('', open_l), Paragraph('', open_l),
+                    Paragraph('Opening Balance', open_l),
+                    Paragraph('-', open_r), Paragraph('-', open_r), Paragraph('-', open_r),
+                    Paragraph(_bal(row['balance']) if row['balance'] is not None else '-', open_r),
+                ]
+                table_rows.append(cells)
+                if opening_row_idx is None:
+                    opening_row_idx = len(table_rows) - 1
+            else:
+                table_rows.append(_row_cells(row))
+
+        fy_total_debit = sum(r['debit'] for r in fy_rows if r['row_type'] == 'transaction')
+        fy_total_credit = sum(r['credit'] for r in fy_rows if r['row_type'] == 'transaction')
+        fy_total_interest = round(
+            sum(r['interest'] for r in fy_rows if r['row_type'] == 'interest'), 2,
+        )
+
+        tbl_cmds: list = [
+            ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
+            ('FONTSIZE',      (0, 0), (-1, -1), 7.5),
+            ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+            ('TOPPADDING',    (0, 0), (-1, -1), 2.5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 3),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
+            ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        if opening_row_idx is not None:
+            tbl_cmds.append(('BACKGROUND', (0, opening_row_idx), (-1, opening_row_idx), _TOTAL_BG))
+            tbl_cmds.append(('SPAN', (0, opening_row_idx), (1, opening_row_idx)))
+        zebra_start = (opening_row_idx + 1) if opening_row_idx is not None else 1
+        for i in range(zebra_start, len(table_rows)):
+            if (i - zebra_start) % 2 == 1:
+                tbl_cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+
+        fy_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
+        fy_table.setStyle(TableStyle(tbl_cmds))
+
+        heading_text = (
+            f'{_fy_label(fy_start)}  '
+            f'({_fmt_ddmmyyyy(fy_start_date)} to {_fmt_ddmmyyyy(fy_end_date)})'
+        )
+
+        fy_section = [Paragraph(heading_text, fy_head_sty), Spacer(1, 3), fy_table, Spacer(1, 4)]
+
+        if single_account:
+            # Closing principal = the last row's balance in this FY block
+            # (interest rows carry the unchanged current principal too, so
+            # this is correct whether the block's last row is a transaction
+            # or an interest line item); falls back to the brought-forward /
+            # opening balance if the block has no rows of its own.
+            balances_in_block = [r['balance'] for r in fy_rows if r.get('balance') is not None]
+            if balances_in_block:
+                fy_closing_principal = balances_in_block[-1]
+            elif fy_idx > 0 and brought_forward is not None:
+                fy_closing_principal = brought_forward
+            else:
+                fy_closing_principal = 0.0
+            fy_total_amount = round(fy_closing_principal + fy_total_interest, 2)
+
+            summary_rows = [
+                [Paragraph('Total Principal Amount', summary_b_sty), Paragraph(_fmt_inr(fy_closing_principal), summary_b_sty)],
+                [Paragraph('Total Interest Amount', summary_sty), Paragraph(_fmt_inr(fy_total_interest), summary_sty)],
+                [Paragraph('Total Amount', summary_b_sty), Paragraph(_fmt_inr(fy_total_amount), summary_b_sty)],
+            ]
+            brought_forward = fy_total_amount  # carried into the next FY block
+        else:
+            summary_rows = [
+                [Paragraph('Total Debit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_debit, 2)), summary_sty)],
+                [Paragraph('Total Credit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_credit, 2)), summary_sty)],
+                [Paragraph('Total Interest Amount', summary_b_sty), Paragraph(_fmt_inr(fy_total_interest), summary_b_sty)],
+            ]
+
+        summary_table = Table(summary_rows, colWidths=[150.0, 150.0])
+        summary_table.setStyle(TableStyle([
+            ('LEFTPADDING',   (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING',  (0, 0), (-1, -1), 4),
+            ('TOPPADDING',    (0, 0), (-1, -1), 1.5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1.5),
+        ]))
+        fy_section.append(summary_table)
+        fy_section.append(Spacer(1, 10))
+
+        elements.append(KeepTogether(fy_section))
 
     # ── Build PDF with the letterhead header AND footer repeating on every page ─
     doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
