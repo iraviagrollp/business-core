@@ -983,6 +983,48 @@ caches under `iravi:borrowings:meta`; `/borrowings` returns the expected row sha
 error shape; a non-empty `account` param produces the expected
 `iravi:borrowings:data:{account}:{from}:{to}` cache key.
 
+**Production bug fix (2026-08-05, same-day, reported via CloudWatch) — `/borrowings/meta`
+returned HTTP 500 on every call:** the initial `_handle_borrowings_meta()` SQL —
+`SELECT DISTINCT account FROM borrowings WHERE out_z IS NULL ORDER BY LOWER(account)` — is
+invalid Postgres: `SELECT DISTINCT` requires every `ORDER BY` expression to appear in the select
+list, and `LOWER(account)` does not (only the bare `account` column does), so Postgres raised
+`InvalidColumnReference: for SELECT DISTINCT, ORDER BY expressions must appear in select list` on
+every invocation — never caught by the local mock-based smoke test above (mocks don't enforce
+real SQL grammar). The pre-smoke-test verification only proved the Lambda's Python-level
+plumbing (routing, response shape, cache-key construction), never that the SQL was valid against
+a real Postgres server — a gap this fix closes by noting it explicitly for future entries.
+Fix: replaced `SELECT DISTINCT account ... ORDER BY LOWER(account)` with
+`SELECT account FROM borrowings WHERE out_z IS NULL GROUP BY account ORDER BY LOWER(account)` —
+`GROUP BY` (unlike `DISTINCT`) permits an `ORDER BY` expression that isn't in the select list, so
+this preserves the required case-insensitive sort (the data mixes ALL-CAPS and TitleCase account
+names, e.g. `LEVAKA VIJAYA LAKSHMI` vs `Kiran Kumar Reddy Levaka`) while being valid SQL. One-line
+diff, only the first query in `_handle_borrowings_meta` changed — the second query (MIN/MAX
+`transaction_date`) and `_handle_borrowings_data`'s query (plain `WHERE`/`ORDER BY`, no
+`DISTINCT`) were already valid and untouched.
+
+**Re-check of every other borrowings SQL statement for the same class of bug (per the
+coordinator's explicit follow-up request):** re-read every `cur.execute(...)` call in both
+`etl_borrowings/handler.py` (`_upsert`'s `UPDATE`/`INSERT`, no `SELECT`/`DISTINCT`/`GROUP BY` at
+all) and `api/handler.py`'s three `FROM borrowings` queries (`_handle_borrowings_meta`'s two
+queries, `_handle_borrowings_data`'s one query) — confirmed the `ORDER BY LOWER(account)` bug
+above was the ONLY instance of this class of error; nothing else uses `DISTINCT` combined with an
+`ORDER BY` expression not in the select list.
+
+**Cache-poisoning check (per the coordinator's explicit follow-up request):** confirmed
+`r.set(cache_key, ...)` in `_handle_borrowings_meta` sits AFTER the `try/finally` block that runs
+the SQL, so when the query raised (the bug above, on every call before this fix), the exception
+propagated straight out of the function — the `payload`/`r.set` lines were never reached, and
+`iravi:borrowings:meta` was never written with a bad/partial value. Verified this empirically (not
+just by code inspection): a scratch script (temp, not committed) stubbed a cursor whose
+`execute()` always raises, confirmed the exception propagates out of
+`_handle_borrowings_meta()`, `redis.set()` was called 0 times, and `conn.close()` was still
+called (the `finally` ran) — i.e. every prior 500 was a raw unhandled exception with no side
+effect on Redis, safe to redeploy without a manual cache-clear. Also re-verified the fixed query
+functionally: a scratch script with a fake cursor simulating real Postgres `GROUP BY`+`ORDER BY
+LOWER(...)` behavior on a 3-name mixed-case fixture returned `['ABC Traders', 'Kiran Kumar Reddy
+Levaka', 'LEVAKA VIJAYA LAKSHMI']` — correct case-insensitive order. `python -m py_compile
+handler.py` clean; `__pycache__` cleaned up after all scratch testing.
+
 **IaC needed:** API Gateway routes `GET /borrowings/meta` + `GET /borrowings` + CORS in
 `lambda_api.tf`. No new Lambda, layer, or DB migration on the API side (same `api` Lambda, same
 `psycopg2-binary`/`redis` already in `requirements.txt`) — depends on migration
