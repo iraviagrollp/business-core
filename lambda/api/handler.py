@@ -17,6 +17,7 @@ import monthly_sales
 import monthly_collection
 import ledger_statement as _ls
 import supplier_ledger_statement as _sls
+import borrowings as _brw
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -202,6 +203,13 @@ def lambda_handler(event, context):
         params = event.get('queryStringParameters') or {}
         return _handle_supplier_ledger_statement_pdf(
             params.get('account_name', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
+    if path == '/borrowings/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_borrowings_pdf(
+            params.get('account', ''),
             params.get('from_date', ''),
             params.get('to_date', ''),
         )
@@ -600,6 +608,12 @@ def _handle_borrowings_data(account: str, from_date: str, to_date: str):
     range, optionally filtered to one account. `account` is optional (empty/
     absent = all accounts), mirroring the optional-branch pattern used by
     _handle_purchases_summary.
+
+    Delegates the SQL/row-building to borrowings.compute_borrowings_rows()
+    (added 2026-08-05, shared with GET /borrowings/pdf so the PDF export can
+    never disagree with this JSON endpoint) — cache-aside + _response
+    wrapping stay here, mirroring how _handle_ledger_statement delegates to
+    ledger_statement.compute_ledger_statement.
     """
     account = (account or '').strip()
     if not from_date or not to_date:
@@ -613,35 +627,43 @@ def _handle_borrowings_data(account: str, from_date: str, to_date: str):
 
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT transaction_date, voucher_no, transaction_name, account, debit, credit
-                FROM borrowings
-                WHERE out_z IS NULL
-                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
-                  AND (%(account)s = '' OR account = %(account)s)
-                ORDER BY transaction_date ASC, voucher_no ASC
-            """, {'from_date': from_date, 'to_date': to_date, 'account': account})
-            col_names = [d[0] for d in cur.description]
-            raw_rows = cur.fetchall()
+        rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
     finally:
         conn.close()
-
-    rows = []
-    for raw in raw_rows:
-        row = dict(zip(col_names, raw))
-        rows.append({
-            'transaction_date': row['transaction_date'].isoformat(),
-            'voucher_no': row['voucher_no'],
-            'transaction_name': row['transaction_name'] or '',
-            'account': row['account'],
-            'debit': float(row['debit']),
-            'credit': float(row['credit']),
-        })
 
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Borrowings data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
+
+
+def _handle_borrowings_pdf(account: str, from_date: str, to_date: str):
+    """GET /borrowings/pdf?account=&from_date=&to_date=
+
+    Same required-param validation as _handle_borrowings_data (`account` is
+    OPTIONAL — empty/absent = all accounts); computes fresh (no Redis
+    caching, matching every other PDF export route in this Lambda) via the
+    SAME borrowings.compute_borrowings_rows() helper GET /borrowings itself
+    calls, so the PDF can never disagree with the on-screen table, then
+    renders via borrowings_pdf.render_borrowings_pdf. Local import so a
+    reportlab issue can never break the JSON routes.
+    """
+    account = (account or '').strip()
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    conn = _get_db_conn()
+    try:
+        rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
+    finally:
+        conn.close()
+
+    import borrowings_pdf
+    pdf_bytes = borrowings_pdf.render_borrowings_pdf(rows, account, from_date, to_date)
+    filename = (
+        f'borrowings_{_safe_filename_part(account) or "all"}_'
+        f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
+    )
+    return _pdf_response(pdf_bytes, filename)
 
 
 def _handle_supplier_ledger_range():
