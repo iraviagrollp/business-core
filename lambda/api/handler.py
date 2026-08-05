@@ -165,6 +165,8 @@ def lambda_handler(event, context):
     if path == '/reports/monthly-collection':
         params = event.get('queryStringParameters') or {}
         return _handle_monthly_collection(params.get('month', ''))
+    if path == '/pdc':
+        return _handle_pdc()
 
     # ── PDF export routes (server-side reportlab; no Redis caching — always
     # computed fresh) ─────────────────────────────────────────────────────────
@@ -197,6 +199,21 @@ def lambda_handler(event, context):
     if path == '/stocks/expiry/pdf':
         params = event.get('queryStringParameters') or {}
         return _handle_stocks_expiry_pdf(params)
+    if path == '/sales/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_sales_pdf(params)
+    if path == '/purchases/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_purchases_pdf(params)
+    if path == '/reports/customer-aging/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_customer_aging_pdf(params)
+    if path == '/reports/supplier-aging/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_supplier_aging_pdf(params)
+    if path == '/pdc/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_pdc_pdf(params)
 
     return _response(404, {'error': 'Not found'})
 
@@ -1543,6 +1560,453 @@ def _handle_supplier_ledger_statement_pdf(account_name: str, from_date: str, to_
         f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
     )
     return _pdf_response(pdf_bytes, filename)
+
+
+def _handle_sales_pdf(params: dict):
+    """GET /sales/pdf?branch=&from_date=&to_date=&type=&customer_filter=&exclude_internal=&search=&period_label=
+
+    Source rows: the same query _handle_sales_list uses (branch + date range
+    on the `sales` table), computed fresh (no Redis caching for PDF exports).
+    The same client-side predicates the UI applies to export the Sales
+    Register are then applied here, IN THIS EXACT ORDER, so the PDF always
+    matches what's on screen:
+      (a) type          — keep rows where sales_return == type (if set)
+      (b) customer_filter — customer_details membership (if 'customer' or
+                             'non-customer')
+      (c) exclude_internal — drop rows where 'iravi' in party.lower()
+      (d) search         — substring match on party OR voucher_no
+    Row order is preserved exactly as returned by the SQL query
+    (purchase_date DESC, voucher_no) — never re-sorted, matching the UI's own
+    export-in-API-order behaviour.
+    """
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+    type_filter = (params.get('type') or '').strip()
+    customer_filter = (params.get('customer_filter') or '').strip().lower()
+    exclude_internal = (params.get('exclude_internal') or '').strip().lower() == 'true'
+    search = (params.get('search') or '').strip()
+    period_label = (params.get('period_label') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT purchase_date, voucher_no, branch, party, product, qty, rate, av, sales_return
+                FROM sales
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+                ORDER BY purchase_date DESC, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+
+        customer_names_lower: set = set()
+        if customer_filter in ('customer', 'non-customer'):
+            with conn.cursor() as cur:
+                cur.execute('SELECT LOWER(customer_name) FROM customer_details WHERE out_z IS NULL')
+                customer_names_lower = {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        party = row['party'] or ''
+        voucher_no = row['voucher_no'] or ''
+        sales_return = row['sales_return']
+
+        if type_filter and sales_return != type_filter:
+            continue
+        if customer_filter == 'customer' and party.lower() not in customer_names_lower:
+            continue
+        if customer_filter == 'non-customer' and party.lower() in customer_names_lower:
+            continue
+        if exclude_internal and 'iravi' in party.lower():
+            continue
+        if search and search.lower() not in party.lower() and search.lower() not in voucher_no.lower():
+            continue
+
+        rows.append({
+            'date': row['purchase_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'party': row['party'],
+            'product': row['product'],
+            'qty': float(row['qty']) if row['qty'] is not None else None,
+            'rate': float(row['rate']) if row['rate'] is not None else None,
+            'amount': float(row['av']) if row['av'] is not None else None,
+            'type_label': 'Return' if sales_return == 'Y' else 'Sale',
+            'branch': row['branch'],
+        })
+
+    total_qty = sum(r['qty'] or 0.0 for r in rows)
+    total_amount = sum(r['amount'] or 0.0 for r in rows)
+
+    period_part = (f'Period: {period_label} ({from_date} to {to_date})' if period_label
+                   else f'Period: {from_date} to {to_date}')
+    meta_lines = [period_part, f'Branch: {branch or "All Branches"}']
+    if type_filter:
+        meta_lines.append(f'Type: {"Returns" if type_filter == "Y" else "Sales"}')
+    if customer_filter in ('customer', 'non-customer'):
+        meta_lines.append(f'Customers: {"Customers Only" if customer_filter == "customer" else "Non-Customers"}')
+    if exclude_internal:
+        meta_lines.append('Exclude Internal: Yes')
+    if search:
+        meta_lines.append(f'Search: {search}')
+
+    payload = {
+        'title': 'Sales Register',
+        'meta_lines': meta_lines,
+        'rows': rows,
+        'totals': {'qty': total_qty, 'amount': total_amount},
+    }
+
+    import sales_register_pdf
+    pdf_bytes = sales_register_pdf.render_sales_register_pdf(payload)
+    filename = f'Sales_Register_{_safe_filename_part(from_date)}_to_{_safe_filename_part(to_date)}.pdf'
+    return _pdf_response(pdf_bytes, filename)
+
+
+def _handle_purchases_pdf(params: dict):
+    """GET /purchases/pdf?branch=&from_date=&to_date=&type=&product_filter=&exclude_internal=&search=&period_label=
+
+    Identical in structure to _handle_sales_pdf EXCEPT: `type` filters the
+    `purchase_return` column (source table `purchases`), and instead of
+    `customer_filter` the param is `product_filter` ('technical' keeps rows
+    where '%' in product; 'non-technical' keeps rows where '%' not in
+    product — the technical-name convention used elsewhere in this codebase,
+    e.g. _handle_purchases_summary's strpos(product, '%') checks). Filter
+    order: (a) type, (b) product_filter, (c) exclude_internal, (d) search.
+    Row order preserved exactly as returned by the SQL query (purchase_date
+    DESC, voucher_no) — never re-sorted.
+    """
+    branch = (params.get('branch') or '').strip()
+    from_date = (params.get('from_date') or '').strip()
+    to_date = (params.get('to_date') or '').strip()
+    type_filter = (params.get('type') or '').strip()
+    product_filter = (params.get('product_filter') or '').strip().lower()
+    exclude_internal = (params.get('exclude_internal') or '').strip().lower() == 'true'
+    search = (params.get('search') or '').strip()
+    period_label = (params.get('period_label') or '').strip()
+
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT purchase_date, voucher_no, branch, party, product, qty, rate, av, purchase_return
+                FROM purchases
+                WHERE out_z IS NULL
+                  AND purchase_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(branch)s = '' OR branch = %(branch)s)
+                ORDER BY purchase_date DESC, voucher_no
+            """, {'from_date': from_date, 'to_date': to_date, 'branch': branch})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        party = row['party'] or ''
+        voucher_no = row['voucher_no'] or ''
+        product = row['product'] or ''
+        purchase_return = row['purchase_return']
+
+        if type_filter and purchase_return != type_filter:
+            continue
+        if product_filter == 'technical' and '%' not in product:
+            continue
+        if product_filter == 'non-technical' and '%' in product:
+            continue
+        if exclude_internal and 'iravi' in party.lower():
+            continue
+        if search and search.lower() not in party.lower() and search.lower() not in voucher_no.lower():
+            continue
+
+        rows.append({
+            'date': row['purchase_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'party': row['party'],
+            'product': row['product'],
+            'qty': float(row['qty']) if row['qty'] is not None else None,
+            'rate': float(row['rate']) if row['rate'] is not None else None,
+            'amount': float(row['av']) if row['av'] is not None else None,
+            'type_label': 'Return' if purchase_return == 'Y' else 'Sale',
+            'branch': row['branch'],
+        })
+
+    total_qty = sum(r['qty'] or 0.0 for r in rows)
+    total_amount = sum(r['amount'] or 0.0 for r in rows)
+
+    period_part = (f'Period: {period_label} ({from_date} to {to_date})' if period_label
+                   else f'Period: {from_date} to {to_date}')
+    meta_lines = [period_part, f'Branch: {branch or "All Branches"}']
+    if type_filter:
+        meta_lines.append(f'Type: {"Returns" if type_filter == "Y" else "Sales"}')
+    if product_filter in ('technical', 'non-technical'):
+        meta_lines.append(f'Products: {"Technical" if product_filter == "technical" else "Non-Technical"}')
+    if exclude_internal:
+        meta_lines.append('Exclude Internal: Yes')
+    if search:
+        meta_lines.append(f'Search: {search}')
+
+    payload = {
+        'title': 'Purchases Register',
+        'meta_lines': meta_lines,
+        'rows': rows,
+        'totals': {'qty': total_qty, 'amount': total_amount},
+    }
+
+    import purchases_register_pdf
+    pdf_bytes = purchases_register_pdf.render_purchases_register_pdf(payload)
+    filename = f'Purchases_Register_{_safe_filename_part(from_date)}_to_{_safe_filename_part(to_date)}.pdf'
+    return _pdf_response(pdf_bytes, filename)
+
+
+def _handle_customer_aging_pdf(params: dict):
+    """GET /reports/customer-aging/pdf?age1=&age2=&age3=&as_of=
+
+    age1/age2/age3 default to 30/60/90 (positive ints; invalid/non-positive
+    values fall back to the default). as_of defaults to today in IST
+    (UTC+5:30) when absent/invalid — NOT UTC, since this Lambda runs in UTC
+    and a naive date.today() would be a day off for part of the day.
+
+    FIFO aging is delegated to aging.compute_aging() (shared with
+    _handle_supplier_aging_pdf) — see that module's docstring for the exact
+    ported algorithm. City is looked up separately from customer_details
+    (case-insensitive match, same convention as customer_balances_fy.py).
+    """
+    from datetime import timedelta as _timedelta
+
+    _IST = timezone(_timedelta(hours=5, minutes=30))
+
+    def _positive_int(raw, default):
+        try:
+            n = int(raw)
+            return n if n > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    age1 = _positive_int(params.get('age1'), 30)
+    age2 = _positive_int(params.get('age2'), 60)
+    age3 = _positive_int(params.get('age3'), 90)
+
+    as_of_raw = (params.get('as_of') or '').strip()
+    try:
+        as_of = datetime.strptime(as_of_raw, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        as_of = datetime.now(_IST).date()
+
+    import aging
+
+    conn = _get_db_conn()
+    try:
+        rows = aging.compute_aging(
+            conn, table='customer_ledger', invoice_category='Db',
+            payment_subcats={'Bank Receipt'}, age1=age1, age2=age2, age3=age3, as_of=as_of,
+        )
+        with conn.cursor() as cur:
+            cur.execute('SELECT UPPER(customer_name), city FROM customer_details WHERE out_z IS NULL')
+            city_map = dict(cur.fetchall())
+    finally:
+        conn.close()
+
+    for row in rows:
+        row['city'] = city_map.get(row['party'].upper())
+
+    payload = {'rows': rows, 'as_of': as_of.isoformat(), 'age1': age1, 'age2': age2, 'age3': age3}
+
+    import customer_aging_pdf
+    pdf_bytes = customer_aging_pdf.render_customer_aging_pdf(payload)
+    return _pdf_response(pdf_bytes, f'Customer_Aging_{as_of.isoformat()}.pdf')
+
+
+def _handle_supplier_aging_pdf(params: dict):
+    """GET /reports/supplier-aging/pdf?age1=&age2=&age3=&as_of=
+
+    Mirror of _handle_customer_aging_pdf on supplier_ledger/supplier_accounts:
+    invoices are 'Cr' rows (what we owe), payments are non-Cr rows, and the
+    last-payment tracker matches sub_category in {'Bank Payment',
+    'Cash Payment'} (a set of two, not the customer side's single
+    'Bank Receipt'). Same age1/age2/age3/as_of defaulting as the customer
+    handler.
+    """
+    from datetime import timedelta as _timedelta
+
+    _IST = timezone(_timedelta(hours=5, minutes=30))
+
+    def _positive_int(raw, default):
+        try:
+            n = int(raw)
+            return n if n > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    age1 = _positive_int(params.get('age1'), 30)
+    age2 = _positive_int(params.get('age2'), 60)
+    age3 = _positive_int(params.get('age3'), 90)
+
+    as_of_raw = (params.get('as_of') or '').strip()
+    try:
+        as_of = datetime.strptime(as_of_raw, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        as_of = datetime.now(_IST).date()
+
+    import aging
+
+    conn = _get_db_conn()
+    try:
+        rows = aging.compute_aging(
+            conn, table='supplier_ledger', invoice_category='Cr',
+            payment_subcats={'Bank Payment', 'Cash Payment'},
+            age1=age1, age2=age2, age3=age3, as_of=as_of,
+        )
+        with conn.cursor() as cur:
+            cur.execute('SELECT UPPER(name), city FROM supplier_accounts WHERE out_z IS NULL')
+            city_map = dict(cur.fetchall())
+    finally:
+        conn.close()
+
+    for row in rows:
+        row['city'] = city_map.get(row['party'].upper())
+
+    payload = {'rows': rows, 'as_of': as_of.isoformat(), 'age1': age1, 'age2': age2, 'age3': age3}
+
+    import supplier_aging_pdf
+    pdf_bytes = supplier_aging_pdf.render_supplier_aging_pdf(payload)
+    return _pdf_response(pdf_bytes, f'Supplier_Aging_{as_of.isoformat()}.pdf')
+
+
+# ── PDC (post-dated cheques) — READ-ONLY mirror of the procurement PDC screen
+# for main-dashboard users. GET only: this Lambda never creates/updates/
+# deletes procurement.pdc rows — that stays exclusively in the
+# procurement_api Lambda. Reuses procurement_api/handler.py's _PDC_SELECT
+# verbatim (same join shape); no Redis cache (low volume, always-fresh
+# finance data).
+_PDC_SELECT = """
+    SELECT p.id, p.po_no, p.po_date, p.supplier_company_id, c.company_name,
+           p.technical_id, t.technical_name, p.brand, p.credit_days, p.qty, p.rate,
+           p.gross, p.gst, p.amount, p.disc, p.adv, p.bal, p.pdc_amt, p.pdc_date,
+           p.created_at, p.updated_at
+    FROM procurement.pdc p
+    LEFT JOIN procurement.supplier_companies c ON c.id = p.supplier_company_id
+    LEFT JOIN procurement.technicals t ON t.id = p.technical_id
+"""
+
+
+def _handle_pdc():
+    """GET /pdc — JSON array of all PDC rows (no filters), ordered
+    po_date DESC NULLS LAST, id DESC (matches procurement_api's own list
+    ordering). Dates as 'YYYY-MM-DD'/ISO-8601 timestamp strings, numerics as
+    floats/None — this handler's own explicit-field serialization (this
+    Lambda's `_response` has no Decimal/date `default=` JSON encoder, unlike
+    procurement_api's `_ser`, so values are converted before json.dumps())."""
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_PDC_SELECT + ' ORDER BY p.po_date DESC NULLS LAST, p.id DESC')
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    from decimal import Decimal as _Decimal
+
+    rows = []
+    for raw in raw_rows:
+        row = {}
+        for name, value in zip(col_names, raw):
+            if isinstance(value, _Decimal):
+                row[name] = float(value)
+            elif hasattr(value, 'isoformat'):
+                row[name] = value.isoformat()
+            else:
+                row[name] = value
+        rows.append(row)
+
+    return _response(200, rows)
+
+
+def _handle_pdc_pdf(params: dict):
+    """GET /pdc/pdf?supplier=&product=&pdc_from=&pdc_to=
+
+    supplier — exact match on company_name; product — exact match on
+    technical_name; pdc_from/pdc_to — inclusive ISO date range on pdc_date.
+    All filters optional and applied server-side. No Redis cache (matches
+    the other report PDF routes' convention). Local import so a reportlab
+    issue can never break /pdc's JSON route.
+    """
+    supplier = (params.get('supplier') or '').strip()
+    product = (params.get('product') or '').strip()
+    pdc_from = (params.get('pdc_from') or '').strip()
+    pdc_to = (params.get('pdc_to') or '').strip()
+
+    query = _PDC_SELECT + ' WHERE 1=1'
+    query_params: list = []
+    if supplier:
+        query += ' AND c.company_name = %s'
+        query_params.append(supplier)
+    if product:
+        query += ' AND t.technical_name = %s'
+        query_params.append(product)
+    if pdc_from:
+        query += ' AND p.pdc_date >= %s'
+        query_params.append(pdc_from)
+    if pdc_to:
+        query += ' AND p.pdc_date <= %s'
+        query_params.append(pdc_to)
+    query += ' ORDER BY p.po_date DESC NULLS LAST, p.id DESC'
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, query_params)
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'po_no': row['po_no'],
+            'po_date': row['po_date'].isoformat() if row['po_date'] else None,
+            'company_name': row['company_name'],
+            'technical_name': row['technical_name'],
+            'brand': row['brand'],
+            'credit_days': row['credit_days'],
+            'qty': float(row['qty']) if row['qty'] is not None else None,
+            'rate': float(row['rate']) if row['rate'] is not None else None,
+            'gross': float(row['gross']) if row['gross'] is not None else None,
+            'gst': float(row['gst']) if row['gst'] is not None else None,
+            'amount': float(row['amount']) if row['amount'] is not None else None,
+            'disc': float(row['disc']) if row['disc'] is not None else None,
+            'adv': float(row['adv']) if row['adv'] is not None else None,
+            'bal': float(row['bal']) if row['bal'] is not None else None,
+            'pdc_amt': float(row['pdc_amt']) if row['pdc_amt'] is not None else None,
+            'pdc_date': row['pdc_date'].isoformat() if row['pdc_date'] else None,
+        })
+
+    payload = {
+        'rows': rows,
+        'supplier': supplier or None,
+        'product': product or None,
+        'pdc_from': pdc_from or None,
+        'pdc_to': pdc_to or None,
+    }
+
+    import issued_pdc_pdf
+    pdf_bytes = issued_pdc_pdf.render_issued_pdc_pdf(payload)
+    return _pdf_response(pdf_bytes, 'Issued_PDC.pdf')
 
 
 def _handle_notify(body_str: str) -> dict:
