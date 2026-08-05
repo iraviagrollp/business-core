@@ -1148,6 +1148,186 @@ dependency `GET /borrowings`/`GET /borrowings/meta` already have.
 
 ---
 
+## api — Borrowings monthly interest accrual, `include_interest` param (added 2026-08-06)
+
+**Status: complete.** Both `GET /borrowings` and `GET /borrowings/pdf` gain an optional query
+param `include_interest` (truthy `1`/`true`, case-insensitive; default OFF). **The calculation
+lives in ONE shared module (`borrowings.py`), used by both routes — the screen and the PDF read
+the exact same computed data and can never disagree**, per the task's hard requirement.
+
+**`include_interest` OFF (unchanged):** both routes are byte-identical to the pre-2026-08-06
+behaviour — `GET /borrowings` still returns a bare JSON array under the same cache key
+(`iravi:borrowings:data:{account}:{from}:{to}`); `GET /borrowings/pdf` still calls
+`borrowings.compute_borrowings_rows()` and `borrowings_pdf.render_borrowings_pdf()` exactly as
+before. Verified by re-reading `_handle_borrowings_data`'s OFF branch post-edit — same cache key,
+same log line, same happy-path code, gated behind `if not include_interest:` with no other change.
+
+**New engine in `borrowings.py`** (extends the existing module — no new file, per the task's
+explicit "put the calculation in a SHARED module" instruction):
+- `compute_borrowing_rate_map(conn, accounts=None) -> dict[account, rate]` — per-account annual
+  rate (percent) from `borrowing_rate` (`out_z IS NULL`). An account absent from the dict has no
+  configured rate — every caller treats that as 0% (never an error; see "missing-rate accounts"
+  below). SQL is parameterised and qualifies every column (`br.account`, `br.rate`) though there's
+  no join yet, per the task's SQL-care instructions.
+- `compute_interest_segments(txn_rows, rate, to_date, from_date=None) -> (segments,
+  monthly_interest, month_last_balance, opening_balance)` — the **low-level, per-EVENT engine**
+  that is the exact algorithm from the task spec (event list incl. synthetic month-boundary
+  "Month-end carry forward" events, terminal boundary at `to_date + 1 day`, 365-day simple
+  interest per segment, FY capitalization at each 31 March). This is the function
+  `test_borrowings_interest.py` exercises directly against the worked reference example — see
+  "Reference test" below. Interest is accumulated at full float precision inside `segments`/
+  `monthly_interest`; rounding to 2dp happens only when building display rows (never inside the
+  per-segment accumulation, per the task's rounding instruction).
+- `compute_borrowings_interest(conn, account, from_date, to_date) -> {'rows': [...],
+  'missing_rate_accounts': [...]}` — the single shared top-level entry point both routes call.
+  Fetches **all** open `borrowings` rows for each in-scope account from its very first transaction
+  through `to_date` (never sliced to `from_date` up front — interest depends on the balance carried
+  in from before the window), runs the engine per account, then slices the resulting row list down
+  to `[from_date, to_date]` at the very end (an "opening" row is prepended when `from_date` is
+  after the account's first transaction, carrying the balance brought forward).
+
+**Row shape (`GET /borrowings?include_interest=1`, per-row):**
+```jsonc
+{ "row_type": "transaction" | "interest" | "opening",
+  "transaction_date": "YYYY-MM-DD", "voucher_no": "JE2526-60", // "" for interest/opening rows
+  "transaction_name": "Journal Entries", // "Interest for May-25" / "Opening balance"
+  "account": "LEVAKA HARANATHA REDDY",
+  "debit": 0.0, "credit": 4845.0,       // 0 on interest/opening rows
+  "balance": 4845.0,                    // running principal after this row; null in multi-account mode
+  "interest": null }                    // the month's total, on interest rows only
+```
+Sort order: `(transaction_date, row-type rank [opening < transaction < interest], voucher_no)`.
+
+**Multiple accounts (`account` param blank):** each in-scope account (same set `GET /borrowings`
+without interest would show — accounts with any row in `[from_date, to_date]`) is computed
+**independently** with its own rate and its own FY capitalization, then merged: transaction/opening
+rows are interleaved by date with **`balance: null` on every row** (a running balance is
+meaningless once different accounts' rows are mixed together — the task's explicit instruction),
+and interest is combined into **ONE line per month**, summing every in-scope account's interest for
+that month (`account: ''`, since there's no single account to attribute a combined figure to).
+
+**Missing-rate accounts — response shape decision:** the task offered either an `X-Missing-Rate-
+Accounts` response header or changing the ON-variant to an object `{rows,
+missing_rate_accounts}`. **This implementation chose the object shape**, ON-variant only — the OFF
+variant stays a bare array (unchanged). `missing_rate_accounts` is the sorted list of in-scope
+accounts with no `borrowing_rate` row (0% was used for them, never an error) — a plain top-level
+array field the UI can read directly without parsing a header. **UI must be briefed:** when
+`include_interest=1`, `GET /borrowings` returns `{rows, missing_rate_accounts}` instead of a bare
+array — a breaking shape change for that query-param combination only (the far more common
+`include_interest` OFF case is completely unaffected).
+
+**Redis cache key (ON case):** `iravi:borrowings:data:interest:{account or "all"}:{from_date}:
+{to_date}` — a separate namespace/key from the OFF case's `iravi:borrowings:data:{...}` so the two
+variants can never collide in cache. Same `_LEDGER_TTL` (1 hour).
+
+**Terminal-boundary assumption (stated per the task's explicit request):** a synthetic terminal
+boundary event is appended at `to_date + 1 day` so the final segment (the balance held on `to_date`
+itself) earns exactly one day of interest. Without it the last segment would have 0 days and accrue
+no interest at all, which would silently under-report interest for the most recent balance — this
+assumption make the reference test's final row (`31-03-2026 JE2526-87`, `days=1`) reproduce
+correctly.
+
+**Reference test — `lambda/api/test_borrowings_interest.py`:** reproduces the task's worked
+example (account LEVAKA HARANATHA REDDY, rate 12% p.a.) via `compute_interest_segments()` directly
+— all 16 given (Date, Voucher, Balance, Days, Interest) rows match to 2dp. **Fixture note:** the
+task's worked example is a "selected rows" excerpt of the real account's full history (this agent's
+sandbox is fenced to `business-core` only and cannot read the real workbook at
+`IaC/helpers/Borrowings.xlsx` — cross-repo access is blocked by the environment's hook; the task
+brief explicitly offers hand-building the fixture as the fallback). The fixture hand-reconstructs a
+full, internally-consistent transaction history by inserting delta=0 "FILLER" transactions at
+exactly the dates each listed row's own `days` value implies (so every gap length matches exactly)
+plus two value-carrying fillers sized so the rows on either side of the untouched 09-06-2025 →
+04-03-2026 span land on their exact reference balances — every one of the 16 reference figures
+matches to 2dp, which is strong evidence the event ordering / month-boundary insertion / 365-day
+simple-interest / terminal-boundary logic is correct. A second, independent synthetic fixture
+(not tied to the task's reference figures) verifies FY capitalization specifically (the reference
+account never crosses an FY boundary): a flat 100,000 balance held for exactly 365 days at 10% p.a.
+accrues exactly 10,000.00 interest for FY 2025-26, the balance never changes mid-year (no
+compounding within the year), and FY 2026-27 opens on 110,000.00 (closing principal + that FY's
+total interest) — matches step 6 of the task spec exactly. A fourth block exercises
+`compute_borrowings_interest()` end-to-end via a stub DB connection (missing-rate surfacing,
+multi-account `balance: null` merge, single-account real balance).
+
+**Real-data test added 2026-08-06 (block 5 in the same file):** once an agent with IaC access
+extracted the account's REAL 60-row transaction history from `IaC/helpers/Borrowings.xlsx`, it was
+added as a SECOND, separate test block — the reference figures in block 1 above are proven correct
+against the task's worked example and were deliberately left untouched (the coordinator confirmed
+the real file does NOT match the reference table: the reference omitted real transactions, e.g.
+`2025-05-07 JE2526-120`/`2025-05-08 JE2526-121`, and had a few amounts transcribed differently —
+`JE2526-79`, `JE2526-36`, `JE2526-84`). Block 5 asserts properties that must hold on ANY real data
+(not specific hardcoded figures): the engine completes without error on all 60 rows; exactly one
+interest line item per calendar month across the full range (17 months, April 2025 through August
+2026), each dated month-end or the window-end for the truncated final month; interest line items
+never alter `balance` (verified by reconstructing the balance carried across every non-FY-boundary
+month transition and confirming it's untouched by the interest computed that month); the principal
+balance at 2026-03-31 (before FY capitalization) equals total credit minus total debit for every
+row up to that date, computed independently in the test from the raw row data; the FY 2026-27
+opening balance equals FY 2025-26's closing principal plus FY 2025-26's total interest (this
+account genuinely crosses an FY boundary — the reference fixture never did, so this is the first
+test to exercise capitalization on non-synthetic data); and total interest reported equals the sum
+of the monthly line items. All 14 new assertions pass alongside the original 61 (**75/75 total**).
+The test also prints a full readable report (every monthly interest line, the FY 2025-26 summary —
+Total Principal Amount ₹51,63,075.00, Total Interest Amount ₹4,14,419.20, Total Amount
+₹55,77,494.20 — the brought-forward figure into FY 2026-27, the FY 2026-27 monthly lines/summary,
+and the grand total interest ₹6,47,037.62 through the window end 2026-08-05) — see the task
+response for the verbatim output.
+
+**`GET /borrowings/pdf?include_interest=1`** — new renderer `render_borrowings_interest_pdf(rows,
+missing_rate_accounts, account, from_date, to_date)` in `borrowings_pdf.py`, called by
+`_handle_borrowings_pdf` with the SAME `borrowings.compute_borrowings_interest()` result
+`GET /borrowings?include_interest=1` itself returns (fresh DB connection, no cache, matching every
+other PDF route) — the screen and the PDF literally render the same computed rows, never
+independently recomputed.
+- Gains an **Interest** column on top of the OFF-mode report's columns.
+- **Sectioned into financial-year blocks** — reuses `ledger_statement_pdf.py`'s per-FY
+  `KeepTogether`-wrapped-table sectioning approach and styling (FY heading, `repeatRows=1` green
+  header, zebra rows), adapted since `compute_borrowings_interest()` already provides each row's
+  real running `balance` directly in single-account mode (no separate running-balance
+  recomputation needed here, unlike `ledger_statement_pdf.py`).
+- **After each FY block (single-account mode):** three summary lines — **Total Principal Amount**
+  (that FY's closing principal, i.e. the last row's `balance` in the block), **Total Interest
+  Amount** (sum of that FY's interest-row `interest` values), **Total Amount** (= principal +
+  interest). This is exactly the figure `compute_interest_segments()` itself capitalizes into the
+  next FY's opening balance (step 6) — so the **Brought Forward** row opening the next FY block is
+  this same Total Amount, self-consistent with the underlying row data without re-deriving the
+  engine's internal capitalization math in the renderer.
+- **"All accounts" mode (`account` blank):** since `balance` is `null` on every row in this mode
+  (see above), "Total Principal Amount"/"Total Amount"/"Brought Forward" have no well-defined
+  per-account-capitalization meaning once accounts are merged — **documented interpretation,
+  not an oversight:** this mode still sections by FY (per the task's literal ask) with a 7th
+  column of **Account** (not Balance) and a reduced per-FY summary of Total Debit / Total Credit /
+  Total Interest only, no Brought-Forward row.
+- **Missing-rate note (additive, not spec-mandated):** when `missing_rate_accounts` is non-empty, a
+  small centered note under the subtitle reads `"Rate not configured (0% used): <names>"` — a
+  courtesy PDF mirror of the JSON field, for auditability.
+- Empty-result case: same graceful `'No records for the selected period.'` message as the OFF-mode
+  report.
+- **Verified 2026-08-06:** `python -m py_compile handler.py borrowings.py borrowings_pdf.py`
+  clean. Smoke-tested with real `reportlab` + `pypdf`: single-account 2-FY dataset (via the actual
+  engine, 10% p.a., 100,000 held across an FY boundary) — confirmed `FY 2025-26`, `FY 2026-27`,
+  `Brought Forward`, `Total Principal Amount`, `Total Interest Amount`, `Total Amount` all present
+  in the extracted text (1 page); multi-account 3-row dataset — confirmed `Account: All accounts`,
+  `Rate not configured`, `Total Debit Amount`, `Total Credit Amount`, `Total Interest Amount`
+  present; empty-rows case renders the "No records" message; the OFF-mode PDF (`render_borrowings
+  _pdf` with 0 rows) still renders unchanged after these additions. `__pycache__` and scratch PDFs
+  cleaned up after testing.
+
+**No IaC/Terraform change needed** — `include_interest` is a query param on the two EXISTING routes
+(`GET /borrowings`, `GET /borrowings/pdf`); no new route, no new Lambda, no new dependency (same
+`reportlab==4.2.2` already in `requirements.txt`). Depends on the `borrowing_rate` table
+(migration `054`, see the `GET`/`POST /config/borrowing-rates` entry above) being applied — an
+account with no `borrowing_rate` row is handled gracefully (0%, listed in
+`missing_rate_accounts`), so this route works even before that migration lands, it just treats
+every account as 0% until rates are configured.
+
+**UI needed (not done here — out of business-core scope):** an "Include Interest" toggle on the
+Borrowings screen; when ON, render the Interest column and the `interest`/`row_type` fields, warn
+on any `missing_rate_accounts`, and be aware `GET /borrowings?include_interest=1` returns
+`{rows, missing_rate_accounts}` (object) rather than a bare array — a shape change scoped to that
+query-param combination only.
+
+---
+
 ## etl_appendix_b_x11_purchase — Purchase Ledger Processing
 
 **Status: complete**
@@ -2124,6 +2304,32 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **Borrowings monthly interest accrual — `include_interest` param on `GET /borrowings` and
+  `GET /borrowings/pdf` (added 2026-08-06):** see the full "api — Borrowings monthly interest
+  accrual, `include_interest` param" section above for complete detail. New engine functions in
+  `lambda/api/borrowings.py` (`compute_borrowing_rate_map`, `compute_interest_segments` — the
+  low-level per-event engine, `compute_borrowings_interest` — the shared top-level entry point used
+  by BOTH routes so the screen and the PDF can never disagree); new renderer
+  `render_borrowings_interest_pdf` in `lambda/api/borrowings_pdf.py` (FY-sectioned, Interest
+  column, Total Principal/Interest/Total Amount + Brought Forward per FY, reusing
+  `ledger_statement_pdf.py`'s sectioning approach); `include_interest` OFF is byte-identical to the
+  pre-2026-08-06 behaviour on both routes (verified). New test
+  `lambda/api/test_borrowings_interest.py` reproduces the task's worked reference example (account
+  LEVAKA HARANATHA REDDY, 12% p.a.) to 2dp for all 16 given rows, plus an independent FY-
+  capitalization check and an end-to-end multi-account/missing-rate check — 61/61 assertions pass.
+  **Added 2026-08-06:** a second, separate test block runs the SAME engine against the account's
+  REAL 60-row transaction history (extracted from `IaC/helpers/Borrowings.xlsx`) — see the "api —
+  Borrowings monthly interest accrual" section above for full detail; the reference block was
+  deliberately left unchanged since the real data does not match the reference table (which
+  omitted some real transactions and had a few amounts transcribed differently) — **75/75
+  assertions pass** in total.
+  Missing-rate accounts: `include_interest=1` changes `GET /borrowings`'s response shape from a
+  bare array to `{rows, missing_rate_accounts}` (object shape chosen per the task's own offered
+  alternative — OFF variant stays a bare array). No IaC/Terraform change needed (query param on
+  existing routes). **UI needed (not done here):** an "Include Interest" toggle + awareness of the
+  `include_interest=1` response-shape change — out of business-core scope, main `ui` repo
+  untouched.
+
 - [x] **`GET`/`POST /config/borrowing-rates` — admin-only config API for per-account borrowing
   interest rates (added 2026-08-05):** new `_route_config()` branch in `lambda/api/handler.py`
   (`/config/borrowing-rates`), mirroring `_handle_config_monthly_targets_get/_post` exactly —
@@ -2997,8 +3203,12 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   Lambda/these routes return real data.
 - [ ] **UI slice for Borrowings** — needs a client method + page + RBAC screen key + a "Download
   PDF" button wired to `GET /borrowings/pdf?account=&from_date=&to_date=` (same params as
-  `GET /borrowings`) once the IaC routes above exist (out of this task's scope — main `ui` repo
-  untouched).
+  `GET /borrowings`) once the IaC routes above exist, PLUS (added 2026-08-06) an "Include Interest"
+  toggle appending `include_interest=1` to both routes, an Interest column, and handling
+  `GET /borrowings?include_interest=1`'s different response shape (`{rows,
+  missing_rate_accounts}` object instead of a bare array) — see the "api — Borrowings monthly
+  interest accrual" section above for the full contract. Out of this task's scope — main `ui` repo
+  untouched.
 - [ ] **IaC: API Gateway routes for the 6 new PDF/JSON exports (2026-08-05)** — `GET /sales/pdf`,
   `GET /purchases/pdf`, `GET /reports/customer-aging/pdf`, `GET /reports/supplier-aging/pdf`,
   `GET /pdc`, `GET /pdc/pdf` + CORS in `lambda_api.tf` (exact query params listed in the "api —
