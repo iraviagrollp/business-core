@@ -573,8 +573,8 @@ def _handle_borrowings_meta():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT DISTINCT account FROM borrowings
-                WHERE out_z IS NULL ORDER BY LOWER(account)
+                SELECT account FROM borrowings
+                WHERE out_z IS NULL GROUP BY account ORDER BY LOWER(account)
             """)
             accounts = [row[0] for row in cur.fetchall()]
 
