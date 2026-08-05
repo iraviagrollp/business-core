@@ -67,6 +67,9 @@ business-core/
     ├── etl_supplier_ledger/  ← ETL: parse Ledger All Accounts xlsx (supplier rows) → RDS supplier_ledger [COMPLETE]
     │   ├── handler.py        ← EventBridge-triggered; read-only on S3; fallback to processed/raw/ if raw gone
     │   └── requirements.txt
+    ├── etl_borrowings/       ← ETL: parse Borrowings xlsx (dual xlsx/CSV) → RDS borrowings [COMPLETE, added 2026-08-05]
+    │   ├── handler.py
+    │   └── requirements.txt
     ├── whatsapp_notifier/    ← S3 trigger on notifications/pending/ → phase 1 moves to notifications/processed/ → phase 2 sends WhatsApp [PHASE 1 COMPLETE]
     │   └── handler.py
     ├── redis_updater/        ← Cache: RDS → ElastiCache Redis (stocks + ledger range done)
@@ -365,6 +368,7 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 | etl_appendix_b_x11_sale_return | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_supplier_accounts | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | etl_supplier_ledger | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
+| etl_borrowings | Python 3.12 | openpyxl, psycopg2-binary, boto3 |
 | redis_updater | Python 3.12 | psycopg2-binary, redis, boto3 |
 | api | Python 3.12 | psycopg2-binary, redis, boto3, reportlab (added 2026-07-20 for PDF exports) |
 | alerts_evaluator | Python 3.12 | psycopg2-binary, reportlab (boto3/ses from runtime) |
@@ -375,11 +379,11 @@ Deploy via the GitHub Actions pipeline (merge to main → apply runs automatical
 
 | Variable | Set by | Used in |
 |---|---|---|
-| `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_supplier_ledger, redis_updater, api |
-| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger, api, whatsapp_notifier |
-| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger (default: `raw/`) |
-| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger (default: `processed/`) |
-| `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger (default: `default`) |
+| `DB_SECRET_ARN` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_supplier_ledger, etl_borrowings, redis_updater, api |
+| `DATA_BUCKET` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger, etl_borrowings, api, whatsapp_notifier |
+| `RAW_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger, etl_borrowings (default: `raw/`) |
+| `PROCESSED_PREFIX` | Terraform | etl_stocks, etl_customer_ledger, etl_customer_accounts, etl_appendix_b_x11, etl_supplier_accounts, etl_supplier_ledger, etl_borrowings (default: `processed/`) |
+| `EVENT_BUS_NAME` | Terraform | etl_stocks, etl_sales, etl_customer_ledger, etl_borrowings (default: `default`) |
 | `REDIS_HOST` | Terraform | redis_updater, api |
 | `JWT_SECRET_ARN` | Terraform | api (RBAC token signing key) |
 | `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` | Terraform | api (first-login admin bootstrap) |
@@ -830,6 +834,163 @@ Partial unique index on (transaction_date, voucher_no, account_name, category, s
 
 ---
 
+## etl_borrowings — Borrowings Ledger Processing (added 2026-08-05)
+
+**Status: complete.**
+
+Source file pattern: filename starts with `Borrowings` and ends `.xlsx` (S3 prefix filter:
+`raw/Borrowings`, `_FILE_PREFIX = 'Borrowings'`); the handler re-checks the full filename exactly
+like the other ETLs (the S3 prefix filter is coarse).
+
+**Dual-format support (format not yet confirmed for production):** the other FUSIL PRO "xlsx"
+exports are actually CSV text (see `etl_customer_ledger`'s 2026-07-22 conversion), but the sample
+file provided (`IaC/helpers/Borrowings.xlsx`) is a REAL binary xlsx. `handler.py` sniffs the first
+4 bytes of the downloaded file: `PK\x03\x04` (zip magic) → real xlsx, parsed via
+`openpyxl.load_workbook(path, read_only=True, data_only=True)` (first worksheet, row 1 = header,
+data from row 2); anything else → CSV, parsed via `csv.DictReader(f, newline='',
+encoding='utf-8-sig')` (same idiom as `etl_customer_ledger`). Both paths normalise into the same
+list of `dict` rows keyed by header name so the downstream logic (`_extract_row`) is shared.
+`openpyxl` stays in `requirements.txt` (needed for the real-xlsx path).
+
+**Case-insensitive header matching:** every row (from either reader) is re-keyed to a
+lowercase-header lookup (`header.strip().lower()`) before extraction, so `ACCOUNT` (all caps, as
+in the sample) and `Date`/`VoucherNo`/`TransactionName`/`Debit`/`Credit` (TitleCase, as in the
+other feeds) both resolve via the same lowercase keys (`'date'`, `'voucherno'`,
+`'transactionname'`, `'account'`, `'debit'`, `'credit'`). The other 22 columns in the 28-column
+file (DDDate, MONTH, QUARTER, UserName, VS, VVN, Currency, Branch, AccountGroup, ContraAccount,
+DebitInCC, CreditInCC, ExchangeRate, Remarks, RefBillNo, RefBillDate, Executive, VoucherType,
+RcptNo, SdcId, MRCNo, InvoiceNo) are ignored.
+
+**Value handling:**
+- `Date` — a real `datetime`/`date` when read via openpyxl, a string when read via CSV; both
+  handled by a `_parse_date()` helper copied from `etl_customer_ledger`'s date parser (formats
+  `%Y-%m-%d`, `%d-%m-%Y`, `%d/%m/%Y`; also treats the literal string `'NULL'` as unparseable).
+- `Debit`/`Credit` — numeric types pass through as-is (openpyxl); string cells go through
+  `_to_amount()`, which strips everything except digits/`.`/`-` (commas, spaces, currency
+  symbols), and treats `''`, `None`, and the literal string `'NULL'` as `0.0`.
+- `VoucherNo`, `TransactionName`, `Account` — go through `_clean_text()`, which strips whitespace
+  and converts the literal string `'NULL'` (any case) to `''`; `TransactionName` stores `None`
+  when blank (nullable column), `VoucherNo`/`Account` blank → row skipped (see below).
+- Rows are skipped (defensive; the sample has no such rows and no footer/total row) when `Date`,
+  `VoucherNo`, or `Account` is missing/empty after cleaning.
+
+**Target table `borrowings`** (IaC migration `052_create_borrowings.sql`):
+```sql
+CREATE TABLE borrowings (
+    id               BIGSERIAL PRIMARY KEY,
+    transaction_date DATE           NOT NULL,
+    voucher_no       TEXT           NOT NULL,
+    transaction_name TEXT,
+    account          TEXT           NOT NULL,
+    debit            NUMERIC(18,2)  NOT NULL DEFAULT 0,
+    credit           NUMERIC(18,2)  NOT NULL DEFAULT 0,
+    in_z             TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    out_z            TIMESTAMPTZ
+);
+```
+
+**Milestoning natural key:** `(transaction_date, voucher_no, account)` — `transaction_date` IS
+part of the key here (unlike the snapshot tables, where date columns are excluded from the
+closing predicate) because it's part of what uniquely identifies a borrowings ledger line.
+`_upsert()` unconditionally closes (`UPDATE ... SET out_z = NOW() WHERE transaction_date = %s AND
+voucher_no = %s AND account = %s AND out_z IS NULL`) then inserts every parsed row — mirrors
+`etl_customer_ledger`'s `_upsert()` exactly (that function has no value-changed check either; it
+always closes+reinserts every parsed row unconditionally, so this Lambda intentionally does the
+same rather than adding new change-detection behaviour that would diverge from the template).
+
+**On success:** archives source to `processed/raw/`, emits `ETLBorrowingsSuccess` EventBridge
+event (same event bus/source as `etl_customer_ledger`'s `ETLCustomerLedgerSuccess` —
+`Source='iravi.etl'`, `EventBusName=os.environ.get('EVENT_BUS_NAME', 'default')`); writes no
+`etl_runs` audit row (`etl_customer_ledger`'s actual `handler.py`, re-read in full before writing
+this Lambda, does **not** write an `etl_runs` row either, despite the task brief's mention of one —
+followed the real template code, not the brief's description of it).
+
+**Verified 2026-08-05:** `python -m py_compile handler.py` clean. Smoke-tested `_parse()` (temp
+scripts in the scratchpad, not committed) against both a synthetic CSV fixture (28-column header,
+one valid row, one `NULL`-date row, one blank-voucher-no row — confirmed the valid row parses with
+`credit=4845.0` from the comma-formatted string `"4,845"`, and both invalid rows are skipped) and a
+synthetic real-binary-xlsx fixture built with `openpyxl.Workbook()` (same header/row shapes) —
+identical output from both readers.
+
+**IaC requirements (report to orchestrator):**
+- Migration `052_create_borrowings.sql` — create `borrowings` table (schema above). Not created by
+  this agent; assumed in progress in parallel per the task brief.
+- `lambda_etl_borrowings.tf` — new Lambda (source_dir = `lambda/etl_borrowings`, runtime
+  python3.12, handler `handler.lambda_handler`); env vars `DATA_BUCKET`, `DB_SECRET_ARN`,
+  `RAW_PREFIX`, `PROCESSED_PREFIX`, `EVENT_BUS_NAME`; IAM: Secrets Manager `GetSecretValue` on
+  `DB_SECRET_ARN`; `s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on `DATA_BUCKET`;
+  `events:PutEvents` on the default event bus. S3 bucket notification entry with prefix filter
+  `raw/Borrowings` added to the shared fan-out in `lambda_etl_sales.tf` (do not create a second
+  `aws_s3_bucket_notification` resource — see the IaC section's fan-out rule at the top of this
+  file). CI layer build step for this Lambda (openpyxl + psycopg2-binary).
+- API Gateway routes `GET /borrowings/meta` + `GET /borrowings` + CORS in `lambda_api.tf` (no new
+  Lambda for these two — same `api` Lambda; see the "api — GET /borrowings/meta, GET /borrowings"
+  section below).
+
+---
+
+## api — GET /borrowings/meta, GET /borrowings (added 2026-08-05)
+
+**Status: complete.** Two new read endpoints on the `api` Lambda, mirroring the existing
+`/purchases/meta` / `/ledger` cache-aside style. Added near the other ledger routes in
+`handler.py`'s routing block (right after `/ledger`).
+
+**`GET /borrowings/meta`** — `{accounts, min_date, max_date}`. `accounts` = `DISTINCT account`
+from `borrowings WHERE out_z IS NULL`, sorted case-insensitively (`ORDER BY LOWER(account)`).
+`min_date`/`max_date` = `MIN`/`MAX(transaction_date)` over open rows; both `null` if the table is
+empty. Cache key `iravi:borrowings:meta`, TTL `_LEDGER_TTL` (1 hour) — **unlike**
+`/purchases/meta` (which only caches on a non-empty result), this endpoint always caches, matching
+the task's literal 1-hour-TTL requirement without a conditional.
+
+**`GET /borrowings?account=&from_date=&to_date=`** — `account` is OPTIONAL (empty/absent = all
+accounts, via the same `(%(account)s = '' OR account = %(account)s)` SQL pattern
+`_handle_purchases_summary` uses for its optional `branch` param); `from_date`/`to_date` are
+required (400 `{'error': 'from_date and to_date are required'}` on missing, same error shape as
+`/ledger`). Filters `out_z IS NULL AND transaction_date BETWEEN from_date AND to_date`, ordered
+`transaction_date ASC, voucher_no ASC`. Response is a flat array:
+```jsonc
+[{ "transaction_date": "YYYY-MM-DD", "voucher_no": "JE2526-60", "transaction_name": "Journal Entries",
+   "account": "LEVAKA HARANATHA REDDY", "debit": 0.0, "credit": 4845.0 }]
+```
+`debit`/`credit` are JSON numbers (`float(...)`), matching `/ledger`'s `amount` serialisation.
+Cache key `iravi:borrowings:data:{account or 'all'}:{from_date}:{to_date}`, TTL `_LEDGER_TTL` (1
+hour). All SQL is parameterised (`%s`/`%(name)s`) — no string interpolation of user input.
+
+**Bug fix (2026-08-05, same-day cross-repo verification pass) — `transaction_name` null
+contract mismatch:** `borrowings.transaction_name` is nullable (`TEXT`, no `NOT NULL` — see the
+DDL in the `etl_borrowings` section above) and the ETL stores `None` when the source cell is
+blank or the literal string `'NULL'`, so `_handle_borrowings_data` could emit `"transaction_name":
+null` — but the UI's `BorrowingRow` interface (once built) would type this field as a
+non-nullable `string`, per the coordinator's cross-repo check. Fixed at the API layer (per the
+coordinator's explicit instruction to keep the contract clean rather than loosen the UI type):
+`'transaction_name': row['transaction_name'] or ''` — coalesces `None` (and, harmlessly, `''`) to
+`''`. **No established `or ''`/coalesce-to-empty-string idiom exists elsewhere in this handler for
+a nullable text field passed straight through a row-building dict** — checked `special_packing_mention`
+(`/stocks/current`, `/stocks/expiry`, both DB-nullable) and `remarks` (the Appendix-B report),
+both of which pass `None` straight through unmodified — so this is a new, minimal, single-line
+fix rather than a refactor to match a pre-existing convention that turned out not to exist.
+`voucher_no` and `account` were checked and do NOT need the same treatment: both are `NOT NULL`
+in the `borrowings` DDL, and `etl_borrowings/handler.py`'s `_extract_row()` already skips (returns
+`None` for) any row where `voucher_no` or `account` is missing/empty after `_clean_text()`
+cleaning — so neither can ever be `NULL` in a row this endpoint reads. Verified: `python -m
+py_compile handler.py` clean; `__pycache__` cleaned up.
+
+**Verified 2026-08-05:** `python -m py_compile handler.py` clean. Smoke-tested both handlers
+(temp script in the scratchpad, not committed) with a stubbed Redis + stubbed psycopg2
+cursor/connection — confirmed: `/borrowings/meta` returns `{accounts, min_date, max_date}` and
+caches under `iravi:borrowings:meta`; `/borrowings` returns the expected row shape with
+`debit`/`credit` as floats; missing `from_date`/`to_date` returns `400` with the exact `/ledger`
+error shape; a non-empty `account` param produces the expected
+`iravi:borrowings:data:{account}:{from}:{to}` cache key.
+
+**IaC needed:** API Gateway routes `GET /borrowings/meta` + `GET /borrowings` + CORS in
+`lambda_api.tf`. No new Lambda, layer, or DB migration on the API side (same `api` Lambda, same
+`psycopg2-binary`/`redis` already in `requirements.txt`) — depends on migration
+`052_create_borrowings.sql` (owned by the `iac` agent, see the `etl_borrowings` section above)
+being applied before these routes will return real data.
+
+---
+
 ## etl_appendix_b_x11_purchase — Purchase Ledger Processing
 
 **Status: complete**
@@ -1135,6 +1296,8 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /reports/supplier-aging/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 | `GET /pdc` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 | `GET /pdc/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /borrowings/meta` | `iravi:borrowings:meta` | Complete (added 2026-08-05) |
+| `GET /borrowings` | `iravi:borrowings:data:{account}:{from}:{to}` | Complete (added 2026-08-05) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
@@ -1802,6 +1965,21 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **New Lambda `etl_borrowings` + `GET /borrowings/meta`/`GET /borrowings` API endpoints
+  (2026-08-05):** see the full "etl_borrowings — Borrowings Ledger Processing" and "api — GET
+  /borrowings/meta, GET /borrowings" sections above for complete detail. New files:
+  `lambda/etl_borrowings/handler.py` + `requirements.txt` (dual xlsx/CSV format sniffing via the
+  `PK\x03\x04` zip magic, case-insensitive header lookup, uni-temporal milestoning on
+  `(transaction_date, voucher_no, account)`, `ETLBorrowingsSuccess` EventBridge emit). Two new GET
+  routes + handlers in `lambda/api/handler.py` (`_handle_borrowings_meta`,
+  `_handle_borrowings_data`), added near the other `/ledger` routes, following the exact
+  `_handle_purchases_meta`/`_handle_ledger_data` cache-aside pattern (1h TTL, `_LEDGER_TTL`).
+  **IaC needed:** migration `052_create_borrowings.sql` (owned by the `iac` agent, in progress in
+  parallel per the task), `lambda_etl_borrowings.tf` (new Lambda + S3 prefix-filter fan-out entry
+  `raw/Borrowings` in the existing shared bucket notification), and API Gateway routes `GET
+  /borrowings/meta` + `GET /borrowings` + CORS in `lambda_api.tf`. No UI change made — out of this
+  task's scope (main `ui` repo untouched).
 
 - [x] **6 new server-side PDF/JSON exports — Sales/Purchases Registers, Customer/Supplier Aging,
   Issued PDC (2026-08-05):** see the full "api — Server-side PDF exports slice 2" section above
@@ -2593,6 +2771,14 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Next (build in this order)
 
+- [ ] **IaC: `borrowings` table + `etl_borrowings` Lambda + API routes (2026-08-05)** — migration
+  `052_create_borrowings.sql` (schema in the "etl_borrowings" section above); new
+  `lambda_etl_borrowings.tf` (Lambda + S3 prefix-filter fan-out entry `raw/Borrowings` added to
+  the existing shared bucket notification in `lambda_etl_sales.tf` — do not create a second
+  `aws_s3_bucket_notification`); API Gateway routes `GET /borrowings/meta` + `GET /borrowings` +
+  CORS in `lambda_api.tf`. Must land before this Lambda/these routes return real data.
+- [ ] **UI slice for Borrowings** — no UI page exists yet; needs a client method + page + RBAC
+  screen key once the IaC routes above exist (out of this task's scope — main `ui` repo untouched).
 - [ ] **IaC: API Gateway routes for the 6 new PDF/JSON exports (2026-08-05)** — `GET /sales/pdf`,
   `GET /purchases/pdf`, `GET /reports/customer-aging/pdf`, `GET /reports/supplier-aging/pdf`,
   `GET /pdc`, `GET /pdc/pdf` + CORS in `lambda_api.tf` (exact query params listed in the "api —

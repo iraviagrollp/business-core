@@ -112,6 +112,15 @@ def lambda_handler(event, context):
     if path == '/ledger':
         params = event.get('queryStringParameters') or {}
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
+    if path == '/borrowings/meta':
+        return _handle_borrowings_meta()
+    if path == '/borrowings':
+        params = event.get('queryStringParameters') or {}
+        return _handle_borrowings_data(
+            params.get('account', ''),
+            params.get('from_date', ''),
+            params.get('to_date', ''),
+        )
     if path == '/supplier-ledger/range':
         return _handle_supplier_ledger_range()
     if path == '/supplier-ledger':
@@ -545,6 +554,93 @@ def _handle_ledger_data(from_date: str, to_date: str):
 
     r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
     logger.info('Ledger data cached: key=%s rows=%d', cache_key, len(rows))
+    return _response(200, rows)
+
+
+def _handle_borrowings_meta():
+    """GET /borrowings/meta — distinct accounts + date range from borrowings.
+
+    Mirror of _handle_purchases_meta's shape (branches/min_date/max_date) but
+    for the borrowings table's account column.
+    """
+    cache_key = 'iravi:borrowings:meta'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT account FROM borrowings
+                WHERE out_z IS NULL ORDER BY LOWER(account)
+            """)
+            accounts = [row[0] for row in cur.fetchall()]
+
+            cur.execute("""
+                SELECT MIN(transaction_date), MAX(transaction_date)
+                FROM borrowings WHERE out_z IS NULL
+            """)
+            min_date, max_date = cur.fetchone()
+    finally:
+        conn.close()
+
+    payload = {
+        'accounts': accounts,
+        'min_date': min_date.isoformat() if min_date else None,
+        'max_date': max_date.isoformat() if max_date else None,
+    }
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    return _response(200, payload)
+
+
+def _handle_borrowings_data(account: str, from_date: str, to_date: str):
+    """GET /borrowings?account=&from_date=&to_date= — borrowings rows in a date
+    range, optionally filtered to one account. `account` is optional (empty/
+    absent = all accounts), mirroring the optional-branch pattern used by
+    _handle_purchases_summary.
+    """
+    account = (account or '').strip()
+    if not from_date or not to_date:
+        return _response(400, {'error': 'from_date and to_date are required'})
+
+    cache_key = f'iravi:borrowings:data:{account or "all"}:{from_date}:{to_date}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT transaction_date, voucher_no, transaction_name, account, debit, credit
+                FROM borrowings
+                WHERE out_z IS NULL
+                  AND transaction_date BETWEEN %(from_date)s AND %(to_date)s
+                  AND (%(account)s = '' OR account = %(account)s)
+                ORDER BY transaction_date ASC, voucher_no ASC
+            """, {'from_date': from_date, 'to_date': to_date, 'account': account})
+            col_names = [d[0] for d in cur.description]
+            raw_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows = []
+    for raw in raw_rows:
+        row = dict(zip(col_names, raw))
+        rows.append({
+            'transaction_date': row['transaction_date'].isoformat(),
+            'voucher_no': row['voucher_no'],
+            'transaction_name': row['transaction_name'] or '',
+            'account': row['account'],
+            'debit': float(row['debit']),
+            'credit': float(row['credit']),
+        })
+
+    r.set(cache_key, json.dumps(rows), ex=_LEDGER_TTL)
+    logger.info('Borrowings data cached: key=%s rows=%d', cache_key, len(rows))
     return _response(200, rows)
 
 
