@@ -1033,6 +1033,121 @@ being applied before these routes will return real data.
 
 ---
 
+## api — GET /borrowings/pdf (added 2026-08-05)
+
+**Status: complete.** Server-side PDF export for the Borrowings screen, matching the "Download
+PDF" button already on Customer Ledger — same shared letterhead/fonts/response envelope as every
+other report PDF in this Lambda, no new letterhead/fonts/styling invented.
+
+**Shared modules reused (byte-for-byte, no new letterhead work):** `letterhead.py` (header/footer,
+palette, `register_fonts()`), `pdf_fonts.py` (DejaVuSans TTF registration for the ₹ glyph),
+`DejaVuSans.ttf`/`DejaVuSans-Bold.ttf`/`ial-logo.png` — all pre-existing, untouched.
+`_pdf_response()`/`_safe_filename_part()` (existing helpers) provide the base64/
+`isBase64Encoded`/`Content-Disposition` envelope — identical to every other PDF route.
+
+**New shared compute module `borrowings.py`** — `compute_borrowings_rows(conn, account, from_date,
+to_date) -> list[dict]`, extracted verbatim from `_handle_borrowings_data`'s SQL/row-building (same
+optional-`account` `%(account)s = '' OR account = %(account)s` pattern `_handle_purchases_summary`
+uses for its optional `branch`). `_handle_borrowings_data` (the JSON route) now delegates to this
+function — cache-aside + `_response` wrapping stay in the handler, mirroring how
+`_handle_ledger_statement` delegates to `ledger_statement.compute_ledger_statement`. JSON response
+shape/cache key/TTL for `GET /borrowings` are UNCHANGED by this refactor.
+
+**New route `GET /borrowings/pdf?account=&from_date=&to_date=`** — `account` OPTIONAL
+(empty/absent = all accounts, same as `GET /borrowings`); `from_date`/`to_date` REQUIRED (400
+`{'error': 'from_date and to_date are required'}` on missing — same error shape as `/borrowings`).
+`_handle_borrowings_pdf` calls the SAME `borrowings.compute_borrowings_rows()` `GET /borrowings`
+itself calls (fresh DB connection, no Redis caching — matches every other PDF route in this
+Lambda), then a **local** `import borrowings_pdf` (so a reportlab problem can never break the JSON
+routes) renders the PDF. Filename: `borrowings_{account or "all"}_{from_date}_{to_date}.pdf` (each
+part sanitized via `_safe_filename_part`). Response envelope is byte-identical to every other PDF
+route: `_pdf_response()` → `{'statusCode': 200, 'headers': {'Content-Type': 'application/pdf',
+'Content-Disposition': 'attachment; filename="..."'}, 'body': <base64>, 'isBase64Encoded': True}`.
+
+**New renderer `borrowings_pdf.py`** — `render_borrowings_pdf(rows, account, from_date, to_date) ->
+bytes`. Portrait A4 (kept — this report is always exactly 6 columns, the same column-count class
+as `ledger_statement_pdf.py`'s 6-column statement table, so landscape was not needed), 1cm
+margins, `letterhead.draw_header`/`letterhead.draw_footer` repeating on every page (same
+`_draw_header_footer` onFirstPage/onLaterPages pattern as `ledger_statement_pdf.py`). Title:
+static, centered, bold, `letterhead.GREEN` — `'BORROWINGS STATEMENT'` (matches the ledger PDF's
+title-block naming style; kept static rather than embedding an account name because this report
+can also cover ALL accounts at once, unlike the customer/supplier statements which are always
+single-account). Subtitle: one centered line — `'Period: DD-MM-YYYY to DD-MM-YYYY  |  Account:
+<name>'` or `'...  |  Account: All accounts'`.
+
+**Columns:** Date | Voucher No | Transaction Name | Debit (₹) | Credit (₹) + a 6th column that is
+EITHER **Account** (when `account` is blank — "all accounts" mode) OR a running **Balance (₹)**
+(when a single account is selected) — mirrors the on-screen table's conditional column exactly, per
+the task spec.
+
+**Running balance (single-account mode only) = cumulative `credit − debit`** (deliberately the
+OPPOSITE operand order from `ledger_statement_pdf.py`/`supplier_ledger_statement_pdf.py`'s
+`debit − credit`) — domain semantics: borrowings are the firm's liability to its investors; `credit`
+= money RECEIVED from the investor (increases what the firm owes), `debit` = REPAYMENT (decreases
+it); a positive balance means the firm owes the investor. The Dr/Cr suffix text reuses
+`supplier_ledger_statement_pdf.py`'s exact `_bal()` convention (positive → `'Dr'`, negative →
+`'Cr'`, zero → `'-'`) — the "payable-inverted" convention the task asked for. Because the balance
+here is computed as `credit − debit` rather than `debit − credit`, a positive/`'Dr'` balance
+correctly reads as "the firm owes the investor" (a payable/liability), the same relationship
+`supplier_ledger_statement_pdf.py`'s positive/`'Dr'` balance has to its `'Closing Balance Payable'`
+banner label. **Deviation from the task's literal spec text (no functional difference):** the task
+prose says "check `supplier_ledger_statement`'s PDF if one exists and follow it" — that PDF's
+`_bal()` function is TEXTUALLY IDENTICAL to the customer statement's (`positive → 'Dr'`); the
+"payable" vs "receivable" distinction between the two lives entirely in which formula (`debit −
+credit` vs `credit − debit`) is fed into it and in the closing-banner LABEL wording, not in the
+`_bal()` code itself — `borrowings_pdf.py` follows that same pattern (reuses the identical `_bal()`
+text, supplies the borrowings-specific `credit − debit` formula).
+
+**Totals row:** Total Debit, Total Credit, and **Net Outstanding** (`Σcredit − Σdebit`, same `_bal()`
+suffix) always rendered in the report's 6th column — regardless of whether that column's per-row
+content is Account or Balance, mirroring how `ledger_statement_pdf.py`'s Totals row always shows the
+closing balance in its last column.
+
+**No per-FY split** (unlike `ledger_statement_pdf.py`/`supplier_ledger_statement_pdf.py`) — the task
+spec does not call for one and the borrowings dataset (unlike customer/supplier ledgers) is not
+tied to any FY reporting concept; the whole period renders as ONE table with a repeating header
+(`repeatRows=1`). No opening-balance/bank-particulars block either — not requested by the spec.
+
+**Empty-result case:** letterhead + title + subtitle render as normal; the table is replaced by a
+single centered `'No records for the selected period.'` line (no empty/zero-row table, no totals
+row) — handled gracefully, never errors.
+
+**Verified 2026-08-05:** `python -m py_compile handler.py borrowings.py borrowings_pdf.py` clean.
+Smoke-tested (temp script `_smoke_borrowings.py` in `lambda/api/`, deleted afterward along with
+`__pycache__`) three cases with `reportlab` + `pypdf`: (1) all-accounts mode with 3 rows across 3
+different account names — confirmed `'BORROWINGS STATEMENT'`, `'Account: All accounts'`, and the
+letterhead company name `'IRAVI AGRO LIFE LLP'` all present via `pypdf` text extraction; (2)
+single-account mode with 2 rows (a ₹4,84,500 credit then a ₹2,00,000 debit) — confirmed
+`'Account: LEVAKA HARANATHA REDDY'` and a `'Dr'` suffix present, and independently re-computed the
+expected cumulative `credit − debit` balance (₹2,84,500) in the test script itself to cross-check
+the renderer's internal running-balance math; (3) zero rows — confirmed
+`'No records for the selected period.'` renders instead of an empty table. All three calls returned
+valid `%PDF`-prefixed bytes (214–236 KB) with no exceptions.
+
+**IaC needed (for the `iac` agent):** add `GET /borrowings/pdf` to `lambda_api.tf` — a **plain**
+route resource + CORS allow-method, same as every other PDF route in this Lambda (`/ledger/statement/pdf`,
+`/supplier-ledger/statement/pdf`, etc.). No binary media type configuration is needed: this Lambda
+(API Gateway HTTP API v2 + Lambda proxy integration) already returns `isBase64Encoded: true` for
+every other PDF route without any special API Gateway binary-media-type setting, and the same
+`_pdf_response()` helper is reused verbatim here — if the existing PDF routes work today with no
+such config, this one needs nothing extra either. No new Lambda, layer, or DB migration — same
+`api` Lambda, same `reportlab==4.2.2` already in `requirements.txt`. Depends on migration
+`052_create_borrowings.sql` and the `borrowings` table (owned by the `iac` agent, see the
+`etl_borrowings` section above) being applied before this route returns real data — same
+dependency `GET /borrowings`/`GET /borrowings/meta` already have.
+
+**Exact route + query params + response envelope (for the `iac`/`ui` agents):**
+- Route: `GET /borrowings/pdf`
+- Query params: `account` (optional, empty/absent = all accounts), `from_date` (required,
+  `YYYY-MM-DD`), `to_date` (required, `YYYY-MM-DD`) — identical param names/semantics to
+  `GET /borrowings`.
+- Response: `{'statusCode': 200, 'headers': {'Content-Type': 'application/pdf',
+  'Content-Disposition': 'attachment; filename="borrowings_<account|all>_<from_date>_<to_date>.pdf"'},
+  'body': '<base64 PDF bytes>', 'isBase64Encoded': true}` — byte-identical envelope shape to
+  `GET /ledger/statement/pdf` / `GET /supplier-ledger/statement/pdf`.
+
+---
+
 ## etl_appendix_b_x11_purchase — Purchase Ledger Processing
 
 **Status: complete**
@@ -1340,6 +1455,7 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /pdc/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 | `GET /borrowings/meta` | `iravi:borrowings:meta` | Complete (added 2026-08-05) |
 | `GET /borrowings` | `iravi:borrowings:data:{account}:{from}:{to}` | Complete (added 2026-08-05) |
+| `GET /borrowings/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
@@ -2022,6 +2138,18 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `raw/Borrowings` in the existing shared bucket notification), and API Gateway routes `GET
   /borrowings/meta` + `GET /borrowings` + CORS in `lambda_api.tf`. No UI change made — out of this
   task's scope (main `ui` repo untouched).
+
+- [x] **`GET /borrowings/pdf` — server-side PDF export for the Borrowings screen (2026-08-05):**
+  see the full "api — GET /borrowings/pdf" section above for complete detail. New files:
+  `lambda/api/borrowings.py` (shared `compute_borrowings_rows()`, also now used by
+  `_handle_borrowings_data`) and `lambda/api/borrowings_pdf.py` (`render_borrowings_pdf()`,
+  portrait A4, shared `letterhead.py`/`pdf_fonts.py`, conditional Account/Balance 6th column,
+  `credit − debit` running balance with the supplier-style Dr/Cr suffix). New
+  `_handle_borrowings_pdf` handler + `GET /borrowings/pdf` route in `lambda/api/handler.py`, using
+  the existing `_pdf_response()`/`_safe_filename_part()` helpers — same response envelope as every
+  other PDF route. No new dependency (`reportlab` already in `requirements.txt`). **IaC needed:**
+  add `GET /borrowings/pdf` (plain route + CORS, no binary media type config) to `lambda_api.tf`.
+  No UI change made — out of this task's scope (main `ui` repo untouched).
 
 - [x] **6 new server-side PDF/JSON exports — Sales/Purchases Registers, Customer/Supplier Aging,
   Issued PDC (2026-08-05):** see the full "api — Server-side PDF exports slice 2" section above
@@ -2818,9 +2946,13 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `lambda_etl_borrowings.tf` (Lambda + S3 prefix-filter fan-out entry `raw/Borrowings` added to
   the existing shared bucket notification in `lambda_etl_sales.tf` — do not create a second
   `aws_s3_bucket_notification`); API Gateway routes `GET /borrowings/meta` + `GET /borrowings` +
-  CORS in `lambda_api.tf`. Must land before this Lambda/these routes return real data.
-- [ ] **UI slice for Borrowings** — no UI page exists yet; needs a client method + page + RBAC
-  screen key once the IaC routes above exist (out of this task's scope — main `ui` repo untouched).
+  `GET /borrowings/pdf` (plain route + CORS, no binary media type config needed — see the "api —
+  GET /borrowings/pdf" section above) + CORS in `lambda_api.tf`. Must land before this
+  Lambda/these routes return real data.
+- [ ] **UI slice for Borrowings** — needs a client method + page + RBAC screen key + a "Download
+  PDF" button wired to `GET /borrowings/pdf?account=&from_date=&to_date=` (same params as
+  `GET /borrowings`) once the IaC routes above exist (out of this task's scope — main `ui` repo
+  untouched).
 - [ ] **IaC: API Gateway routes for the 6 new PDF/JSON exports (2026-08-05)** — `GET /sales/pdf`,
   `GET /purchases/pdf`, `GET /reports/customer-aging/pdf`, `GET /reports/supplier-aging/pdf`,
   `GET /pdc`, `GET /pdc/pdf` + CORS in `lambda_api.tf` (exact query params listed in the "api —
