@@ -19,27 +19,59 @@ render_issued_pdc_pdf(data: dict) -> bytes
 
 Design mirrors the house report-PDF convention (customer_balances_fy_pdf.py /
 stocks_expiry_pdf.py / aging_pdf.py / transactions_register_pdf.py):
-landscape A4, 1cm margins, shared letterhead header/footer repeating on
-every page, single-row GREEN header band with white bold text, repeatRows=1,
-zebra data rows, TOTAL row background #f0f0f0 bold. Helvetica/Helvetica-Bold
-body font; DejaVuSans registered only for the inline rupee-glyph token
-(`_RS`).
+landscape A4, shared letterhead header/footer repeating on every page,
+single-row GREEN header band with white bold text, repeatRows=1, zebra data
+rows, TOTAL row background #f0f0f0 bold. Helvetica/Helvetica-Bold body font;
+DejaVuSans registered only for the inline rupee-glyph token (`_RS`), used
+now ONLY in the subtitle ("All amounts in Rs" line) — see the "column
+sizing" note below.
 
-16 columns (mirroring the procurement PDC screen), a smaller 7pt body font
-and Paragraph-wrapped text cells for the long Supplier/Product/Brand columns
-so this wide table fits landscape A4 without overflow:
+16 columns (mirroring the procurement PDC screen):
   PO | Date | Supplier | Product | Brand | Cr.Days (right) | Qty (right) |
   Rate (right) | Gross (right) | GST (right) | Amount (right) | Disc (right)
   | Adv (right) | Bal (right) | PDC Amt (right) | PDC Date
 
+Column sizing (measured, not guessed)
+--------------------------------------
+Every column here except Supplier/Product/Brand holds a value that can NEVER
+wrap — dates, PO numbers, and rupee amounts are single unbreakable tokens
+(no spaces), and a reportlab Paragraph cannot break an unbreakable token; it
+just overflows the cell instead. A fixed weight-based column-width split
+(the previous design) therefore reliably overflowed on real data (long
+dates, lakh/crore-scale amounts).
+
+`_measure()` / `_compute_layout()` instead measure, PER RENDER, the actual
+`pdfmetrics.stringWidth` of every header label, every data cell, and the
+TOTAL row cell in this specific payload, at the exact font/size that cell
+will be drawn with:
+  - The 13 unbreakable columns (PO, Date, PDC Date, Cr.Days, Qty, Rate, and
+    the 7 money columns) always get AT LEAST their measured required width.
+  - Supplier/Product/Brand wrap on spaces, so they get a measured MINIMUM
+    (header label vs. the longest single word in the column — the true wrap
+    floor) and then absorb whatever width is left over, split across the
+    three proportional to their average full-cell width (so Product, which
+    tends to hold the longest text, gets the biggest share of the slack).
+If the 13 unbreakable columns' own required widths already exceed the page
+at the default 7pt/3pt-padding/1cm-margin layout, `_compute_layout()`
+degrades — in order, re-measuring after each step — cell padding 3pt->2pt,
+body font 7pt->6.5pt->6pt, then side margin 1.0cm->0.75cm — until everything
+fits, exactly as this package's other report renderers do NOT need to (they
+have far fewer / narrower unbreakable columns) but this one, with 16 columns
+including 7 money columns, sometimes does.
+
 Formatting: Date/PDC Date as DD-MM-YYYY; Gross/GST/Amount/Disc/Adv/Bal/PDC
-Amt as Rupee-token Indian-grouped 2dp (via `_RS`, matching the procurement
-UI's currency columns); Qty/Rate as plain numbers (no currency symbol,
-matching the procurement UI). None -> hyphen placeholder '-'.
+Amt as Indian-grouped 2dp numbers with NO per-cell rupee glyph (the unit is
+stated once, in the subtitle, via `_RS` — this reclaims ~4-5pt per money
+cell x 7 columns, which is what makes the unbreakable columns fit without
+crushing Supplier/Product/Brand to unreadable widths); the money column
+headers are therefore plain 'Gross'/'GST'/'Amount'/'Disc'/'Adv'/'Bal'/
+'PDC Amt' (no '(Rs)' suffix). Qty/Rate as plain numbers (no currency
+symbol, matching the procurement UI). None -> hyphen placeholder '-'.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from io import BytesIO
 
@@ -48,6 +80,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -58,23 +91,32 @@ from reportlab.platypus import (
 
 import letterhead
 
+_LOG = logging.getLogger('issued_pdc_pdf')
+
 # ── constants ─────────────────────────────────────────────────────────────────
 _TOTAL_BG    = colors.HexColor('#f0f0f0')
 _ALT_BG      = colors.HexColor('#fafafa')
 _CELL_BORDER = colors.HexColor('#cccccc')
 
 _PAGE_W, _PAGE_H = landscape(A4)
-_MARGIN = 1.0 * cm
-_CONTENT_W = _PAGE_W - 2 * _MARGIN
+_MARGIN       = 1.0 * cm
+_MARGIN_TIGHT = 0.75 * cm
 
-# Rupee token — Helvetica-primary; DejaVuSans is registered only for this glyph.
+_BASE_FONT = letterhead.BASE_FONT
+_BOLD_FONT = letterhead.BOLD_FONT
+
+# Rupee token — Helvetica-primary; DejaVuSans is registered only for this
+# glyph. Used ONLY in the subtitle ("All amounts in <_RS>") — data/TOTAL
+# cells are plain Helvetica numbers now (see module docstring).
 _RS = letterhead.register_fonts()
 
 
 # ── formatting helpers ────────────────────────────────────────────────────────
 
 def _fmt_inr(value: float) -> str:
-    """Format |value| as Indian-grouped rupees, e.g. '<font ...>₹</font>1,23,456.00'."""
+    """Format |value| as Indian-grouped rupees with NO currency glyph, e.g.
+    '1,23,456.00' / '-1,23,456.00'. The unit (Rs) is stated once in the
+    report subtitle instead of on every cell — see module docstring."""
     formatted = f'{abs(value):.2f}'
     int_str, dec_str = formatted.split('.')
     s = int_str
@@ -87,11 +129,12 @@ def _fmt_inr(value: float) -> str:
             groups.insert(0, s[-2:])
             s = s[:-2]
     sign = '-' if value < 0 else ''
-    return sign + _RS + ','.join(groups) + '.' + dec_str
+    return sign + ','.join(groups) + '.' + dec_str
 
 
 def _amt(value) -> str:
-    """Rupee string for a non-None value (including 0), else a hyphen placeholder."""
+    """Rupee-free amount string for a non-None value (including 0), else a
+    hyphen placeholder."""
     if value is None:
         return '-'
     return _fmt_inr(value)
@@ -143,25 +186,167 @@ def _draw_header_footer(canvas, doc):
     letterhead.draw_footer(canvas, doc)
 
 
-# label, weight, alignment, wrap (True -> long-text Paragraph cell)
-_COLUMNS = [
-    ('PO', 0.85, TA_LEFT, False),
-    ('Date', 0.65, TA_CENTER, False),
-    ('Supplier', 1.35, TA_LEFT, True),
-    ('Product', 1.45, TA_LEFT, True),
-    ('Brand', 0.85, TA_LEFT, True),
-    ('Cr.Days', 0.55, TA_RIGHT, False),
-    ('Qty', 0.55, TA_RIGHT, False),
-    (f'Rate', 0.6, TA_RIGHT, False),
-    (f'Gross ({_RS})', 0.8, TA_RIGHT, False),
-    (f'GST ({_RS})', 0.65, TA_RIGHT, False),
-    (f'Amount ({_RS})', 0.85, TA_RIGHT, False),
-    (f'Disc ({_RS})', 0.65, TA_RIGHT, False),
-    (f'Adv ({_RS})', 0.65, TA_RIGHT, False),
-    (f'Bal ({_RS})', 0.7, TA_RIGHT, False),
-    (f'PDC Amt ({_RS})', 0.8, TA_RIGHT, False),
-    ('PDC Date', 0.65, TA_CENTER, False),
+# ── column definitions ────────────────────────────────────────────────────────
+# key, header label, alignment, wrap (True -> long-text column that can break
+# on spaces), money (True -> summed into the TOTAL row), cell(row) -> str.
+_COL_SPECS = [
+    dict(key='po', header='PO', align=TA_LEFT, wrap=False, money=False,
+         cell=lambda r: r.get('po_no') or '-'),
+    dict(key='date', header='Date', align=TA_CENTER, wrap=False, money=False,
+         cell=lambda r: _fmt_date(r.get('po_date'))),
+    dict(key='supplier', header='Supplier', align=TA_LEFT, wrap=True, money=False,
+         cell=lambda r: r.get('company_name') or '-'),
+    dict(key='product', header='Product', align=TA_LEFT, wrap=True, money=False,
+         cell=lambda r: r.get('technical_name') or '-'),
+    dict(key='brand', header='Brand', align=TA_LEFT, wrap=True, money=False,
+         cell=lambda r: r.get('brand') or '-'),
+    dict(key='cr_days', header='Cr.Days', align=TA_RIGHT, wrap=False, money=False,
+         cell=lambda r: _fmt_int(r.get('credit_days'))),
+    dict(key='qty', header='Qty', align=TA_RIGHT, wrap=False, money=False,
+         cell=lambda r: _fmt_num(r.get('qty'))),
+    dict(key='rate', header='Rate', align=TA_RIGHT, wrap=False, money=False,
+         cell=lambda r: _fmt_num(r.get('rate'))),
+    dict(key='gross', header='Gross', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('gross'))),
+    dict(key='gst', header='GST', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('gst'))),
+    dict(key='amount', header='Amount', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('amount'))),
+    dict(key='disc', header='Disc', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('disc'))),
+    dict(key='adv', header='Adv', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('adv'))),
+    dict(key='bal', header='Bal', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('bal'))),
+    dict(key='pdc_amt', header='PDC Amt', align=TA_RIGHT, wrap=False, money=True,
+         cell=lambda r: _amt(r.get('pdc_amt'))),
+    dict(key='pdc_date', header='PDC Date', align=TA_CENTER, wrap=False, money=False,
+         cell=lambda r: _fmt_date(r.get('pdc_date'))),
 ]
+
+_MONEY_KEYS = [spec['key'] for spec in _COL_SPECS if spec['money']]
+
+# Degradation ladder — tried in order, re-measured at each step, until the 13
+# unbreakable columns' required widths + the 3 wrap columns' minimum widths
+# fit the page. See module docstring.
+_DEGRADE_STEPS = [
+    # (font_size, cell_padding, side_margin)
+    (7.0, 3, _MARGIN),
+    (7.0, 2, _MARGIN),
+    (6.5, 2, _MARGIN),
+    (6.0, 2, _MARGIN),
+    (6.0, 2, _MARGIN_TIGHT),
+]
+
+
+def _total_cell_text(spec: dict, totals: dict, has_rows: bool) -> str:
+    """TOTAL row text for one column — 'TOTAL' label in PO, summed amount in
+    the 7 money columns (only when there is at least one row), blank
+    everywhere else (matches the pre-existing TOTAL row shape)."""
+    if spec['key'] == 'po':
+        return 'TOTAL'
+    if spec['money']:
+        return _amt(totals.get(spec['key'])) if has_rows else '-'
+    return ''
+
+
+def _measure(rows: list, totals: dict, font_size: float, pad: float):
+    """Required width for the 13 unbreakable columns, and (minimum, 'want')
+    width for the 3 wrap columns, measured over THIS render's actual header
+    label / data cells / TOTAL cell, at `font_size`/`pad`."""
+    nonwrap: dict = {}
+    wrap_min: dict = {}
+    wrap_want: dict = {}
+    has_rows = bool(rows)
+
+    for spec in _COL_SPECS:
+        header_w = pdfmetrics.stringWidth(spec['header'], _BOLD_FONT, font_size)
+
+        if spec['wrap']:
+            longest_word_w = 0.0
+            cell_w_sum = 0.0
+            for row in rows:
+                text = spec['cell'](row)
+                for word in text.split():
+                    longest_word_w = max(longest_word_w,
+                                          pdfmetrics.stringWidth(word, _BASE_FONT, font_size))
+                cell_w_sum += pdfmetrics.stringWidth(text, _BASE_FONT, font_size)
+            avg_cell_w = (cell_w_sum / len(rows)) if rows else 0.0
+            floor = max(header_w, longest_word_w) + 2 * pad
+            wrap_min[spec['key']] = floor
+            wrap_want[spec['key']] = max(floor, avg_cell_w + 2 * pad)
+        else:
+            data_w = max(
+                [pdfmetrics.stringWidth(spec['cell'](row), _BASE_FONT, font_size)
+                 for row in rows] or [0.0]
+            )
+            total_text = _total_cell_text(spec, totals, has_rows)
+            total_w = (pdfmetrics.stringWidth(total_text, _BOLD_FONT, font_size)
+                       if total_text else 0.0)
+            nonwrap[spec['key']] = max(header_w, data_w, total_w) + 2 * pad
+
+    return nonwrap, wrap_min, wrap_want
+
+
+def _compute_layout(rows: list, totals: dict):
+    """Pick the least-aggressive degradation step that fits, then distribute
+    any leftover width across Supplier/Product/Brand proportional to their
+    measured 'want'. Returns (col_widths_in_COL_SPECS_order, font_size, pad,
+    margin, content_w)."""
+    chosen = None
+    for font_size, pad, margin in _DEGRADE_STEPS:
+        content_w = _PAGE_W - 2 * margin
+        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad)
+        nonwrap_total = sum(nonwrap.values())
+        wrap_min_total = sum(wrap_min.values())
+        remaining = content_w - nonwrap_total
+        if remaining >= wrap_min_total:
+            chosen = (font_size, pad, margin, content_w, nonwrap, wrap_min, wrap_want, remaining)
+            break
+
+    if chosen is None:
+        # Every degradation step exhausted and the 13 unbreakable columns'
+        # OWN required widths (plus the wrap columns' hard word-wrap minimums)
+        # still exceed the page — genuinely unfittable content (this is a
+        # data-outlier case, e.g. a single 30-40+ character unbreakable token
+        # in Supplier/Product/Brand; see module docstring). Per the house
+        # policy for this case: the 13 unbreakable columns keep their own
+        # required width (they cannot shrink without overflowing their own
+        # cell), the 3 wrap columns are clamped to their hard minimum (their
+        # own word-wrap floor, not shrunk further), and — since that
+        # necessarily means the table is wider than the page — we log a
+        # warning (CloudWatch) instead of silently shipping the overflow.
+        # This is NOT scaled/silenced: it is a bounded, reported edge case.
+        font_size, pad, margin = _DEGRADE_STEPS[-1]
+        content_w = _PAGE_W - 2 * margin
+        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad)
+        nonwrap_total = sum(nonwrap.values())
+        wrap_min_total = sum(wrap_min.values())
+        total = nonwrap_total + wrap_min_total
+        if total > content_w:
+            _LOG.warning(
+                'issued_pdc_pdf: content genuinely does not fit landscape A4 even at the '
+                'smallest degradation step (font=%.1fpt pad=%.1fpt margin=%.2fcm) — table '
+                'width %.1fpt exceeds page content width %.1fpt by %.1fpt. Unbreakable '
+                'columns: %s. Wrap columns clamped to their minimum: %s.',
+                font_size, pad, margin / cm, total, content_w, total - content_w,
+                nonwrap, wrap_min,
+            )
+        remaining = content_w - nonwrap_total
+        chosen = (font_size, pad, margin, content_w, nonwrap, wrap_min, wrap_want, remaining)
+
+    font_size, pad, margin, content_w, nonwrap, wrap_min, wrap_want, remaining = chosen
+    wrap_min_total = sum(wrap_min.values())
+    extra = max(0.0, remaining - wrap_min_total)
+    want_total = sum(wrap_want.values())
+    wrap_widths = {}
+    for key, min_w in wrap_min.items():
+        share = (wrap_want[key] / want_total) if want_total > 0 else (1.0 / len(wrap_min))
+        wrap_widths[key] = min_w + extra * share
+
+    col_widths = [wrap_widths[spec['key']] if spec['wrap'] else nonwrap[spec['key']]
+                  for spec in _COL_SPECS]
+    return col_widths, font_size, pad, margin, content_w
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -173,44 +358,47 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
     pdc_from = data.get('pdc_from')
     pdc_to = data.get('pdc_to')
 
+    totals = {key: sum(row.get(key) or 0.0 for row in rows) for key in _MONEY_KEYS}
+
+    col_widths, font_size, pad, margin, content_w = _compute_layout(rows, totals)
+
     buffer = BytesIO()
 
     doc = SimpleDocTemplate(
         buffer,
         pagesize=landscape(A4),
-        leftMargin=_MARGIN,
-        rightMargin=_MARGIN,
+        leftMargin=margin,
+        rightMargin=margin,
         topMargin=letterhead.HEADER_TOP_PAD + letterhead.HEADER_HEIGHT + 0.3 * cm,
         bottomMargin=1.4 * cm,
         title='IAL Issued PDC',
         author='IRAVI AGRO LIFE LLP',
     )
 
-    _BASE, _BOLD = letterhead.BASE_FONT, letterhead.BOLD_FONT
     _W = colors.white
 
-    title_sty = _ps('PDCTitle', _BOLD, 12, TA_LEFT, color=letterhead.GREEN)
-    subtitle_sty = _ps('PDCSubtitle', _BASE, 8, TA_LEFT, color=letterhead.MUTED)
+    title_sty = _ps('PDCTitle', _BOLD_FONT, 12, TA_LEFT, color=letterhead.GREEN)
+    subtitle_sty = _ps('PDCSubtitle', _BASE_FONT, 8, TA_LEFT, color=letterhead.MUTED)
 
     hdr_align = {
-        TA_LEFT: _ps('PDCHdrL', _BOLD, 6.5, TA_LEFT, color=_W),
-        TA_CENTER: _ps('PDCHdrC', _BOLD, 6.5, TA_CENTER, color=_W),
-        TA_RIGHT: _ps('PDCHdrR', _BOLD, 6.5, TA_RIGHT, color=_W),
+        TA_LEFT: _ps('PDCHdrL', _BOLD_FONT, font_size, TA_LEFT, color=_W),
+        TA_CENTER: _ps('PDCHdrC', _BOLD_FONT, font_size, TA_CENTER, color=_W),
+        TA_RIGHT: _ps('PDCHdrR', _BOLD_FONT, font_size, TA_RIGHT, color=_W),
     }
     dat_align = {
-        TA_LEFT: _ps('PDCDatL', _BASE, 7, TA_LEFT),
-        TA_CENTER: _ps('PDCDatC', _BASE, 7, TA_CENTER),
-        TA_RIGHT: _ps('PDCDatR', _BASE, 7, TA_RIGHT),
+        TA_LEFT: _ps('PDCDatL', _BASE_FONT, font_size, TA_LEFT),
+        TA_CENTER: _ps('PDCDatC', _BASE_FONT, font_size, TA_CENTER),
+        TA_RIGHT: _ps('PDCDatR', _BASE_FONT, font_size, TA_RIGHT),
     }
     tot_align = {
-        TA_LEFT: _ps('PDCTotL', _BOLD, 7, TA_LEFT),
-        TA_CENTER: _ps('PDCTotC', _BOLD, 7, TA_CENTER),
-        TA_RIGHT: _ps('PDCTotR', _BOLD, 7, TA_RIGHT),
+        TA_LEFT: _ps('PDCTotL', _BOLD_FONT, font_size, TA_LEFT),
+        TA_CENTER: _ps('PDCTotC', _BOLD_FONT, font_size, TA_CENTER),
+        TA_RIGHT: _ps('PDCTotR', _BOLD_FONT, font_size, TA_RIGHT),
     }
 
     title_row = Table(
         [[Paragraph('ISSUED PDC', title_sty)]],
-        colWidths=[_CONTENT_W],
+        colWidths=[content_w],
     )
     title_row.setStyle(TableStyle([
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
@@ -228,7 +416,8 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
         from_disp = _fmt_date(pdc_from) if pdc_from else '-'
         to_disp = _fmt_date(pdc_to) if pdc_to else '-'
         filter_parts.append(f'PDC Period: {from_disp} to {to_disp}')
-    subtitle_text = ' | '.join(filter_parts) if filter_parts else 'All records'
+    unit_note = f'All amounts in {_RS}'
+    subtitle_text = unit_note + ' | ' + (' | '.join(filter_parts) if filter_parts else 'All records')
 
     # Header is drawn on the canvas (letterhead.draw_header, every page) — NOT
     # added here as a flowable, to avoid double-rendering it on page 1.
@@ -239,75 +428,35 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
         Spacer(1, 5),
     ]
 
-    # ── Column widths ─────────────────────────────────────────────────────────
-    weight_total = sum(w for _, w, _, _ in _COLUMNS)
-    col_widths = [_CONTENT_W * (w / weight_total) for _, w, _, _ in _COLUMNS]
-
     table_rows: list = [
-        [Paragraph(label, hdr_align[align]) for label, _, align, _ in _COLUMNS]
+        [Paragraph(spec['header'], hdr_align[spec['align']]) for spec in _COL_SPECS]
     ]
-
-    total_gross = total_gst = total_amount = 0.0
-    total_disc = total_adv = total_bal = total_pdc_amt = 0.0
 
     for row in rows:
-        total_gross += row.get('gross') or 0.0
-        total_gst += row.get('gst') or 0.0
-        total_amount += row.get('amount') or 0.0
-        total_disc += row.get('disc') or 0.0
-        total_adv += row.get('adv') or 0.0
-        total_bal += row.get('bal') or 0.0
-        total_pdc_amt += row.get('pdc_amt') or 0.0
-
         table_rows.append([
-            Paragraph(row.get('po_no') or '-', dat_align[TA_LEFT]),
-            Paragraph(_fmt_date(row.get('po_date')), dat_align[TA_CENTER]),
-            Paragraph(row.get('company_name') or '-', dat_align[TA_LEFT]),
-            Paragraph(row.get('technical_name') or '-', dat_align[TA_LEFT]),
-            Paragraph(row.get('brand') or '-', dat_align[TA_LEFT]),
-            Paragraph(_fmt_int(row.get('credit_days')), dat_align[TA_RIGHT]),
-            Paragraph(_fmt_num(row.get('qty')), dat_align[TA_RIGHT]),
-            Paragraph(_fmt_num(row.get('rate')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('gross')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('gst')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('amount')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('disc')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('adv')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('bal')), dat_align[TA_RIGHT]),
-            Paragraph(_amt(row.get('pdc_amt')), dat_align[TA_RIGHT]),
-            Paragraph(_fmt_date(row.get('pdc_date')), dat_align[TA_CENTER]),
+            Paragraph(spec['cell'](row), dat_align[spec['align']]) for spec in _COL_SPECS
         ])
 
-    total_row: list = [
-        Paragraph('TOTAL', tot_align[TA_LEFT]),
-        Paragraph('', tot_align[TA_CENTER]),
-        Paragraph('', tot_align[TA_LEFT]),
-        Paragraph('', tot_align[TA_LEFT]),
-        Paragraph('', tot_align[TA_LEFT]),
-        Paragraph('', tot_align[TA_RIGHT]),
-        Paragraph('', tot_align[TA_RIGHT]),
-        Paragraph('', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_gross) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_gst) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_amount) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_disc) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_adv) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_bal) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph(_amt(total_pdc_amt) if rows else '-', tot_align[TA_RIGHT]),
-        Paragraph('', tot_align[TA_CENTER]),
-    ]
+    has_rows = bool(rows)
+    total_row: list = []
+    for spec in _COL_SPECS:
+        if spec['wrap']:
+            total_row.append(Paragraph('', tot_align[TA_LEFT]))
+        else:
+            text = _total_cell_text(spec, totals, has_rows)
+            total_row.append(Paragraph(text, tot_align[spec['align']]))
     table_rows.append(total_row)
     total_row_idx = len(table_rows) - 1
 
     tbl_cmds: list = [
         ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
         ('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG),
-        ('FONTSIZE', (0, 0), (-1, -1), 7),
+        ('FONTSIZE', (0, 0), (-1, -1), font_size),
         ('GRID', (0, 0), (-1, -1), 0.3, _CELL_BORDER),
         ('TOPPADDING', (0, 0), (-1, -1), 2),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-        ('LEFTPADDING', (0, 0), (-1, -1), 3),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), pad),
+        ('RIGHTPADDING', (0, 0), (-1, -1), pad),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
     ]
     # Zebra stripe on alternate data rows (row 0 is the header)
