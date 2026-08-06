@@ -1548,6 +1548,144 @@ Balances (FY) screens' UX pattern.
 
 ---
 
+## api — Borrowings interest model change: interest NEVER carried forward (2026-08-06)
+
+**Status: complete.** User-decided change to the Borrowings interest model: previously, at each
+FY boundary the FY's accrued interest was CAPITALIZED into the running balance (the next FY opened
+on principal+interest, and interest compounded annually). **Now interest is never carried forward
+— only PRINCIPAL is brought forward into the next FY.** Interest for each FY is tracked and
+displayed SEPARATELY and accumulates as a payable, listed FY-by-FY. Three files touched:
+`lambda/api/borrowings.py`, `lambda/api/borrowings_pdf.py`, `lambda/api/handler.py`,
+`lambda/api/test_borrowings_interest.py`.
+
+**`borrowings.py` — `compute_interest_segments`:** the FY-boundary capitalization block (the
+`if ev_fy != current_fy: ... balance = round(balance + fy_total, 2)` step, and the now-unused
+`current_fy` bookkeeping) is REMOVED entirely. `balance` now changes ONLY via `ev['delta']`
+(transaction deltas) — interest is computed per segment (`balance * rate/100 * days/365`, simple
+interest on principal, unchanged formula) but is NEVER added back into `balance` at any point, not
+just "within a year" — no FY-boundary step exists anymore at all. Docstrings (module-level, function-
+level, and the numbered Algorithm steps) rewritten to describe the new no-capitalization model; the
+old "step 6" (FY capitalization) is gone.
+
+**`borrowings.py` — `_compute_fy_totals`:** each FY entry now carries a NEW field
+`cumulative_interest` (running sum of `interest` across every FY from the earliest through this one,
+inclusive) alongside the existing `closing_principal` and `interest` (that FY's own interest only).
+`total` is now `closing_principal + cumulative_interest` (semantic change — it used to be
+`closing_principal + that-FY-only interest`; now it's the "Total Payable Amount" — principal plus
+EVERY FY's interest accrued so far). Docstring states the invariant: the next FY's "Brought Forward"
+is `closing_principal`, NEVER `total`.
+
+**`borrowings.py` — `compute_borrowings_summary_fy`** (the all-accounts FY matrix): `closing` is now
+`round(opening + taken - paid, 2)` — PRINCIPAL ONLY, interest excluded (was `+ interest`); `opening`
+= prior FY's `closing` (principal), unchanged mechanism. Two NEW per-FY fields added:
+`cumulative_interest` (running sum of that account's `interest` across FYs up to and including this
+one) and `total_payable` = `round(closing + cumulative_interest, 2)`. The `totals` (all-accounts)
+dict gets the same treatment — `closing`/`cumulative_interest`/`total_payable` are column sums
+across accounts, so the totals row stays internally consistent. Account-level `closing` (the
+`BorrowingsSummaryFYRow.closing` field) is now principal-only, with a new account-level
+`total_payable` alongside it.
+
+**`borrowings_pdf.py` — the per-FY summary box in `render_borrowings_interest_pdf`
+(single-account mode):** replaced the old fixed 3-line box with, in order: (1) `Total Principal
+Amount` → `closing_principal` (bold); (2) one line PER financial year, ascending, from the earliest
+through the FY of this block (inclusive) that has non-zero `interest` — label `Interest FY
+2023-24` (using the same `YYYY-YY` format `borrowings.py`'s `_fy_key` produces, NOT this module's
+own `_fy_label` which prepends `FY `), value that FY's own `interest` (not bold); (3) `Total
+Payable Amount` → the FY's `total` from `fy_totals` (bold); (4) `Rate of Interest` → the account's
+annual rate rendered as e.g. `12.00% p.a.` (not bold, a plain STRING not a rupee amount). The
+summary-line row-emitting loop was extended so a value may be either a number (formatted via
+`_fmt_inr` as before) or a pre-formatted string (emitted verbatim) — `isinstance(value, str)`, no
+special-casing on label text. The box now grows by one interest line each FY — intended: prior-FY
+interest stays visible as an outstanding payable since it's no longer folded into principal.
+
+**`borrowings_pdf.py` — Brought Forward:** `brought_forward` is now `fy_closing_principal`
+(was `fy_total_amount`) — so the "Brought Forward" row opening each subsequent FY equals the
+previous FY's `Total Principal Amount` line exactly. `render_borrowings_pdf` (the interest-OFF
+report) already carried principal only — verified unchanged, left alone.
+
+**`borrowings_pdf.py` — `render_borrowings_interest_pdf` gained a new `rate: float | None = None`
+keyword arg** (single-account mode only) feeding the "Rate of Interest" line — `0.00% p.a.` when
+`rate is None` or the account is in `missing_rate_accounts` (consistent with the existing
+"missing rate ⇒ 0%, never an error" rule). `handler.py`'s `_handle_borrowings_pdf` now resolves the
+single account's rate via `_brw.compute_borrowing_rate_map(conn, [account])` (a small second query
+inside the same DB connection/try-block — `compute_borrowings_interest` already computes a rate map
+internally but doesn't expose it) and passes it through.
+
+**`borrowings_pdf.py` — `render_borrowings_summary_fy_pdf`** gained a new `Total Payable (₹)`
+sub-column per FY (ONLY when `include_interest=True` — omitted when off, since it would equal
+`Closing` there, `cumulative_interest` always being 0), reading the new `total_payable` field —
+covers the task's "if the summary-FY matrix PDF renders a closing/total column, make it reflect
+the new principal-only closing plus the new `total_payable`" instruction. `Closing` itself needed
+no code change — it already reads `fy_data['closing']`/`fy_totals['closing']`, which now naturally
+carries the new principal-only semantics from the compute layer.
+
+**Other consumers checked (per the task's explicit "grep for any other consumer" instruction):**
+`handler.py` never reads `fy_totals['...']['total']`/summary-fy `closing` directly — it only
+delegates the whole payload dict from `borrowings.py` straight into the PDF renderers, so no other
+handler-level change was needed. No other file in `lambda/` references `closing_principal`,
+`fy_totals`, `compute_borrowings_summary_fy`, `compute_interest_segments`, or `_compute_fy_totals`
+(confirmed via a repo-wide grep) — this feature is entirely self-contained to `borrowings.py` /
+`borrowings_pdf.py` / `handler.py` / the test file.
+
+**Tests (`test_borrowings_interest.py`):** Section 1 (the reference test) and Section 2 needed NO
+change — the reference fixture's entire date range sits inside a single FY, so it never exercised
+capitalization either way. Section 3 was REWRITTEN from "FY capitalization" to "no-compounding
+model" — a flat single drawdown held across 3 full non-leap-Feb FYs (2024-25/2025-26/2026-27, each
+exactly 365 real days) at a fixed rate accrues the SAME interest each FY (10,000.00 exactly, not
+growing), `closing_principal` is identical (100,000.00) across all 3 FYs, `cumulative_interest`
+accumulates (10,000 → 20,000 → 30,000), `total` = principal + cumulative_interest (110,000 →
+120,000 → 130,000), and an explicit regression-pinning check that the next FY's closing_principal
+(what "Brought Forward" reads) is NOT equal to the prior FY's `total` (i.e. differs from what the
+OLD capitalizing model would have produced) — plus a second fixture with real mid-FY transactions
+proving `closing_principal` tracks only transaction deltas, cross-checked independently against
+Σcredit−Σdebit computed straight from the raw rows. Section 5 (REAL DATA): part 3 ("interest never
+alters balance") no longer skips the FY-boundary month transition (capitalization no longer
+"legitimately" changes balance there — balance must now be continuous across EVERY month
+transition, FY boundaries included); part 5 updated from "FY 26-27 opening == FY 25-26 closing +
+interest" to "FY 26-27 opening == FY 25-26 closing_principal EXACTLY (no interest added)"; the
+printed report block was rewritten to read `borrowings._compute_fy_totals()` directly (single
+source of truth) instead of re-deriving FY summary figures ad hoc, now printing `Interest FY
+<label>` / `Total Payable Amount` / cumulative interest. Section 6 (FY-boundary continuity,
+real LEVAKA HARANATHA REDDY data) rewritten: FY 2025-26's `total` (₹55,77,494.20) is UNCHANGED
+by the model change (this is the account's very first FY, so `cumulative_interest == interest`
+there — nothing earlier to add) but the invariant tested shifted from "Total Amount carries
+forward byte-identically into the next FY's balance" to "closing_principal carries forward exactly
+(₹51,63,075.00), and total (₹55,77,494.20) does NOT" — an explicit regression-pinning check that
+the two are no longer equal. Section 7 (`/borrowings/summary-fy` roll-forward invariant) rewritten:
+`closing == opening + taken − paid` (principal only, no `+ interest`), plus new
+`cumulative_interest`/`total_payable` arithmetic checks, plus a check that `closing` (principal) is
+byte-identical between `include_interest=0` and `include_interest=1` runs of the same fixture (the
+toggle changes interest-derived fields only, never principal). Section 8 (dormant middle FY) gained
+additional checks that `closing` is identical across the `include_interest` toggle for both FYs, and
+that `cumulative_interest`/`total_payable` accumulate correctly through the dormant FY (which still
+accrues real interest despite zero taken/paid). **149/149 assertions pass** (was 111 before this
+task — 38 new/rewritten assertions).
+
+**Verification:** `python -m py_compile borrowings.py borrowings_pdf.py handler.py
+test_borrowings_interest.py` clean. `python test_borrowings_interest.py` → 149/149 pass. Smoke-tested
+`render_borrowings_interest_pdf`/`render_borrowings_pdf`/`render_borrowings_summary_fy_pdf` directly
+with `reportlab` (scratch script, not committed) — a 3-FY single-account dataset renders with all of
+`Total Principal Amount` / `Interest FY 2024-25` / `Interest FY 2025-26` / `Interest FY 2026-27` /
+`Total Payable Amount` / `Rate of Interest` / `10.00% p.a.` present (confirmed via `pypdf` text
+extraction) and the old `Total Amount` label absent; a missing-rate variant renders `0.00% p.a.`; the
+summary-FY matrix PDF renders the new `Total Payable (₹)` sub-column; the OFF-mode report renders
+unchanged. `__pycache__` cleaned up after every scratch run.
+
+**No IaC/DB/UI change required** — this is a pure computation/rendering change on the existing
+`GET /borrowings`, `GET /borrowings/pdf`, `GET /borrowings/summary-fy`, and
+`GET /borrowings/summary-fy/pdf` routes; JSON field additions (`cumulative_interest`, `total_payable`
+on the summary-fy routes; `cumulative_interest` inside `fy_totals` on the interest-ON borrowings
+routes) are purely additive — no existing field was removed, only `total`'s VALUE changed semantics
+(now principal + cumulative interest instead of principal + that-FY-only interest) for any FY after
+an account's first. **UI note (flag for the `ui` agent when the Borrowings screens are built):** if/
+when the UI renders `fy_totals`/`summary-fy` "Total"/"Closing" figures, it must not assume `total`
+still means "that FY's principal + that FY's own interest" — it now means "principal + every FY's
+interest accrued so far" (`cumulative_interest`). The `closing`/`total_payable` split on
+`/borrowings/summary-fy` should be surfaced similarly (closing = principal only; total_payable =
+principal + cumulative interest).
+
+---
+
 ## etl_appendix_b_x11_purchase — Purchase Ledger Processing
 
 **Status: complete**
@@ -2525,6 +2663,26 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **Borrowings interest model change — interest NEVER carried forward (2026-08-06):** see the
+  full "api — Borrowings interest model change: interest NEVER carried forward" section above for
+  complete detail. User-decided change: at each FY boundary the FY's accrued interest is no longer
+  capitalized into the running balance — only PRINCIPAL is brought forward into the next FY;
+  interest per FY is tracked/displayed separately and accumulates as a payable, listed FY-by-FY.
+  `borrowings.py`'s `compute_interest_segments` FY-capitalization step removed entirely (balance
+  changes only via transaction deltas, never never compounds); `_compute_fy_totals` gained
+  `cumulative_interest`, and `total` now means "principal + every FY's interest so far" (was
+  "principal + that FY's own interest"); `compute_borrowings_summary_fy`'s `closing` is now
+  principal-only with new `cumulative_interest`/`total_payable` fields (row-level and totals-level).
+  `borrowings_pdf.py`'s single-account interest-ON summary box now shows one `Interest FY <label>`
+  line per FY (ascending) plus `Total Payable Amount` and a new `Rate of Interest` line (new `rate`
+  kwarg, threaded from `handler.py` via a small `compute_borrowing_rate_map` call); `Brought
+  Forward` now reads `closing_principal` (was `total`); `render_borrowings_summary_fy_pdf` gained a
+  `Total Payable (₹)` sub-column when `include_interest=True`. `test_borrowings_interest.py`
+  extended/rewritten (no-compounding 3-FY test, FY-boundary real-data invariant, summary-fy
+  roll-forward/cumulative-interest checks) — **149/149 assertions pass** (was 111). No IaC/DB/UI
+  change required — purely additive JSON fields (`cumulative_interest`, `total_payable`) on
+  existing routes; only `total`'s VALUE semantics changed for any FY after an account's first.
 
 - [x] **Borrowings monthly interest accrual — `include_interest` param on `GET /borrowings` and
   `GET /borrowings/pdf` (added 2026-08-06):** see the full "api — Borrowings monthly interest

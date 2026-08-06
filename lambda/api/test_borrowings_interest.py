@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """
 Local unit tests for borrowings.py's monthly interest-accrual engine (added
-2026-08-06). No AWS, no DB required — compute_interest_segments() is a pure
-function.
+2026-08-06; reworked the same day to remove FY-boundary interest
+capitalization entirely — see the "interest is never carried forward" model
+change: only PRINCIPAL is brought forward into the next FY; each FY's own
+interest is tracked/displayed separately and accumulates as a payable,
+listed FY-by-FY, via `cumulative_interest`/`total`). No AWS, no DB required —
+compute_interest_segments() is a pure function.
 
 Run: python test_borrowings_interest.py
 
 Covers:
   1. THE REFERENCE TEST — reproduces the worked example in the task brief
      (account LEVAKA HARANATHA REDDY, rate 12% p.a.) to 2 dp: Balance, Days,
-     Interest for all 16 given rows.
+     Interest for all 16 given rows. (This fixture's entire date range sits
+     inside a single FY — 2025-04-30 to 2026-03-31, all within FY 2025-26 —
+     so it never exercised the old capitalization step at all and needs no
+     change for the new no-capitalization model.)
   2. include_interest OFF byte-identical guard — compute_borrowings_rows is
      untouched by this change (shape/behaviour spot check).
-  3. FY capitalization — a small synthetic 2-FY fixture (the reference
-     account above never crosses an FY boundary, so this is exercised
-     separately) confirming the next FY's opening balance = prior FY's
-     closing principal + prior FY's total interest, and that interest is
-     never added to balance mid-year.
+  3. NO-COMPOUNDING MODEL (rewritten 2026-08-06 — was "FY capitalization"):
+     a flat single drawdown held across 3 full financial years (chosen to
+     all be non-leap-Feb FYs, so each FY is exactly 365 days) at a fixed
+     rate — confirms each FY accrues the SAME interest (no growth / no
+     compounding), confirms `closing_principal` never changes across any FY
+     boundary (interest never folded into balance, ever — not just within a
+     year), and confirms `_compute_fy_totals`'s `cumulative_interest`/`total`
+     arithmetic across all 3 FYs, plus the key regression-pinning check that
+     the next FY's "Brought Forward" is `closing_principal`, NOT `total`
+     (explicitly asserted to differ from what the OLD capitalizing model
+     would have produced).
   4. compute_borrowings_interest() end-to-end via a stub DB connection —
      row_type/opening-row/interest-line-item shape, missing-rate handling,
      and the multi-account balance=null merge rule.
@@ -26,8 +39,9 @@ Covers:
      does NOT match section 1's reference figures (the reference omitted real
      transactions and had a few amounts transcribed differently) -- this
      block does not assert against the reference; it proves the engine runs
-     end-to-end on real data and exercises the FY-capitalization path with a
-     genuine FY boundary crossing, then prints a full monthly interest report.
+     end-to-end on real data and exercises a genuine FY boundary crossing
+     under the no-capitalization model (balance continuous straight through
+     the boundary, no jump), then prints a full monthly interest report.
 
 Fixture note (reference test)
 ------------------------------
@@ -178,47 +192,111 @@ check(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. FY capitalization (synthetic 2-FY fixture — the reference account above
-#    never crosses an FY boundary, so this is exercised independently)
+# 3. NO-COMPOUNDING MODEL (rewritten 2026-08-06 — interest is never carried
+#    forward; only principal is brought forward into the next FY). A single
+#    credit of 100,000 held with NO other activity across 3 FULL financial
+#    years, chosen so every one of the 3 FYs has a non-leap February (2025,
+#    2026, 2027 are all non-leap) — each FY is therefore exactly 365 days,
+#    so "same interest each full FY" can be asserted as an EXACT equality
+#    rather than "modulo day counts".
 # ══════════════════════════════════════════════════════════════════════════════
 
-print("\n=== 3. FY capitalization (synthetic, rate=10%) ===")
+print("\n=== 3. No-compounding model across 3 FYs (synthetic, rate=10%) ===")
 
-# A single credit of 100,000 on 2025-04-01, held with no other activity all
-# the way through 2026-04-05 (crossing exactly one FY boundary at 31-03-2026
-# -> 01-04-2026).
-fy_fixture = [row(date(2025, 4, 1), 'OPEN-1', credit=100000.0)]
-fy_to_date = date(2026, 4, 5)
-fy_segments, fy_monthly, fy_month_bal, _ = borrowings.compute_interest_segments(
-    fy_fixture, rate=10.0, to_date=fy_to_date,
+fy3_fixture = [row(date(2024, 4, 1), 'OPEN-1', credit=100000.0)]
+fy3_to_date = date(2027, 4, 5)  # a few days into FY 2027-28, past FY 2026-27's close
+fy3_segments, fy3_monthly, fy3_month_bal, _ = borrowings.compute_interest_segments(
+    fy3_fixture, rate=10.0, to_date=fy3_to_date,
 )
-fy_by_key = {(s['date'], s['voucher_no']): s for s in fy_segments}
 
-# FY 2025-26 (Apr 2025 - Mar 2026), rate 10%: total interest on a flat
-# 100,000 balance for exactly 365 days = 100000 * 0.10 * 365/365 = 10,000.00
-fy1_total_interest = round(sum(
-    amt for (yy, mm), amt in fy_monthly.items()
-    if borrowings._fy_start_year(date(yy, mm, 1)) == 2025
-), 2)
-check("FY 2025-26 total interest (365 days flat @ 10% on 100,000)", 10000.0, fy1_total_interest)
-
-# Balance never changes mid-year (interest is never added to balance within
-# the FY) — every segment in FY 2025-26 must show balance == 100,000.00.
-mid_fy_ok = all(
-    round(s['balance'], 2) == 100000.0
-    for s in fy_segments
-    if borrowings._fy_start_year(s['date']) == 2025
-)
-check("balance stays flat at 100,000.00 throughout FY 2025-26 (no mid-year compounding)", True, mid_fy_ok)
-
-# The first event of FY 2026-27 (01-04-2026, the auto month-boundary) must
-# show the capitalized balance: 100,000 (principal) + 10,000 (FY total
-# interest) = 110,000.00.
-apr1_seg = fy_by_key.get((date(2026, 4, 1), ''))
+# Balance NEVER changes, in ANY of the 3 FYs — not just "mid-year", but
+# straight across every FY boundary too (no capitalization step exists
+# anymore at all).
+balance_always_flat = all(round(s['balance'], 2) == 100000.0 for s in fy3_segments)
 check(
-    "FY 2026-27 opens on closing principal + FY 2025-26 total interest (110,000.00)",
-    110000.0,
-    round(apr1_seg['balance'], 2) if apr1_seg else None,
+    "balance stays flat at 100,000.00 across all 3 FYs, including every FY boundary "
+    "(no capitalization anywhere, ever)",
+    True, balance_always_flat,
+)
+
+fy_totals_3 = borrowings._compute_fy_totals(fy3_monthly, fy3_month_bal)
+check("_compute_fy_totals produced entries for FY 2024-25, 2025-26, 2026-27",
+      True, {'2024-25', '2025-26', '2026-27'} <= set(fy_totals_3.keys()))
+
+# Each FULL FY (all three are exactly 365 real days here) accrues the SAME
+# interest — 100000 * 0.10 * 365/365 = 10,000.00 — never growing, since the
+# balance the NEXT FY's interest is computed on is never inflated by the
+# PREVIOUS FY's interest.
+for fy_label in ('2024-25', '2025-26', '2026-27'):
+    check(f"FY {fy_label} own interest == 10,000.00 (flat 100,000 @ 10%, 365 days, no compounding)",
+          10000.0, fy_totals_3[fy_label]['interest'])
+
+# closing_principal is IDENTICAL in every FY — 100,000.00, untouched by any
+# amount of accrued interest.
+for fy_label in ('2024-25', '2025-26', '2026-27'):
+    check(f"FY {fy_label} closing_principal == 100,000.00 (interest never folds into principal)",
+          100000.0, fy_totals_3[fy_label]['closing_principal'])
+
+# cumulative_interest / total arithmetic across all 3 FYs — a running sum,
+# never reset, never rebased on a capitalized balance.
+check("FY 2024-25 cumulative_interest == 10,000.00 (first FY — no earlier interest to add)",
+      10000.0, fy_totals_3['2024-25']['cumulative_interest'])
+check("FY 2025-26 cumulative_interest == 20,000.00 (10,000 + 10,000)",
+      20000.0, fy_totals_3['2025-26']['cumulative_interest'])
+check("FY 2026-27 cumulative_interest == 30,000.00 (10,000 + 10,000 + 10,000)",
+      30000.0, fy_totals_3['2026-27']['cumulative_interest'])
+
+check("FY 2024-25 total == closing_principal + cumulative_interest (100,000 + 10,000 = 110,000.00)",
+      110000.0, fy_totals_3['2024-25']['total'])
+check("FY 2025-26 total == closing_principal + cumulative_interest (100,000 + 20,000 = 120,000.00)",
+      120000.0, fy_totals_3['2025-26']['total'])
+check("FY 2026-27 total == closing_principal + cumulative_interest (100,000 + 30,000 = 130,000.00)",
+      130000.0, fy_totals_3['2026-27']['total'])
+
+# THE key regression-pinning invariant: the next FY's "Brought Forward" is
+# `closing_principal`, NEVER `total` — explicitly confirm this differs from
+# what the OLD (capitalizing) model would have carried forward.
+check(
+    "FY 2025-26's closing_principal (what 'Brought Forward' into FY 2026-27 must equal) "
+    "== FY 2024-25's closing_principal (100,000.00) — principal-only carry-forward",
+    fy_totals_3['2024-25']['closing_principal'], fy_totals_3['2025-26']['closing_principal'],
+)
+check(
+    "FY 2025-26's closing_principal (100,000.00) != FY 2024-25's total (110,000.00) — "
+    "'Brought Forward' must NOT equal the old capitalizing model's carried-forward figure",
+    True, fy_totals_3['2025-26']['closing_principal'] != fy_totals_3['2024-25']['total'],
+)
+
+# ── A second fixture, with a REAL transaction inside the middle FY, so
+# closing_principal actually changes FY-to-FY — proves "brought forward ==
+# closing_principal" holds even when principal itself moves, and that the
+# transaction-driven change is untouched by interest accrual. ────────────────
+fy3b_fixture = [
+    row(date(2024, 4, 1), 'OPEN-1', credit=100000.0),
+    row(date(2025, 6, 1), 'ADD-1', credit=50000.0),   # FY 2025-26 — principal grows here
+    row(date(2026, 8, 1), 'PAY-1', debit=20000.0),    # FY 2026-27 — principal shrinks here
+]
+fy3b_segments, fy3b_monthly, fy3b_month_bal, _ = borrowings.compute_interest_segments(
+    fy3b_fixture, rate=10.0, to_date=fy3_to_date,
+)
+fy_totals_3b = borrowings._compute_fy_totals(fy3b_monthly, fy3b_month_bal)
+
+check("[with mid-FY transactions] FY 2024-25 closing_principal == 100,000.00 (no transactions yet)",
+      100000.0, fy_totals_3b['2024-25']['closing_principal'])
+check("[with mid-FY transactions] FY 2025-26 closing_principal == 150,000.00 (100,000 + 50,000 credit)",
+      150000.0, fy_totals_3b['2025-26']['closing_principal'])
+check("[with mid-FY transactions] FY 2026-27 closing_principal == 130,000.00 (150,000 - 20,000 debit)",
+      130000.0, fy_totals_3b['2026-27']['closing_principal'])
+
+# Independent cross-check: reconstruct the closing principal directly from
+# the raw transaction deltas (bypassing the engine entirely) and confirm it
+# matches — proves interest never leaked into the figure the engine reports
+# as closing_principal, even with real transactions moving it FY-to-FY.
+expected_closing_2026_27 = round(100000.0 + 50000.0 - 20000.0, 2)
+check(
+    "[with mid-FY transactions] FY 2026-27 closing_principal == sum(credit) - sum(debit) computed "
+    "independently from the raw rows (100,000 + 50,000 - 20,000 = 130,000.00)",
+    expected_closing_2026_27, fy_totals_3b['2026-27']['closing_principal'],
 )
 
 
@@ -489,11 +567,12 @@ for r in real_interest_rows:
 check("every monthly interest line is dated month-end (or the window end for the truncated month)",
       True, dates_ok)
 
-# --- 3. interest line items never alter balance ------------------------------
-# For every pair of consecutive months that does NOT cross an FY boundary, the
-# balance carried into the first event of month M+1 must equal month M's last
-# segment balance exactly -- i.e. nothing but real transaction deltas (never
-# the interest itself) moved the balance across the month line.
+# --- 3. interest line items never alter balance -------------------------------
+# For EVERY pair of consecutive months -- including FY boundaries, since
+# capitalization no longer exists at all -- the balance carried into the
+# first event of month M+1 must equal month M's last segment balance
+# exactly -- i.e. nothing but real transaction deltas (never the interest
+# itself, and never an FY-boundary step) ever moves the balance.
 by_month_first_seg = {}
 for seg in real_segments:
     key = (seg['date'].year, seg['date'].month)
@@ -503,40 +582,46 @@ for seg in real_segments:
 interest_never_alters_balance = True
 for i in range(len(expected_months) - 1):
     m_cur, m_next = expected_months[i], expected_months[i + 1]
-    if borrowings._fy_start_year(date(*m_cur, 1)) != borrowings._fy_start_year(date(*m_next, 1)):
-        continue  # FY boundary -- capitalization legitimately changes balance here
     if m_cur not in real_month_bal or m_next not in by_month_first_seg:
         continue
     next_seg = by_month_first_seg[m_next]
     balance_before_next_delta = round(next_seg['balance'] - next_seg['delta'], 2)
     if balance_before_next_delta != real_month_bal[m_cur]:
         interest_never_alters_balance = False
-check("interest line items never alter balance (verified across every non-FY-boundary month transition)",
-      True, interest_never_alters_balance)
+check(
+    "interest line items never alter balance, verified across EVERY month transition "
+    "including the FY boundary (no capitalization step exists anymore)",
+    True, interest_never_alters_balance,
+)
 
-# --- 4. principal balance at 2026-03-31 (before FY capitalization) equals ----
-#        total credit minus total debit for rows up to that date, arithmetically
+# --- 4. principal balance at 2026-03-31 equals total credit minus total -------
+#        debit for rows up to that date, arithmetically (always true now --
+#        balance is ALWAYS pure principal, never touched by interest, at any
+#        point, not just "before capitalization")
 expected_bal_2026_03_31 = round(
     sum(credit for d, _, _, debit, credit in REAL_ROWS_RAW if d <= '2026-03-31')
     - sum(debit for d, _, _, debit, credit in REAL_ROWS_RAW if d <= '2026-03-31'),
     2,
 )
 actual_bal_2026_03_31 = real_month_bal.get((2026, 3))
-check("principal balance at 2026-03-31 (pre-capitalization) == total credit - total debit up to that date",
+check("principal balance at 2026-03-31 == total credit - total debit up to that date",
       expected_bal_2026_03_31, actual_bal_2026_03_31)
 
-# --- 5. FY 26-27 opening balance == FY 25-26 closing principal + FY interest -
-fy2526_months = [(y, m) for (y, m) in expected_months if borrowings._fy_start_year(date(y, m, 1)) == 2025]
-fy2526_total_interest = round(sum(real_monthly.get(k, 0.0) for k in fy2526_months), 2)
+# --- 5. FY 26-27 opening balance == FY 25-26 closing principal (interest -----
+#        NEVER added — 2026-08-06 model change: only principal carries
+#        forward into the next FY)
 fy2526_closing_principal = real_month_bal.get((2026, 3))
-expected_fy2627_opening = round(fy2526_closing_principal + fy2526_total_interest, 2)
+expected_fy2627_opening = fy2526_closing_principal
 # April 2026 has no real transaction before BP2627-90 (2026-06-17), so its
 # ENTIRE segment (the auto month-boundary at 2026-04-01) sits at the
-# capitalized opening value the whole month -- month_last_balance[(2026,4)]
-# IS that opening value.
+# untouched carried-forward principal the whole month -- month_last_balance
+# [(2026,4)] IS that value.
 actual_fy2627_opening = real_month_bal.get((2026, 4))
-check("FY 26-27 opening balance == FY 25-26 (closing principal + total FY interest)",
-      expected_fy2627_opening, actual_fy2627_opening)
+check(
+    "FY 26-27 opening balance == FY 25-26 closing principal EXACTLY "
+    "(no interest added — only principal is brought forward)",
+    expected_fy2627_opening, actual_fy2627_opening,
+)
 
 # --- 6. total interest reported == sum of the monthly line items ------------
 grand_total_interest = round(sum(r['interest'] for r in real_interest_rows), 2)
@@ -545,6 +630,12 @@ check("total interest reported == sum of the monthly line items",
       sum_of_monthly_buckets, grand_total_interest)
 
 # --- readable report table, printed verbatim for the coordinator/user -------
+# Uses borrowings._compute_fy_totals() (the same single-source-of-truth the
+# renderer reads) for the FY summary figures — closing_principal / interest
+# (that FY only) / cumulative_interest / total (principal + every FY's
+# interest accrued so far) — rather than re-deriving them ad hoc here.
+real_fy_totals = borrowings._compute_fy_totals(real_monthly, real_month_bal)
+
 print("\n--- Monthly interest line items (LEVAKA HARANATHA REDDY, 12% p.a.) ---")
 print(f"{'Month':<10} {'Date':<12} {'Balance':>14} {'Interest':>14}")
 fy2627_months = [(y, m) for (y, m) in expected_months if borrowings._fy_start_year(date(y, m, 1)) == 2026]
@@ -555,33 +646,39 @@ for r in real_interest_rows:
     bal = real_month_bal.get((y, m))
     print(f"{label:<10} {r['transaction_date']:<12} {bal:>14,.2f} {r['interest']:>14,.2f}")
     if (y, m) == (2026, 3):
+        fy2526 = real_fy_totals['2025-26']
         print(f"\n--- FY 2025-26 summary ---")
-        print(f"{'Total Principal Amount':<28} {fy2526_closing_principal:>14,.2f}")
-        print(f"{'Total Interest Amount':<28} {fy2526_total_interest:>14,.2f}")
-        print(f"{'Total Amount':<28} {round(fy2526_closing_principal + fy2526_total_interest, 2):>14,.2f}")
-        print(f"\nBrought forward into FY 2026-27: {expected_fy2627_opening:>14,.2f}")
+        print(f"{'Total Principal Amount':<28} {fy2526['closing_principal']:>14,.2f}")
+        print(f"{'Interest FY 2025-26':<28} {fy2526['interest']:>14,.2f}")
+        print(f"{'Total Payable Amount':<28} {fy2526['total']:>14,.2f}")
+        print(f"\nBrought forward into FY 2026-27 (PRINCIPAL ONLY): {fy2526['closing_principal']:>14,.2f}")
         print(f"\n--- FY 2026-27 monthly lines ---")
         print(f"{'Month':<10} {'Date':<12} {'Balance':>14} {'Interest':>14}")
 
-fy2627_total_interest = round(sum(real_monthly.get(k, 0.0) for k in fy2627_months), 2)
-fy2627_closing_principal = real_month_bal.get(fy2627_months[-1]) if fy2627_months else None
+fy2627 = real_fy_totals.get('2026-27')
 print(f"\n--- FY 2026-27 summary (through {_REAL_TO_DATE.isoformat()}, window end -- not a full FY) ---")
-print(f"{'Total Principal Amount':<28} {fy2627_closing_principal:>14,.2f}")
-print(f"{'Total Interest Amount':<28} {fy2627_total_interest:>14,.2f}")
-print(f"{'Total Amount':<28} {round(fy2627_closing_principal + fy2627_total_interest, 2):>14,.2f}")
+if fy2627:
+    print(f"{'Total Principal Amount':<28} {fy2627['closing_principal']:>14,.2f}")
+    print(f"{'Interest FY 2026-27':<28} {fy2627['interest']:>14,.2f}")
+    print(f"{'Total Payable Amount':<28} {fy2627['total']:>14,.2f}  "
+          f"(= principal + cumulative interest {fy2627['cumulative_interest']:,.2f})")
 
 print(f"\n--- Grand total interest, 2025-04-30 to {_REAL_TO_DATE.isoformat()} ---")
 print(f"{'Grand Total Interest':<28} {grand_total_interest:>14,.2f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. FY-BOUNDARY CONTINUITY INVARIANT (2026-08-06 fix verification) —
-#    a FY's Total Amount must equal the balance on the first row of the next
-#    FY when no transaction intervenes. Uses compute_borrowings_interest()
-#    end-to-end (via a stub DB connection) on the REAL LEVAKA HARANATHA REDDY
-#    data — this is the exact account/scenario the original bug report was
-#    filed against (a 2-paisa self-contradiction between FY 2025-26's
-#    printed "Total Amount" and the very next row's balance).
+# 6. FY-BOUNDARY CONTINUITY INVARIANT (2026-08-06; rewritten the same day for
+#    the "interest never carried forward" model change) —
+#    a FY's closing_principal (NOT total — total now includes cumulative
+#    interest, which is NEVER folded into balance) must equal the balance on
+#    the first row of the next FY when no transaction intervenes. Uses
+#    compute_borrowings_interest() end-to-end (via a stub DB connection) on
+#    the REAL LEVAKA HARANATHA REDDY data — this is the exact account/scenario
+#    the original FY-boundary rounding bug report was filed against; under the
+#    new model the invariant shifts from "Total Amount carries forward
+#    byte-identically" to "closing_principal carries forward exactly, and
+#    interest is tracked/displayed separately, never folded into balance".
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n=== 6. FY-boundary continuity invariant (Task 1 fix) ===")
@@ -638,11 +735,21 @@ real_result = borrowings.compute_borrowings_interest(
 check("compute_borrowings_interest returns a fy_totals entry for FY 2025-26",
       True, '2025-26' in real_result['fy_totals'])
 
+fy2526_closing_principal_r6 = real_result['fy_totals']['2025-26']['closing_principal']
 fy2526_total_amount = real_result['fy_totals']['2025-26']['total']
-check("fy_totals['2025-26']['total'] matches the CLAUDE.md reference figure (55,77,494.20)",
+# FY 2025-26 is this account's VERY FIRST FY (its earliest transaction,
+# 2025-04-30, falls inside it) — so cumulative_interest for this FY equals
+# that FY's own interest exactly (nothing earlier to add), which is why the
+# reference figure below is UNCHANGED by the interest-never-carried-forward
+# model change even though `total`'s general formula did change.
+check("fy_totals['2025-26']['total'] matches the CLAUDE.md reference figure (55,77,494.20) — "
+      "unchanged because this is the account's first FY (cumulative_interest == interest here)",
       5577494.20, fy2526_total_amount)
 check("fy_totals['2025-26']['interest'] matches the CLAUDE.md reference figure (4,14,419.20)",
       414419.20, real_result['fy_totals']['2025-26']['interest'])
+check("fy_totals['2025-26']['cumulative_interest'] == fy_totals['2025-26']['interest'] (first FY)",
+      real_result['fy_totals']['2025-26']['interest'],
+      real_result['fy_totals']['2025-26']['cumulative_interest'])
 
 # The first row chronologically inside FY 2026-27 (April 2026 has no real
 # transaction until BP2627-90 on 2026-06-17, so the April interest line
@@ -655,17 +762,26 @@ fy2627_rows = sorted(
 first_fy2627_row = fy2627_rows[0] if fy2627_rows else None
 check("a row exists at the start of FY 2026-27", True, first_fy2627_row is not None)
 check(
-    "FY 2025-26's Total Amount == the balance on the first FY 2026-27 row (no more 2-paisa discontinuity)",
-    fy2526_total_amount,
+    "FY 2025-26's closing_principal == the balance on the first FY 2026-27 row "
+    "(principal-only carry-forward — interest is tracked separately, never folded into balance)",
+    fy2526_closing_principal_r6,
     first_fy2627_row['balance'] if first_fy2627_row else None,
+)
+check(
+    "FY 2025-26's closing_principal != FY 2025-26's total (55,77,494.20) — the balance carried "
+    "forward is NOT the old capitalizing model's figure",
+    True, fy2526_closing_principal_r6 != fy2526_total_amount,
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. /borrowings/summary-fy ROLL-FORWARD INVARIANT (Task 6) —
-#    closing == opening + taken - paid + interest for every account/FY, and
-#    each FY's opening equals the prior FY's closing. Two synthetic accounts
-#    with activity in different, overlapping FYs, via a stub DB connection.
+# 7. /borrowings/summary-fy ROLL-FORWARD INVARIANT (Task 6; rewritten
+#    2026-08-06 for the "interest never carried forward" model change) —
+#    closing == opening + taken - paid (PRINCIPAL ONLY, interest excluded),
+#    each FY's opening equals the prior FY's closing, cumulative_interest is
+#    a running sum of that FY's own interest, and total_payable == closing +
+#    cumulative_interest. Two synthetic accounts with activity in different,
+#    overlapping FYs, via a stub DB connection.
 # ══════════════════════════════════════════════════════════════════════════════
 
 print("\n=== 7. /borrowings/summary-fy roll-forward invariant (Task 6) ===")
@@ -751,25 +867,43 @@ for label, include_interest_flag in (('include_interest=0', False), ('include_in
     for row in summary['rows']:
         acct = row['account']
         prior_closing = 0.0
+        prior_cumulative_interest = 0.0
         roll_forward_ok = True
         opening_matches_prior_ok = True
+        cumulative_interest_ok = True
+        total_payable_ok = True
         for fy in summary['fys']:
             fy_data = row['fys'].get(fy)
             if fy_data is None:
                 roll_forward_ok = False
                 continue
-            expected_closing = round(fy_data['opening'] + fy_data['taken'] - fy_data['paid'] + fy_data['interest'], 2)
+            # PRINCIPAL ONLY — interest is never added here (2026-08-06 model
+            # change: interest is never carried forward).
+            expected_closing = round(fy_data['opening'] + fy_data['taken'] - fy_data['paid'], 2)
             if round(fy_data['closing'], 2) != expected_closing:
                 roll_forward_ok = False
             if round(fy_data['opening'], 2) != round(prior_closing, 2):
                 opening_matches_prior_ok = False
+            expected_cumulative_interest = round(prior_cumulative_interest + fy_data['interest'], 2)
+            if round(fy_data['cumulative_interest'], 2) != expected_cumulative_interest:
+                cumulative_interest_ok = False
+            expected_total_payable = round(fy_data['closing'] + fy_data['cumulative_interest'], 2)
+            if round(fy_data['total_payable'], 2) != expected_total_payable:
+                total_payable_ok = False
             prior_closing = fy_data['closing']
-        check(f"[{label}] {acct}: closing == opening + taken - paid + interest for every FY",
+            prior_cumulative_interest = fy_data['cumulative_interest']
+        check(f"[{label}] {acct}: closing == opening + taken - paid (PRINCIPAL ONLY) for every FY",
               True, roll_forward_ok)
         check(f"[{label}] {acct}: each FY's opening == the prior FY's closing",
               True, opening_matches_prior_ok)
-        check(f"[{label}] {acct}: row-level 'closing' == the last FY's closing",
+        check(f"[{label}] {acct}: cumulative_interest == running sum of that FY's own interest",
+              True, cumulative_interest_ok)
+        check(f"[{label}] {acct}: total_payable == closing + cumulative_interest for every FY",
+              True, total_payable_ok)
+        check(f"[{label}] {acct}: row-level 'closing' == the last FY's closing (principal only)",
               round(prior_closing, 2), round(row['closing'], 2))
+        check(f"[{label}] {acct}: row-level 'total_payable' == last closing + last cumulative_interest",
+              round(prior_closing + prior_cumulative_interest, 2), round(row['total_payable'], 2))
 
     # Every account's fys map contains an entry for EVERY fy in the list
     # (rectangular matrix, no null-checks needed by the caller).
@@ -782,11 +916,35 @@ for label, include_interest_flag in (('include_interest=0', False), ('include_in
     # totals are column-wise sums across accounts, same shape.
     totals_ok = True
     for fy in summary['fys']:
-        for key in ('opening', 'taken', 'paid', 'interest', 'closing'):
+        for key in ('opening', 'taken', 'paid', 'interest', 'closing', 'cumulative_interest', 'total_payable'):
             expected_sum = round(sum(row['fys'][fy][key] for row in summary['rows']), 2)
             if round(summary['totals'][fy][key], 2) != expected_sum:
                 totals_ok = False
-    check(f"[{label}] totals are column-wise sums across accounts", True, totals_ok)
+    check(f"[{label}] totals (incl. cumulative_interest/total_payable) are column-wise sums across accounts",
+          True, totals_ok)
+
+    if include_interest_flag:
+        # With a nonzero rate configured for both accounts, interest must be
+        # strictly positive once activity exists — proving the toggle
+        # produces a real amount, even though it never affects `closing`.
+        any_interest_present = any(
+            fy_data['interest'] > 0.0
+            for row in summary['rows']
+            for fy_data in row['fys'].values()
+        )
+        check(f"[{label}] at least one FY shows nonzero interest (rate configured)",
+              True, any_interest_present)
+        # And `closing` (principal) must be IDENTICAL to the include_interest=0
+        # run for the very same fixture — the interest toggle changes
+        # interest/cumulative_interest/total_payable ONLY, never `closing`.
+        summary_off_for_compare = borrowings.compute_borrowings_summary_fy(summary_stub_conn, False)
+        closing_identical = all(
+            round(row_on['fys'][fy]['closing'], 2) == round(row_off['fys'][fy]['closing'], 2)
+            for row_on, row_off in zip(summary['rows'], summary_off_for_compare['rows'])
+            for fy in summary['fys']
+        )
+        check(f"[{label}] 'closing' (principal) is IDENTICAL to the include_interest=0 run "
+              "(the toggle never changes principal)", True, closing_identical)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -891,6 +1049,7 @@ check("[include_interest=0] FY2's opening == closing == 5,00,000.00 (FY1's taken
 
 gap_on_row = next(r for r in gap_on['rows'] if r['account'] == _GAP_ACCOUNT)
 fy2_on = gap_on_row['fys']['2024-25']
+fy1_on = gap_on_row['fys']['2023-24']
 check("[include_interest=1] FY2 (dormant) still has zero taken/paid (no transactions that year)",
       (0.0, 0.0), (fy2_on['taken'], fy2_on['paid']))
 check("[include_interest=1] FY2's opening == the prior FY's (FY1's) closing",
@@ -900,6 +1059,25 @@ check("[include_interest=1] FY2's opening == the prior FY's (FY1's) closing",
 # transactions) -- demonstrating the toggle changes AMOUNTS, never coverage.
 check("[include_interest=1] FY2 accrues nonzero interest (rate=12%, dormant but not interest-free)",
       True, fy2_on['interest'] > 0.0)
+# 2026-08-06 model change: `closing` (principal) must be IDENTICAL between
+# include_interest=0 and include_interest=1 for EVERY FY, including the
+# dormant one — interest never touches principal, in either mode, anymore.
+check("[both modes] FY2's closing (principal) is IDENTICAL whether include_interest is 0 or 1",
+      fy2_off['closing'], fy2_on['closing'])
+check("[both modes] FY1's closing (principal) is IDENTICAL whether include_interest is 0 or 1",
+      fy1_off['closing'], fy1_on['closing'])
+# cumulative_interest / total_payable arithmetic through the dormant FY —
+# FY2 accrues real interest (checked above) even though taken/paid are zero,
+# so cumulative_interest must strictly increase from FY1 to FY2, and
+# total_payable must reflect principal (unchanged) + the growing interest.
+check("[include_interest=1] FY2's cumulative_interest == FY1's cumulative_interest + FY2's own interest",
+      round(fy1_on['cumulative_interest'] + fy2_on['interest'], 2),
+      round(fy2_on['cumulative_interest'], 2))
+check("[include_interest=1] FY2's cumulative_interest > FY1's (strictly increasing, dormant FY still accrues)",
+      True, fy2_on['cumulative_interest'] > fy1_on['cumulative_interest'])
+check("[include_interest=1] FY2's total_payable == FY2's closing (principal, unchanged) + FY2's cumulative_interest",
+      round(fy2_on['closing'] + fy2_on['cumulative_interest'], 2),
+      round(fy2_on['total_payable'], 2))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

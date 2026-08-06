@@ -696,6 +696,14 @@ def _handle_borrowings_pdf(account: str, from_date: str, to_date: str, include_i
     try:
         if include_interest:
             payload = _brw.compute_borrowings_interest(conn, account, from_date, to_date)
+            # Single-account mode only — feeds the PDF's "Rate of Interest"
+            # summary line (added 2026-08-06, interest-never-carried-forward
+            # model change). None in all-accounts mode (rate differs per
+            # account there — the renderer omits the line entirely).
+            rate = None
+            if account:
+                rate_map = _brw.compute_borrowing_rate_map(conn, [account])
+                rate = rate_map.get(account)
         else:
             rows = _brw.compute_borrowings_rows(conn, account, from_date, to_date)
     finally:
@@ -705,7 +713,7 @@ def _handle_borrowings_pdf(account: str, from_date: str, to_date: str, include_i
     if include_interest:
         pdf_bytes = borrowings_pdf.render_borrowings_interest_pdf(
             payload['rows'], payload['missing_rate_accounts'], payload.get('fy_totals', {}),
-            account, from_date, to_date,
+            account, from_date, to_date, rate=rate,
         )
     else:
         pdf_bytes = borrowings_pdf.render_borrowings_pdf(rows, account, from_date, to_date)

@@ -32,12 +32,13 @@ compute_borrowing_rate_map(conn, accounts=None) -> dict[str, float]
 
 compute_interest_segments(txn_rows, rate, to_date, from_date=None)
     -> (segments, monthly_interest, month_last_balance, opening_balance)
-    The low-level, per-EVENT interest-accrual engine — this is the exact
-    algorithm from the task spec (event list, month-boundary carry-forward
-    events, terminal boundary, simple 365-day interest per segment, FY
-    capitalization at 31 March) and is what the reference test in
-    test_borrowings_interest.py exercises directly. See the docstring below
-    for the full algorithm description.
+    The low-level, per-EVENT interest-accrual engine — event list,
+    month-boundary carry-forward events, terminal boundary, simple 365-day
+    interest per segment on PRINCIPAL ONLY. Interest is NEVER capitalized
+    into the running balance (2026-08-06 model change) — `balance` moves
+    only on transaction deltas, so interest never compounds and each FY's
+    interest is tracked/reported separately (see _compute_fy_totals). See
+    the docstring below for the full algorithm description.
 
 compute_borrowings_interest(conn, account, from_date, to_date) -> dict
     The GET /borrowings?include_interest=1 (and GET /borrowings/pdf
@@ -203,7 +204,11 @@ def compute_interest_segments(
     to_date: date,
     from_date: date | None = None,
 ) -> tuple[list[dict], dict[tuple[int, int], float], dict[tuple[int, int], float], float]:
-    """The exact per-EVENT algorithm from the task spec, for ONE account.
+    """The per-EVENT interest-accrual algorithm, for ONE account. Interest
+    is NEVER capitalized into principal (2026-08-06 model change) — only
+    transaction deltas ever change `balance`; each FY's interest is
+    computed and reported separately (see _compute_fy_totals), never
+    carried forward or compounded.
 
     Parameters
     ----------
@@ -233,20 +238,18 @@ def compute_interest_segments(
         {'kind': 'transaction'|'boundary', 'date': date, 'voucher_no': str,
          'transaction_name': str, 'debit': float, 'credit': float,
          'delta': float, 'balance': float, 'days': int, 'interest': float}
-        'balance' is the running PRINCIPAL after this event's delta (and
-        after any FY capitalization applied at this event, if it is the
-        first event of a new financial year — see below). Interest is
-        stored UNROUNDED (full float precision) — round only for display.
+        'balance' is the running PRINCIPAL after this event's delta — ONLY
+        ever changed by transaction deltas, never by interest (there is no
+        capitalization step anymore). Interest is stored UNROUNDED (full
+        float precision) — round only for display.
     monthly_interest : {(year, month): float} — sum of every segment's
         (unrounded) interest whose event date falls in that (year, month) —
         i.e. attributed to the segment's START month (a segment never
         straddles a month boundary, since a boundary event always exists at
         every month's 1st unless a real transaction already occupies it).
     month_last_balance : {(year, month): float} — the running principal as
-        of the LAST segment starting in that month (captured before any
-        later capitalization jump, which by construction always lands in a
-        different month — April). Used as the "balance" shown on that
-        month's synthetic interest line item.
+        of the LAST segment starting in that month. Used as the "balance"
+        shown on that month's synthetic interest line item.
     opening_balance : float — see `from_date` above; 0.0 if from_date is
         None or txn_rows is empty.
 
@@ -263,17 +266,13 @@ def compute_interest_segments(
     4. A terminal boundary is appended at to_date + 1 day.
     5. Walking events in order: balance += delta; days = date-gap to the
        NEXT event; interest_segment = balance * (rate/100) * days/365 —
-       365-day year, simple interest, never compounded within a year
-       (interest is never added to balance except at the FY step below).
-    6. FY capitalization (1 April - 31 March): when an event's date crosses
-       into a new financial year (relative to the previous event), the FY
-       just closed's total accrued interest (sum of its Apr-Mar monthly
-       buckets, which are guaranteed complete by this point since events are
-       processed strictly chronologically) is added to `balance` BEFORE
-       applying this event's own delta — so the new FY opens on
-       closing principal + that FY's total interest, and the next FY's
-       interest compounds on the higher figure (interest compounds
-       annually, never monthly).
+       365-day year, simple interest on PRINCIPAL ONLY. `balance` is NEVER
+       adjusted for interest, at any point — no FY-boundary capitalization
+       step, no compounding of any kind (2026-08-06 model change: interest
+       is never carried forward, only principal is; each FY's interest is
+       tracked separately via monthly_interest / _compute_fy_totals and
+       accumulates as an outstanding payable rather than being folded back
+       into the balance that future interest is computed on).
     """
     if not txn_rows:
         return [], {}, {}, 0.0
@@ -331,22 +330,12 @@ def compute_interest_segments(
     month_last_balance: dict[tuple[int, int], float] = {}
     balance = 0.0
     opening_balance = 0.0
-    current_fy = _fy_start_year(events[0]['date'])
 
     for i in range(len(events) - 1):  # last event is the terminal boundary — no segment starts there
         ev = events[i]
-        ev_fy = _fy_start_year(ev['date'])
-        if ev_fy != current_fy:
-            # Crossing into a new financial year: capitalize the FY just
-            # closed's total accrued interest into principal (step 6) BEFORE
-            # applying this event's own delta.
-            fy_total = sum(
-                amt for (yy, mm), amt in monthly_interest.items()
-                if _fy_start_year(date(yy, mm, 1)) == current_fy
-            )
-            balance = round(balance + fy_total, 2)
-            current_fy = ev_fy
-
+        # balance changes ONLY via this event's own transaction delta —
+        # interest is never capitalized into it (2026-08-06 model change:
+        # interest is never carried forward, only principal is).
         balance = round(balance + ev['delta'], 2)
 
         if from_date is not None and ev['date'] < from_date:
@@ -428,28 +417,33 @@ def _compute_fy_totals(
     monthly_interest: dict[tuple[int, int], float],
     month_last_balance: dict[tuple[int, int], float],
 ) -> dict[str, dict]:
-    """Per-FY {closing_principal, interest, total}, derived ENTIRELY from the
-    engine's own (unrounded) monthly_interest / month_last_balance — the
-    single source of truth for FY summary figures (added 2026-08-06, fixes
-    the FY-boundary rounding discontinuity: the old PDF renderer re-summed
-    already-2dp-rounded per-row interest values, a double-rounding that could
-    disagree by a paisa or two with the balance the engine itself capitalizes
-    into the next FY's opening balance).
+    """Per-FY {closing_principal, interest, cumulative_interest, total},
+    derived ENTIRELY from the engine's own (unrounded) monthly_interest /
+    month_last_balance — the single source of truth for FY summary figures,
+    so both the JSON endpoint and the PDF renderer read these same numbers
+    and round exactly once (avoids double-rounding drift between the two).
 
-    closing_principal : the running principal as of the LAST event in that FY
-        — i.e. month_last_balance's value for that FY's last (year, month)
-        key — captured BEFORE that FY's own interest is capitalized into the
-        next FY (see compute_interest_segments: the capitalization happens on
-        the FIRST event of the FOLLOWING fy, strictly after this value was
-        already recorded, so it is exactly the pre-capitalization balance).
+    INVARIANT (2026-08-06 model change — interest is never carried forward):
+    the next FY's "Brought Forward" is `closing_principal`, NEVER `total` —
+    interest is tracked/displayed separately per FY and accumulates as an
+    outstanding payable, but it never feeds back into the balance future
+    interest is computed on.
+
+    closing_principal : the running principal as of the LAST event in that
+        FY — i.e. month_last_balance's value for that FY's last (year,
+        month) key. Since compute_interest_segments no longer capitalizes
+        interest into `balance` at all, this is simply the principal after
+        every transaction delta up to and including that FY — nothing is
+        ever added to or subtracted from it on account of interest.
     interest : sum of that FY's (unrounded) monthly_interest values, rounded
-        to 2dp exactly once here.
-    total : closing_principal + interest, rounded to 2dp exactly once — this
-        is byte-identical to the balance compute_interest_segments itself
-        computes when it capitalizes this FY (`round(balance + fy_total, 2)`
-        with the SAME unrounded fy_total and the SAME pre-capitalization
-        balance), so "Total Amount" and the next FY's "Brought Forward" can
-        never disagree.
+        to 2dp exactly once here — THAT FY's own interest only.
+    cumulative_interest : running sum of `interest` across every FY from the
+        earliest through this one (inclusive) — since interest is never
+        capitalized into principal, it must be tracked FY-by-FY as an
+        accumulating payable instead.
+    total : closing_principal + cumulative_interest, rounded to 2dp exactly
+        once — the "Total Payable Amount": this FY's principal PLUS every
+        FY's interest accrued so far (not just this FY's own interest).
     """
     if not monthly_interest and not month_last_balance:
         return {}
@@ -468,13 +462,16 @@ def _compute_fy_totals(
             closing_principal_by_fy[fy] = (key, bal)
 
     fy_totals: dict[str, dict] = {}
+    cumulative_interest = 0.0
     for fy in sorted(set(interest_by_fy) | set(closing_principal_by_fy)):
         closing_principal = round(closing_principal_by_fy.get(fy, (None, 0.0))[1], 2)
         interest = round(interest_by_fy.get(fy, 0.0), 2)
+        cumulative_interest = round(cumulative_interest + interest, 2)
         fy_totals[_fy_key(fy)] = {
             'closing_principal': closing_principal,
             'interest': interest,
-            'total': round(closing_principal + interest, 2),
+            'cumulative_interest': cumulative_interest,
+            'total': round(closing_principal + cumulative_interest, 2),
         }
     return fy_totals
 
@@ -547,10 +544,12 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
             them — they always survive).
         missing_rate_accounts : sorted list of in-scope accounts that had no
             configured borrowing_rate row (rate defaulted to 0% for them).
-        fy_totals : {fy_label: {closing_principal, interest, total}} (added
-            2026-08-06, Task 1) — SINGLE-ACCOUNT mode only (populated only
+        fy_totals : {fy_label: {closing_principal, interest,
+            cumulative_interest, total}} (added 2026-08-06, Task 1;
+            `cumulative_interest` added when interest capitalization was
+            removed the same day) — SINGLE-ACCOUNT mode only (populated only
             when `account` is given); empty dict `{}` in all-accounts mode,
-            where a per-account capitalized principal has no well-defined
+            where a per-account principal roll-forward has no well-defined
             merged analogue (same reasoning the multi-account balance=null
             rule already documents). Computed via _compute_fy_totals() from
             the engine's own unrounded monthly_interest/month_last_balance —
@@ -630,14 +629,24 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     Semantics (see the API docstring in handler.py for the full contract):
       taken   = that FY's Σ credit for the account (money received)
       paid    = that FY's Σ debit for the account (repayment)
-      interest = that FY's capitalized interest from the engine (0.0 for
-                 every FY when include_interest is False)
-      closing = opening + taken - paid + interest
+      interest = that FY's own interest accrued from the engine (0.0 for
+                 every FY when include_interest is False) — NEVER folded
+                 into `closing` (2026-08-06 model change: interest is never
+                 carried forward, only principal is brought forward into
+                 the next FY).
+      closing = opening + taken - paid  (PRINCIPAL ONLY — interest is never
+                added here)
       opening = prior FY's closing (0.0 for the first FY in `fys`, and for
                 any FY before the account's own first appearance — both
-                fall out naturally since taken/paid/interest are all 0.0
-                there, so closing stays equal to the carried-forward
-                opening).
+                fall out naturally since taken/paid are 0.0 there, so
+                closing stays equal to the carried-forward opening).
+      cumulative_interest = running sum of `interest` across every FY from
+                the earliest through this one (inclusive) — tracked
+                separately since interest is never capitalized; this is the
+                account's accumulating interest payable.
+      total_payable = closing + cumulative_interest — the FY's "Total
+                Payable Amount" (this FY's principal PLUS every FY's
+                interest accrued so far, not just this FY's own interest).
 
     `fys` is the CONTIGUOUS ascending range of financial years from the
     earliest FY with any recorded activity (taken/paid) across ALL accounts
@@ -663,12 +672,15 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     -------
     {'fys': [...], 'rows': [...], 'totals': {...}, 'missing_rate_accounts': [...]}
         rows[i] = {'account': str, 'fys': {fy_label: {opening, taken, paid,
-            interest, closing}}, 'closing': float}  (`closing` = the final,
-            most-recent FY's closing balance — the account's current
-            outstanding balance)
-        totals[fy_label] = {opening, taken, paid, interest, closing} —
-            column-wise sums across every account, same shape as a row's
-            per-FY entry.
+            interest, closing, cumulative_interest, total_payable}},
+            'closing': float, 'total_payable': float}  (`closing` = the
+            final, most-recent FY's closing PRINCIPAL — the account's
+            current outstanding principal, interest excluded; `total_payable`
+            = that same `closing` plus the account's final cumulative
+            interest — the account's true current outstanding liability)
+        totals[fy_label] = {opening, taken, paid, interest, closing,
+            cumulative_interest, total_payable} — column-wise sums across
+            every account, same shape as a row's per-FY entry.
         missing_rate_accounts : only meaningful when include_interest is
             True (empty list otherwise) — sorted list of in-scope accounts
             with no configured borrowing_rate row (0% was used for them).
@@ -749,7 +761,10 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     fys = [_fy_key(fy) for fy in fy_starts_sorted]
 
     totals_by_fy: dict[str, dict] = {
-        fy_label: {'opening': 0.0, 'taken': 0.0, 'paid': 0.0, 'interest': 0.0, 'closing': 0.0}
+        fy_label: {
+            'opening': 0.0, 'taken': 0.0, 'paid': 0.0, 'interest': 0.0,
+            'closing': 0.0, 'cumulative_interest': 0.0, 'total_payable': 0.0,
+        }
         for fy_label in fys
     }
 
@@ -761,19 +776,26 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
 
         acct_fys: dict[str, dict] = {}
         opening = 0.0
+        cumulative_interest = 0.0
         for fy in fy_starts_sorted:
             fy_label = _fy_key(fy)
             taken = round(taken_by_fy.get(fy, 0.0), 2)
             paid = round(paid_by_fy.get(fy, 0.0), 2)
             interest = round(interest_by_fy.get(fy, 0.0), 2)
             opening_r = round(opening, 2)
-            closing = round(opening_r + taken - paid + interest, 2)
+            # PRINCIPAL ONLY — interest is never folded into closing (2026-08-06
+            # model change: interest is never carried forward).
+            closing = round(opening_r + taken - paid, 2)
+            cumulative_interest = round(cumulative_interest + interest, 2)
+            total_payable = round(closing + cumulative_interest, 2)
             acct_fys[fy_label] = {
                 'opening': opening_r,
                 'taken': taken,
                 'paid': paid,
                 'interest': interest,
                 'closing': closing,
+                'cumulative_interest': cumulative_interest,
+                'total_payable': total_payable,
             }
             t = totals_by_fy[fy_label]
             t['opening'] += opening_r
@@ -781,9 +803,16 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
             t['paid'] += paid
             t['interest'] += interest
             t['closing'] += closing
+            t['cumulative_interest'] += cumulative_interest
+            t['total_payable'] += total_payable
             opening = closing
 
-        rows.append({'account': acct, 'fys': acct_fys, 'closing': round(opening, 2)})
+        rows.append({
+            'account': acct,
+            'fys': acct_fys,
+            'closing': round(opening, 2),
+            'total_payable': round(opening + cumulative_interest, 2),
+        })
 
     for fy_label in totals_by_fy:
         for key in totals_by_fy[fy_label]:
