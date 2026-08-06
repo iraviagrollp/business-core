@@ -65,11 +65,13 @@ non-FY-split, single-table Borrowings report)
   'No records for the selected period.' line (no empty/zero-row table, no
   totals row) — handled gracefully rather than erroring.
 
-render_borrowings_interest_pdf(rows, missing_rate_accounts, fy_totals, account, from_date, to_date) -> bytes
+render_borrowings_interest_pdf(rows, missing_rate_accounts, fy_totals, account, from_date, to_date, rate=None) -> bytes
     include_interest=ON report — FY-sectioned, merged interest rows, FY
     summary boxes. See the module comment directly above the function for
     full detail (added 2026-08-06; `fy_totals` param added the same day —
-    see Task 1 in the function's own comment block).
+    see Task 1 in the function's own comment block; `rate` param added the
+    same day when interest capitalization was removed — single-account mode
+    only, feeds the summary box's 'Rate of Interest' line).
 
 render_borrowings_summary_fy_pdf(data, include_interest) -> bytes
     "All accounts" FY-summary matrix (added 2026-08-06, Task 6) — landscape
@@ -532,16 +534,19 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
 #        screen and this PDF can never disagree (per the task's hard
 #        requirement).
 # fy_totals : dict returned by the same call (['fy_totals']) — single-account
-#        mode only; {fy_label: {closing_principal, interest, total}}, ALREADY
-#        rounded exactly once by the engine (borrowings._compute_fy_totals).
-#        This renderer reads these values directly for "Total Principal
-#        Amount" / "Total Interest Amount" / "Total Amount" / the next FY's
+#        mode only; {fy_label: {closing_principal, interest,
+#        cumulative_interest, total}}, ALREADY rounded exactly once by the
+#        engine (borrowings._compute_fy_totals). This renderer reads these
+#        values directly for "Total Principal Amount" / each FY's own
+#        "Interest FY <fy_key>" line / "Total Payable Amount" / the next FY's
 #        "Brought Forward" — it NEVER re-sums the already-2dp-rounded per-row
 #        `interest` values itself (that double-rounding was the root cause of
-#        the FY-boundary discontinuity bug: a FY's printed "Total Amount"
-#        could differ by a paisa or two from the balance the engine actually
-#        carries into the next FY's first row). Empty `{}` in "all accounts"
-#        mode (not applicable there — see below).
+#        the original FY-boundary discontinuity bug). Empty `{}` in "all
+#        accounts" mode (not applicable there — see below).
+# rate : the single account's configured annual borrowing_rate (percent, or
+#        None) — single-account mode only, feeds the summary box's "Rate of
+#        Interest" line (0.00% p.a. when None or the account is in
+#        missing_rate_accounts).
 #
 # Design
 # ------
@@ -580,21 +585,33 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
 #   Interest, Balance" — only matches the single-account 7-column layout).
 # - single-account mode (an `account` was given): the 7th column is a real
 #   running Balance (on transaction/opening rows only — see merge above), and
-#   the 3-line FY summary/Brought-Forward mechanism reads `fy_totals`
-#   directly (see above) rather than re-deriving anything from `rows`.
+#   the FY summary box reads `fy_totals` directly (see above) rather than
+#   re-deriving anything from `rows`. Reworked 2026-08-06 (interest never
+#   carried forward): the box now has ONE line per FY from the earliest
+#   through this FY's own key (ascending, inclusive) with non-zero own-FY
+#   interest — 'Interest FY <fy_key>' — between the always-present 'Total
+#   Principal Amount' (bold) and 'Total Payable Amount' (bold, = principal +
+#   EVERY FY's interest so far) lines, plus a trailing 'Rate of Interest'
+#   line (plain string, e.g. '12.00% p.a.', fed by the new `rate` param) —
+#   so the box grows by one row each FY, and prior-FY interest stays visible
+#   as an outstanding payable rather than disappearing into principal.
+#   'Brought Forward' into the next FY block is the PRINCIPAL-ONLY closing
+#   balance (`fy_closing_principal`) — byte-identical to that same FY's own
+#   'Total Principal Amount' line.
 # - "all accounts" mode (`account` blank): `compute_borrowings_interest`
 #   deliberately returns `balance: null` on every row once accounts are
 #   mixed (a running/closing PRINCIPAL is not a meaningful single number
 #   across different accounts — see that function's docstring), and
 #   `fy_totals` is `{}` in this mode for the same reason. The task's
-#   "Total Principal Amount" / "Total Amount" / "Brought Forward" concept is
-#   inherently a PER-ACCOUNT capitalization figure, so it has no well-defined
+#   "Total Principal Amount" / "Total Payable Amount" / "Brought Forward"
+#   concept is inherently a PER-ACCOUNT figure, so it has no well-defined
 #   analogue when accounts are merged; rather than fabricate a misleading
 #   number, this mode still sections by FY (per the task's literal ask) but
 #   the 7th column is Account (not Balance), interest rows are NOT merged
 #   (unchanged _row_cells rendering), and the per-FY summary is reduced to
 #   Total Debit / Total Credit / Total Interest only — no Brought-Forward
-#   row. This is a deliberate, documented interpretation (flagged in the
+#   row, no Rate of Interest line (rate differs per account in this mode).
+#   This is a deliberate, documented interpretation (flagged in the
 #   original task write-up) rather than an oversight.
 # - Zero-row case: same graceful 'No records for the selected period.'
 #   message as the plain report.
@@ -606,7 +623,7 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
 
 def render_borrowings_interest_pdf(
     rows: list, missing_rate_accounts: list, fy_totals: dict,
-    account: str, from_date: str, to_date: str,
+    account: str, from_date: str, to_date: str, rate: float | None = None,
 ) -> bytes:
     """Render the Borrowings Statement WITH interest as a portrait A4 PDF.
 
@@ -623,6 +640,14 @@ def render_borrowings_interest_pdf(
         module comment above; single-account mode only, `{}` otherwise.
     account : '' / None for "all accounts", else the single account name
     from_date, to_date : 'YYYY-MM-DD' strings
+    rate : the single account's configured annual borrowing_rate (percent),
+        or None — used ONLY for the single-account FY summary box's "Rate of
+        Interest" line (added 2026-08-06, interest-never-carried-forward
+        model change). Ignored in "all accounts" mode (rate differs per
+        account there, so no rate line is rendered in that mode at all).
+        When `rate` is None, or `account` is in `missing_rate_accounts`, the
+        line renders '0.00% p.a.' — consistent with the existing "missing
+        rate => 0%, never an error" rule elsewhere in this module.
 
     Returns
     -------
@@ -631,6 +656,8 @@ def render_borrowings_interest_pdf(
     account = (account or '').strip()
     single_account = bool(account)
     fy_totals = fy_totals or {}
+    missing_rate_accounts = missing_rate_accounts or []
+    effective_rate = 0.0 if (rate is None or account in missing_rate_accounts) else rate
 
     buffer = BytesIO()
 
@@ -829,15 +856,32 @@ def render_borrowings_interest_pdf(
             fy_key = f'{fy_start}-{str(fy_start + 1)[-2:]}'
             fy_data = fy_totals.get(fy_key, {})
             fy_closing_principal = fy_data.get('closing_principal', 0.0)
-            fy_total_interest = fy_data.get('interest', 0.0)
-            fy_total_amount = fy_data.get('total', round(fy_closing_principal + fy_total_interest, 2))
+            fy_total_payable = fy_data.get(
+                'total', round(fy_closing_principal + fy_data.get('cumulative_interest', 0.0), 2),
+            )
 
-            summary_lines = [
-                ('Total Principal Amount', fy_closing_principal, True),
-                ('Total Interest Amount', fy_total_interest, False),
-                ('Total Amount', fy_total_amount, True),
-            ]
-            brought_forward = fy_total_amount  # carried into the next FY block — byte-identical to the engine's own capitalized balance
+            # Task 4 (2026-08-06, interest-never-carried-forward model): the
+            # summary box now grows by one line per FY — every FY from the
+            # earliest through THIS FY's own key (ascending, inclusive) that
+            # has a non-zero OWN-FY interest, labelled 'Interest FY <fy_key>'
+            # (fy_key format matches borrowings.py's _fy_key(), e.g.
+            # '2023-24' — plain 'YYYY-YY' string sort == chronological sort
+            # since every key shares the same fixed-width year prefix). Prior
+            # FYs' interest stays visible as an outstanding payable because
+            # it is no longer folded into principal.
+            summary_lines: list = [('Total Principal Amount', fy_closing_principal, True)]
+            for k in sorted(k for k in fy_totals if k <= fy_key):
+                k_interest = fy_totals[k].get('interest', 0.0)
+                if k_interest:
+                    summary_lines.append((f'Interest FY {k}', k_interest, False))
+            summary_lines.append(('Total Payable Amount', fy_total_payable, True))
+            summary_lines.append(('Rate of Interest', f'{effective_rate:.2f}% p.a.', False))
+
+            # Task 5: Brought Forward into the NEXT FY block is the
+            # PRINCIPAL-ONLY closing balance — interest is never carried
+            # forward (2026-08-06 model change) — so this is exactly this
+            # FY's own "Total Principal Amount" line, byte-identical.
+            brought_forward = fy_closing_principal
         else:
             fy_total_interest = round(
                 sum(r['interest'] for r in fy_rows if r['row_type'] == 'interest'), 2,
@@ -866,8 +910,14 @@ def render_borrowings_interest_pdf(
         summary_start = len(table_rows)
         for label, value, bold in summary_lines:
             sty = summary_b_sty if bold else summary_sty
+            # A summary-line value may be a rupee amount (float, formatted
+            # via _fmt_inr as before) OR a pre-formatted plain string (e.g.
+            # the 'Rate of Interest' line's '12.00% p.a.') — emitted
+            # verbatim, never routed through _fmt_inr. No special-casing on
+            # the label text; any string value takes this path.
+            value_text = value if isinstance(value, str) else _fmt_inr(value)
             table_rows.append(
-                [Paragraph(label, sty)] + [''] * (n_cols - 2) + [Paragraph(_fmt_inr(value), sty)]
+                [Paragraph(label, sty)] + [''] * (n_cols - 2) + [Paragraph(value_text, sty)]
             )
 
         fy_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
@@ -981,9 +1031,16 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
         return buffer.getvalue()
 
     # ── Column widths ─────────────────────────────────────────────────────────
+    # Sub-columns per FY: Taken, Paid, [Interest, Total Payable — only when
+    # include_interest], Closing. 'Total Payable' added 2026-08-06 (interest
+    # never carried forward model change) — 'Closing' is now PRINCIPAL ONLY,
+    # so the account's true outstanding liability (principal + every FY's
+    # interest accrued so far) needs its own column; omitted when
+    # include_interest is False since it would be identical to Closing there
+    # (cumulative_interest is always 0).
     sno_w = 22.0
     account_w = 150.0 if n_fys <= 4 else 120.0
-    sub_col_count = 4 if include_interest else 3
+    sub_col_count = 5 if include_interest else 3
     fixed_w = sno_w + account_w
     fy_pool = content_w - fixed_w
     sub_col_w = fy_pool / (n_fys * sub_col_count) if n_fys > 0 else fy_pool / sub_col_count
@@ -1004,6 +1061,8 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
         if include_interest:
             sub_headers.append(f'Interest ({_RS})')
         sub_headers.append(f'Closing ({_RS})')
+        if include_interest:
+            sub_headers.append(f'Total Payable ({_RS})')
         row1.extend(Paragraph(h, hdr_r) for h in sub_headers)
 
     span_cmds: list = [
@@ -1022,11 +1081,15 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
             if include_interest:
                 cells.append(Paragraph('-', dat_r))
             cells.append(Paragraph('-', dat_r))
+            if include_interest:
+                cells.append(Paragraph('-', dat_r))
             return cells
         cells = [Paragraph(_amt(fy_data['taken']), dat_r), Paragraph(_amt(fy_data['paid']), dat_r)]
         if include_interest:
             cells.append(Paragraph(_amt(fy_data['interest']), dat_r))
         cells.append(Paragraph(_bal(fy_data['closing']), dat_r))
+        if include_interest:
+            cells.append(Paragraph(_bal(fy_data['total_payable']), dat_r))
         return cells
 
     for idx, row in enumerate(rows):
@@ -1043,11 +1106,15 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
             if include_interest:
                 cells.append(Paragraph('-', tot_r))
             cells.append(Paragraph('-', tot_r))
+            if include_interest:
+                cells.append(Paragraph('-', tot_r))
         else:
             cells = [Paragraph(_amt(fy_totals['taken']), tot_r), Paragraph(_amt(fy_totals['paid']), tot_r)]
             if include_interest:
                 cells.append(Paragraph(_amt(fy_totals['interest']), tot_r))
             cells.append(Paragraph(_bal(fy_totals['closing']), tot_r))
+            if include_interest:
+                cells.append(Paragraph(_bal(fy_totals['total_payable']), tot_r))
         total_row.extend(cells)
     table_rows.append(total_row)
     total_row_idx = len(table_rows) - 1
