@@ -1328,6 +1328,143 @@ query-param combination only.
 
 ---
 
+## api — Borrowings PDF fixes (rounding/pagination/merge/styling) + Summary-FY endpoints (2026-08-06)
+
+**Status: complete.** Six related fixes/additions on top of the `include_interest` work above, all
+in `lambda/api/borrowings.py`, `lambda/api/borrowings_pdf.py`, `lambda/api/handler.py`, and
+`lambda/api/test_borrowings_interest.py`.
+
+**1. FY-boundary rounding discontinuity fixed.** Root cause: `borrowings_pdf.py`'s
+`render_borrowings_interest_pdf` re-summed already-2dp-rounded per-row `interest` values
+(`fy_total_interest = round(sum(r['interest'] for ...), 2)`) — a double-rounding that could disagree
+by a paisa or two with the balance `compute_interest_segments` itself capitalizes into the next FY's
+opening balance. Fix: `compute_borrowings_interest(conn, account, from_date, to_date)` now ALSO
+returns `fy_totals` — `{fy_label: {closing_principal, interest, total}}` (single-account mode only;
+`{}` in "all accounts" mode, same reasoning as the existing `balance: null` rule) — computed by a new
+`borrowings._compute_fy_totals(monthly_interest, month_last_balance)` helper, derived ENTIRELY from
+the engine's own unrounded `monthly_interest`/`month_last_balance` (no `compute_interest_segments`
+signature change — `month_last_balance`'s value for an FY's last month is, by construction, exactly
+the pre-capitalization closing principal the engine itself uses). `interest`/`total` are rounded to
+2dp exactly ONCE. The renderer's `fy_total_interest`/`fy_closing_principal`/`fy_total_amount`
+re-derivation was deleted; it now reads `fy_totals[fy_key]` directly. Verified against the real
+LEVAKA HARANATHA REDDY account: FY 2025-26 now prints **Total Amount ₹55,77,494.20**, and the very
+next row (FY 2026-27's "Brought Forward") shows the byte-identical **₹55,77,494.20 Dr** — the
+2-paisa self-contradiction from the bug report is gone (confirmed via `pypdf` text extraction on a
+rendered sample PDF, not just unit assertions).
+
+**2. Pagination — no more blank leading page.** `render_borrowings_interest_pdf` and (now also,
+Task 5) `render_borrowings_pdf` no longer wrap the whole FY block (heading + table + summary) in one
+`KeepTogether` — that forced the ENTIRE block to defer to a fresh page the instant it didn't fit,
+leaving page 1 mostly blank for any FY taller than one page. Fix: the FY heading Paragraph style now
+sets `keepWithNext=True` (never left dangling alone at the bottom of a page); the bulk of the FY's
+rows ("main" chunk) flow as a normal `repeatRows=1` Table that reportlab paginates on its own
+(repeating the green header on every continuation page); only the LAST `_TAIL_ROW_COUNT` (3) rows
+("tail" chunk) are pulled into a small separate table and wrapped in ONE `KeepTogether` together with
+the FY summary box, so the summary can never land alone/orphaned at the top of a fresh page. New
+shared helper `borrowings_pdf._fy_table_style(total_rows, opening_idx, interest_idxs, has_header)`
+builds the TableStyle for either chunk. Accepted cosmetic tradeoff: the tail chunk always carries its
+own header row, so if it happens to render immediately after the main chunk on the SAME page, the
+green header band appears twice in a row (reads like a "closing entries" sub-table) — preferred over
+un-headed rows floating alone on a page. Verified: a 3-page rendered sample (LEVAKA, 2 FYs, ~17
+interest rows) has real content on page 1 (`'FY 2025-26'` heading + data, 500+ chars) — no blank page.
+
+**3. Merged interest rows (single-account mode only).** Every `row_type == 'interest'` row keeps its
+Date cell, then SPANs the remaining six columns (Voucher No, Transaction Name, Debit, Credit,
+Interest, Balance) into ONE centered cell reading `"{FullMonthName} Interest - ₹{amount}"` (Indian
+grouping, 2dp — e.g. `"July Interest - ₹34,314.28"`), via a new `_interest_merged_cells(row)` closure
++ `('SPAN', (1, idx), (6, idx))` TableStyle commands from `_fy_table_style`'s `interest_idxs` param.
+The balance is intentionally no longer shown on interest rows at all (it never changes on one, which
+previously read as confusing). Text color/emphasis unchanged (`letterhead.GREEN2`, now centered via a
+new `dat_i_center` style). "All accounts" mode is UNCHANGED (unmerged `_row_cells` rendering) — the
+task's column list only matches the single-account 7-column layout, and there's no Balance column to
+hide there.
+
+**4. FY-section color shading.** Dark-green (`letterhead.GREEN`) header band with white bold headers
+(right-aligned for numeric columns) — already correct, unchanged. Bold FY heading — already correct.
+Interest-row text color — reused `letterhead.GREEN2` (no new brand color). Zebra striping on
+transaction rows — already correct. NEW: the FY summary box (Total Principal/Interest/Total Amount,
+or Total Debit/Credit/Interest in "all accounts" mode) is now a light-green filled box with a 2px
+solid green border spanning the table width — new module constant `_SUMMARY_BG = '#e4f0e8'` +
+`('BOX', (0,0), (-1,-1), 2, letterhead.GREEN)`, replacing the old borderless/transparent 300pt-wide
+mini-table.
+
+**5. `render_borrowings_pdf` (interest OFF) rebuilt with FY blocks.** Previously one flat table;
+now mirrors the interest report's sectioning: grouped by financial year (1 Apr – 31 Mar), each with
+its own bold FY heading + green-banded table (same `_fy_table_style`/tail-split/`KeepTogether`
+pagination discipline as point 2); every FY after the first opens with a **Brought Forward** row
+carrying the previous FY's closing principal (single-account mode; running balance = cumulative
+`credit − debit`, unchanged domain semantics); every FY block ends with the same light-green/
+2px-green-bordered **Total Principal Amount** box (Task 4 treatment) = that FY's closing principal =
+exactly the next FY's Brought Forward. No Interest column, no interest rows, no capitalization — pure
+principal roll-forward. "All accounts" mode: same documented deviation as the interest report (6th
+column stays Account, no Brought-Forward row, summary reduced to Total Debit/Total Credit only).
+
+**6. New "all accounts" FY-summary endpoints.**
+- **`GET /borrowings/summary-fy?include_interest=0|1`** → JSON, Redis cache 1h, key
+  `iravi:borrowings:summary_fy:{0|1}`. Delegates to new
+  `borrowings.compute_borrowings_summary_fy(conn, include_interest)` — covers ALL accounts and ALL
+  FYs present in `borrowings` (no date params; `as_of` defaults to `date.today()`), reusing the SAME
+  per-account interest engine (`compute_interest_segments` + `_compute_fy_totals`) rather than a
+  second implementation. Per account/FY: `taken` = Σ credit, `paid` = Σ debit (both from the full
+  `_fetch_account_history` rows, independent of `include_interest`), `interest` = that FY's
+  capitalized interest from `_compute_fy_totals` (0.0 everywhere when `include_interest=0`),
+  `closing = opening + taken − paid + interest`, `opening` = prior FY's closing (0.0 for the first FY
+  an account appears in — falls out naturally since taken/paid/interest are all 0 before an account's
+  first activity). `fys` = ascending union of every FY with recorded taken/paid activity across ALL
+  accounts, plus (only when `include_interest=1`) any FY the interest engine's month-boundary walk
+  surfaced on its own (a dormant account can still accrue interest in a year with zero real
+  transactions). Every account's `fys` map is filled for EVERY key in the global `fys` list
+  (zero-filled, correctly carried-forward opening/closing) — a rectangular matrix, no null-checks
+  needed by the caller. `totals` = column-wise sums across accounts, same shape.
+  `missing_rate_accounts` — sorted, only meaningful when `include_interest=1` (empty otherwise).
+  Response shape matches the task's example exactly (`{fys, rows: [{account, fys, closing}], totals,
+  missing_rate_accounts}`).
+- **`GET /borrowings/summary-fy/pdf?include_interest=0|1`** → `application/pdf`, no cache. New
+  `borrowings_pdf.render_borrowings_summary_fy_pdf(data, include_interest)` — landscape A4, modeled
+  on `customer_balances_fy_pdf.py`'s two-row-header FY-matrix layout (same letterhead, GREEN header
+  band, TOTAL row, zebra) so the two `*_fy` reports read as siblings: one row per account, FY column
+  groups (Taken/Paid/[Interest — omitted entirely when `include_interest=0`]/Closing per FY), bold
+  TOTAL row at the bottom, missing-rate note under the title when applicable. Calls the SAME
+  `compute_borrowings_summary_fy()` the JSON route calls (via `_handle_borrowings_summary_fy_pdf` in
+  `handler.py`), so screen and PDF can never disagree.
+- `handler.py`: two new handlers `_handle_borrowings_summary_fy` / `_handle_borrowings_summary_fy_pdf`
+  + two new GET routes (`/borrowings/summary-fy`, `/borrowings/summary-fy/pdf`), following the
+  existing borrowings route/caching conventions exactly (same `_LEDGER_TTL`, same `_pdf_response`/
+  local-`import borrowings_pdf` pattern as every other PDF route).
+
+**Verification (2026-08-06):** `python -m py_compile handler.py borrowings.py borrowings_pdf.py
+test_borrowings_interest.py` clean. `test_borrowings_interest.py` extended with two new blocks —
+**block 6** (FY-boundary continuity invariant, on the real LEVAKA data via a stub DB connection: a
+closed FY's `fy_totals[...]['total']` must equal the `balance` on the first row of the next FY when
+no transaction intervenes — confirms the exact bug scenario is fixed) and **block 7**
+(`/borrowings/summary-fy` roll-forward invariant, two synthetic accounts across overlapping FYs, both
+`include_interest` values: `closing == opening + taken − paid + interest` for every account/FY, each
+FY's `opening` == the prior FY's `closing`, the `fys` map is rectangular, `totals` are column-wise
+sums) — **99/99 assertions pass** (75 pre-existing + 24 new; verbatim output captured in the task
+response). Sample PDFs rendered locally (real `reportlab`/`pypdf`, no AWS credentials needed — a
+stub DB connection feeds `compute_borrowings_interest`/`compute_borrowings_summary_fy` the same real
+LEVAKA HARANATHA REDDY row data used in the test file) and written to the session scratchpad (NOT the
+repo), then deleted from the repo along with the scratch verification script and `__pycache__`
+afterward: `Borrowings_LEVAKA_HARANATHA_REDDY_with_interest_VERIFY.pdf` (3 pages — confirmed no blank
+leading page, confirmed `"July Interest - ₹34,314.28"`-style merged/centered interest rows on every
+page, confirmed `"Total Amount ₹55,77,494.20"` immediately followed by `"Brought Forward ...
+₹55,77,494.20 Dr"` — byte-identical, fixing the reported 2-paisa discontinuity),
+`Borrowings_LEVAKA_HARANATHA_REDDY_no_interest_VERIFY.pdf` (2 pages, FY sectioning + Brought Forward
++ Total Principal Amount box confirmed), and `Borrowings_Summary_FY_VERIFY.pdf` /
+`Borrowings_Summary_FY_no_interest_VERIFY.pdf` (1 page each — FY column-group matrix + TOTAL row
+confirmed, Interest sub-column correctly present/absent per `include_interest`).
+
+**No IaC/DB change needed** for items 1-5 (presentation-only fixes on existing routes/data). **IaC
+needed for item 6:** API Gateway routes `GET /borrowings/summary-fy` + `GET /borrowings/summary-fy/pdf`
++ CORS in `lambda_api.tf` (same `api` Lambda, no new dependency — `reportlab==4.2.2` already in
+`requirements.txt`); depends on the same `borrowings`/`borrowing_rate` tables the other borrowings
+routes already depend on. **UI needed (not done here):** a company-wide "Borrowings Summary (FY)"
+screen — matrix table (accounts × FYs) + PDF export button, an `include_interest` toggle, and a
+`missing_rate_accounts` warning banner when non-empty — mirrors the existing Customer/Supplier
+Balances (FY) screens' UX pattern.
+
+---
+
 ## etl_appendix_b_x11_purchase — Purchase Ledger Processing
 
 **Status: complete**
@@ -1634,8 +1771,10 @@ Triggered by EventBridge. Routes on `detail-type`:
 | `GET /pdc` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 | `GET /pdc/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
 | `GET /borrowings/meta` | `iravi:borrowings:meta` | Complete (added 2026-08-05) |
-| `GET /borrowings` | `iravi:borrowings:data:{account}:{from}:{to}` | Complete (added 2026-08-05) |
-| `GET /borrowings/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05) |
+| `GET /borrowings` | `iravi:borrowings:data:{account}:{from}:{to}` (or `:interest:...` for `include_interest=1`) | Complete (added 2026-08-05; `include_interest` added 2026-08-06) |
+| `GET /borrowings/pdf` | — (no cache; always fresh) | Complete (added 2026-08-05; `include_interest` + rounding/pagination/merge/styling fixes 2026-08-06) |
+| `GET /borrowings/summary-fy` | `iravi:borrowings:summary_fy:{0\|1}` | Complete (added 2026-08-06) |
+| `GET /borrowings/summary-fy/pdf` | — (no cache; always fresh) | Complete (added 2026-08-06) |
 
 Cache-aside pattern: Redis first → RDS fallback → populate Redis.
 
@@ -2329,6 +2468,34 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   existing routes). **UI needed (not done here):** an "Include Interest" toggle + awareness of the
   `include_interest=1` response-shape change — out of business-core scope, main `ui` repo
   untouched.
+
+- [x] **Borrowings PDF fixes (FY-boundary rounding, pagination, merged interest rows, FY-section
+  color shading) + new "all accounts" Summary-FY endpoints (2026-08-06):** see the full "api —
+  Borrowings PDF fixes (rounding/pagination/merge/styling) + Summary-FY endpoints" section above
+  for complete detail. `compute_borrowings_interest` now returns a third key `fy_totals`
+  (single-account mode) — `{fy_label: {closing_principal, interest, total}}`, the single source of
+  truth for FY summary figures (new `borrowings._compute_fy_totals` helper) — fixing a real 2-paisa
+  self-contradiction between a FY's printed "Total Amount" and the next FY's "Brought Forward" row.
+  `render_borrowings_interest_pdf` and (reworked, Task 5) `render_borrowings_pdf` no longer wrap
+  whole FY blocks in one `KeepTogether` (new `_fy_table_style`/tail-split pagination discipline —
+  no more blank leading page); interest rows in the WITH-INTEREST report are now merged into one
+  centered `"{Month} Interest - ₹{amount}"` cell (single-account mode); the FY summary box is now a
+  light-green/2px-green-bordered box (new `_SUMMARY_BG` constant, `letterhead.GREEN` border, no new
+  brand color) on BOTH the with- and without-interest reports. New endpoints
+  `GET /borrowings/summary-fy?include_interest=0|1` (JSON, 1h Redis cache) and
+  `GET /borrowings/summary-fy/pdf?include_interest=0|1` (landscape A4 matrix PDF, modeled on
+  `customer_balances_fy_pdf.py`) — new `borrowings.compute_borrowings_summary_fy()` covering ALL
+  accounts/ALL FYs with no date params, reusing the existing per-account interest engine (no second
+  interest implementation); new `borrowings_pdf.render_borrowings_summary_fy_pdf()`. `test_
+  borrowings_interest.py` extended with 2 new blocks (FY-boundary continuity invariant on real data;
+  `/borrowings/summary-fy` roll-forward invariant) — **99/99 assertions pass**. Sample PDFs rendered
+  locally and visually/textually verified (confirmed via `pypdf`: no blank leading page, merged
+  interest rows, and the exact fixed figure `"Total Amount ₹55,77,494.20"` immediately followed by
+  a byte-identical `"Brought Forward ... ₹55,77,494.20 Dr"`); written to the session scratchpad, not
+  the repo. **IaC needed:** `GET /borrowings/summary-fy` + `GET /borrowings/summary-fy/pdf` routes +
+  CORS in `lambda_api.tf` (no new Lambda/dependency/migration). **UI needed (not done here):** a
+  company-wide "Borrowings Summary (FY)" screen (matrix + PDF export + `include_interest` toggle) —
+  out of business-core scope, main `ui` repo untouched.
 
 - [x] **`GET`/`POST /config/borrowing-rates` — admin-only config API for per-account borrowing
   interest rates (added 2026-08-05):** new `_route_config()` branch in `lambda/api/handler.py`
@@ -3208,6 +3375,14 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   `GET /borrowings?include_interest=1`'s different response shape (`{rows,
   missing_rate_accounts}` object instead of a bare array) — see the "api — Borrowings monthly
   interest accrual" section above for the full contract. Out of this task's scope — main `ui` repo
+  untouched.
+- [ ] **IaC: `GET /borrowings/summary-fy` + `GET /borrowings/summary-fy/pdf` routes (2026-08-06)** —
+  + CORS in `lambda_api.tf` (no new Lambda, layer, or DB migration — same `api` Lambda, same
+  `borrowings`/`borrowing_rate` tables the other borrowings routes already depend on). See the
+  "api — Borrowings PDF fixes ... + Summary-FY endpoints" section above for the exact contract.
+- [ ] **UI slice for Borrowings Summary (FY)** — a company-wide matrix screen (accounts × FYs) +
+  PDF export button + `include_interest` toggle + `missing_rate_accounts` warning banner, mirroring
+  the existing Customer/Supplier Balances (FY) screens. Out of this task's scope — main `ui` repo
   untouched.
 - [ ] **IaC: API Gateway routes for the 6 new PDF/JSON exports (2026-08-05)** — `GET /sales/pdf`,
   `GET /purchases/pdf`, `GET /reports/customer-aging/pdf`, `GET /reports/supplier-aging/pdf`,

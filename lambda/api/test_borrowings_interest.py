@@ -575,5 +575,220 @@ print(f"{'Grand Total Interest':<28} {grand_total_interest:>14,.2f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 6. FY-BOUNDARY CONTINUITY INVARIANT (2026-08-06 fix verification) —
+#    a FY's Total Amount must equal the balance on the first row of the next
+#    FY when no transaction intervenes. Uses compute_borrowings_interest()
+#    end-to-end (via a stub DB connection) on the REAL LEVAKA HARANATHA REDDY
+#    data — this is the exact account/scenario the original bug report was
+#    filed against (a 2-paisa self-contradiction between FY 2025-26's
+#    printed "Total Amount" and the very next row's balance).
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n=== 6. FY-boundary continuity invariant (Task 1 fix) ===")
+
+
+class _StubCursor2:
+    def __init__(self, plan):
+        self._plan = plan
+        self.description = None
+        self._result = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def execute(self, sql, params=None):
+        for marker, cols, rows_fn in self._plan:
+            if marker in sql:
+                self.description = [(c,) for c in cols]
+                self._result = rows_fn(params or {})
+                return
+        raise AssertionError(f"stub cursor: no plan matched SQL:\n{sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+class _StubConn2:
+    def __init__(self, plan):
+        self._plan = plan
+
+    def cursor(self):
+        return _StubCursor2(self._plan)
+
+
+def _real_history_rows(params):
+    return [(date(*map(int, d.split('-'))), v, n, deb, cred) for d, v, n, deb, cred in REAL_ROWS_RAW]
+
+
+real_plan = [
+    ('GROUP BY b.account', ['account'], lambda p: [(_ACCOUNT_NAME,)]),
+    ('FROM borrowing_rate br', ['account', 'rate'], lambda p: [(_ACCOUNT_NAME, _RATE)]),
+    ('b.transaction_date <= %(to_date)s', ['transaction_date', 'voucher_no', 'transaction_name', 'debit', 'credit'], _real_history_rows),
+]
+real_stub_conn = _StubConn2(real_plan)
+
+# Window covering the account's entire real history through the same
+# _REAL_TO_DATE used in section 5, single-account mode.
+real_result = borrowings.compute_borrowings_interest(
+    real_stub_conn, _ACCOUNT_NAME, '2025-04-30', _REAL_TO_DATE.isoformat(),
+)
+check("compute_borrowings_interest returns a fy_totals entry for FY 2025-26",
+      True, '2025-26' in real_result['fy_totals'])
+
+fy2526_total_amount = real_result['fy_totals']['2025-26']['total']
+check("fy_totals['2025-26']['total'] matches the CLAUDE.md reference figure (55,77,494.20)",
+      5577494.20, fy2526_total_amount)
+check("fy_totals['2025-26']['interest'] matches the CLAUDE.md reference figure (4,14,419.20)",
+      414419.20, real_result['fy_totals']['2025-26']['interest'])
+
+# The first row chronologically inside FY 2026-27 (April 2026 has no real
+# transaction until BP2627-90 on 2026-06-17, so the April interest line
+# item's balance IS the untouched brought-forward value — "no transaction
+# intervenes").
+fy2627_rows = sorted(
+    (r for r in real_result['rows'] if r['transaction_date'] >= '2026-04-01'),
+    key=lambda r: r['transaction_date'],
+)
+first_fy2627_row = fy2627_rows[0] if fy2627_rows else None
+check("a row exists at the start of FY 2026-27", True, first_fy2627_row is not None)
+check(
+    "FY 2025-26's Total Amount == the balance on the first FY 2026-27 row (no more 2-paisa discontinuity)",
+    fy2526_total_amount,
+    first_fy2627_row['balance'] if first_fy2627_row else None,
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. /borrowings/summary-fy ROLL-FORWARD INVARIANT (Task 6) —
+#    closing == opening + taken - paid + interest for every account/FY, and
+#    each FY's opening equals the prior FY's closing. Two synthetic accounts
+#    with activity in different, overlapping FYs, via a stub DB connection.
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n=== 7. /borrowings/summary-fy roll-forward invariant (Task 6) ===")
+
+
+class _StubCursor3:
+    def __init__(self, plan):
+        self._plan = plan
+        self.description = None
+        self._result = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def execute(self, sql, params=None):
+        for marker, cols, rows_fn in self._plan:
+            if marker in sql:
+                self.description = [(c,) for c in cols]
+                self._result = rows_fn(params or {})
+                return
+        raise AssertionError(f"stub cursor: no plan matched SQL:\n{sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+class _StubConn3:
+    def __init__(self, plan):
+        self._plan = plan
+
+    def cursor(self):
+        return _StubCursor3(self._plan)
+
+
+_SUMMARY_HISTORY = {
+    'ACCOUNT ONE': [
+        (date(2024, 5, 1), 'S1-1', 'Journal Entries', 0.0, 1000000.0),   # FY 2024-25 taken
+        (date(2024, 6, 1), 'S1-2', 'Journal Entries', 200000.0, 0.0),    # FY 2024-25 paid
+        (date(2025, 5, 1), 'S1-3', 'Journal Entries', 0.0, 500000.0),    # FY 2025-26 taken
+        (date(2025, 6, 1), 'S1-4', 'Journal Entries', 100000.0, 0.0),    # FY 2025-26 paid
+    ],
+    'ACCOUNT TWO': [
+        (date(2025, 4, 15), 'S2-1', 'Journal Entries', 0.0, 2000000.0),  # FY 2025-26 taken only
+    ],
+}
+
+
+def _summary_accounts_rows(params):
+    return [('ACCOUNT ONE',), ('ACCOUNT TWO',)]
+
+
+def _summary_rate_rows(params):
+    return [('ACCOUNT ONE', 12.0), ('ACCOUNT TWO', 10.0)]
+
+
+def _summary_history_rows(params):
+    return _SUMMARY_HISTORY[params['account']]
+
+
+summary_plan = [
+    ('GROUP BY account', ['account'], _summary_accounts_rows),
+    ('FROM borrowing_rate br', ['account', 'rate'], _summary_rate_rows),
+    ('b.transaction_date <= %(to_date)s', ['transaction_date', 'voucher_no', 'transaction_name', 'debit', 'credit'], _summary_history_rows),
+]
+summary_stub_conn = _StubConn3(summary_plan)
+
+for label, include_interest_flag in (('include_interest=0', False), ('include_interest=1', True)):
+    summary = borrowings.compute_borrowings_summary_fy(summary_stub_conn, include_interest_flag)
+
+    check(f"[{label}] fys is non-empty and covers both accounts' activity", True, len(summary['fys']) >= 2)
+
+    if not include_interest_flag:
+        all_interest_zero = all(
+            fy_data['interest'] == 0.0
+            for row in summary['rows']
+            for fy_data in row['fys'].values()
+        )
+        check(f"[{label}] interest is 0.0 everywhere when include_interest=0", True, all_interest_zero)
+
+    for row in summary['rows']:
+        acct = row['account']
+        prior_closing = 0.0
+        roll_forward_ok = True
+        opening_matches_prior_ok = True
+        for fy in summary['fys']:
+            fy_data = row['fys'].get(fy)
+            if fy_data is None:
+                roll_forward_ok = False
+                continue
+            expected_closing = round(fy_data['opening'] + fy_data['taken'] - fy_data['paid'] + fy_data['interest'], 2)
+            if round(fy_data['closing'], 2) != expected_closing:
+                roll_forward_ok = False
+            if round(fy_data['opening'], 2) != round(prior_closing, 2):
+                opening_matches_prior_ok = False
+            prior_closing = fy_data['closing']
+        check(f"[{label}] {acct}: closing == opening + taken - paid + interest for every FY",
+              True, roll_forward_ok)
+        check(f"[{label}] {acct}: each FY's opening == the prior FY's closing",
+              True, opening_matches_prior_ok)
+        check(f"[{label}] {acct}: row-level 'closing' == the last FY's closing",
+              round(prior_closing, 2), round(row['closing'], 2))
+
+    # Every account's fys map contains an entry for EVERY fy in the list
+    # (rectangular matrix, no null-checks needed by the caller).
+    rectangular_ok = all(
+        set(row['fys'].keys()) == set(summary['fys'])
+        for row in summary['rows']
+    )
+    check(f"[{label}] every row's fys map is rectangular (one entry per global FY)", True, rectangular_ok)
+
+    # totals are column-wise sums across accounts, same shape.
+    totals_ok = True
+    for fy in summary['fys']:
+        for key in ('opening', 'taken', 'paid', 'interest', 'closing'):
+            expected_sum = round(sum(row['fys'][fy][key] for row in summary['rows']), 2)
+            if round(summary['totals'][fy][key], 2) != expected_sum:
+                totals_ok = False
+    check(f"[{label}] totals are column-wise sums across accounts", True, totals_ok)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 print(f"\n{'=' * 60}\nTOTAL: {PASS} passed, {FAIL} failed\n{'=' * 60}")
 sys.exit(1 if FAIL else 0)
