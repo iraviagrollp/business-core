@@ -874,6 +874,30 @@ RcptNo, SdcId, MRCNo, InvoiceNo) are ignored.
 - Rows are skipped (defensive; the sample has no such rows and no footer/total row) when `Date`,
   `VoucherNo`, or `Account` is missing/empty after cleaning.
 
+**Synthetic opening-balance rows skipped (added 2026-08-06):** the source file (despite the `.xlsx`
+extension, actually UTF-8-BOM CSV content produced by PowerShell `Export-Csv` in every sample seen
+so far — the dual-format sniff in `_parse()` above still handles a real binary xlsx defensively)
+carries one synthetic "Brought Forward" header row per account — `VoucherNo == 'Brought Forward'`
+exactly (no surrounding whitespace, that exact casing observed in the sample; `Date` on these rows
+is the export date, not a transaction date, `DDDate`/`RefBillDate` are the `01-01-1900` null
+sentinel, most other fields are blank, `VVN='0'`, and `Debit`/`Credit` carry the account's opening
+balance). These rows must never reach the `borrowings` table. A new `_is_brought_forward_row(norm)`
+helper (module constant `_BROUGHT_FORWARD_VOUCHER = 'brought forward'`) checks the row's raw
+`voucherno` cell stripped + lower-cased against that constant (safe against a missing/`None` cell —
+returns `False`, falling through to `_extract_row()`'s own blank-`VoucherNo` skip); it is called
+directly in both of `_parse()`'s row loops (xlsx and CSV), BEFORE `_extract_row()` — so a Brought
+Forward row is filtered out at the earliest point and never even reaches the field-extraction/skip
+logic above. `_parse()`'s return type changed to `(rows, skipped_brought_forward)`; `_process()`
+logs the count in the same "Parsed N rows" completion log line: `'Parsed %d borrowings rows (%d
+Brought Forward opening-balance rows skipped)'`. No `etl_runs` row is written by this Lambda (see
+above), so there is no audit-table counter to extend. Deliberately narrow match — only the one
+exact observed spelling, no "B/F"/"Opening Balance" variants (no evidence any exist in this feed).
+Test: `lambda/etl_borrowings/tests/test_brought_forward_skip.py` — 14/14 assertions pass (helper
+unit tests for exact/case/whitespace/missing-cell variants, plus an end-to-end `_parse()` run
+against a synthetic CSV fixture with one Brought Forward row, one case/whitespace-variant Brought
+Forward row, and one real transaction row, confirming exactly the real row survives and the skip
+count is 2).
+
 **Target table `borrowings`** (IaC migration `052_create_borrowings.sql`):
 ```sql
 CREATE TABLE borrowings (
@@ -2663,6 +2687,24 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **`etl_borrowings` — skip synthetic "Brought Forward" opening-balance rows (2026-08-06):**
+  see the new "Synthetic opening-balance rows skipped" note in the "etl_borrowings — Borrowings
+  Ledger Processing" section above for full detail. `handler.py` gained `_BROUGHT_FORWARD_VOUCHER`
+  + `_is_brought_forward_row(norm)` (stripped, case-insensitive `VoucherNo == 'brought forward'`
+  match, safe against a missing/`None` cell); called in both of `_parse()`'s row loops (xlsx and
+  CSV) BEFORE `_extract_row()`, so these rows never reach the field-extraction logic or the
+  `borrowings` table. `_parse()` now returns `(rows, skipped_brought_forward)`; `_process()` logs
+  the skipped count in the existing "Parsed N rows" completion log line (this Lambda writes no
+  `etl_runs` row, so there is no audit-table counter to extend). New test
+  `lambda/etl_borrowings/tests/test_brought_forward_skip.py` — 14/14 assertions pass (exact/case/
+  whitespace/missing-cell variants of the helper, plus an end-to-end `_parse()` run against a
+  synthetic CSV fixture). `python -m py_compile handler.py tests/test_brought_forward_skip.py`
+  clean. No IaC/DB/UI change needed — same table, same natural key, purely a row-level ingestion
+  filter; no re-ingest strictly required (Brought Forward rows that already landed as transaction
+  rows before this fix are a pre-existing data-cleanup item, not something this filter retroactively
+  removes — flag to the `iac`/coordinator if a one-time cleanup DELETE against already-ingested
+  Brought Forward rows is wanted, since this agent cannot query production RDS to check).
 
 - [x] **Borrowings interest model change — interest NEVER carried forward (2026-08-06):** see the
   full "api — Borrowings interest model change: interest NEVER carried forward" section above for
