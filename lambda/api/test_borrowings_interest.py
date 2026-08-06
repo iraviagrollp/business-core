@@ -790,5 +790,118 @@ for label, include_interest_flag in (('include_interest=0', False), ('include_in
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 8. /borrowings/summary-fy — DORMANT MIDDLE FY must not be silently skipped
+#    (2026-08-06 fix). An account borrows in FY1, has ZERO transactions in
+#    FY2, and repays in FY3 — FY2 must still appear (contiguous FY range),
+#    zero-filled, with opening == closing == FY1's closing, REGARDLESS of
+#    the include_interest toggle. Uses a fixed `as_of` (not date.today())
+#    for full determinism.
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n=== 8. /borrowings/summary-fy — dormant middle FY must not vanish (2026-08-06 fix) ===")
+
+
+class _StubCursor4:
+    def __init__(self, plan):
+        self._plan = plan
+        self.description = None
+        self._result = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+    def execute(self, sql, params=None):
+        for marker, cols, rows_fn in self._plan:
+            if marker in sql:
+                self.description = [(c,) for c in cols]
+                self._result = rows_fn(params or {})
+                return
+        raise AssertionError(f"stub cursor: no plan matched SQL:\n{sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+class _StubConn4:
+    def __init__(self, plan):
+        self._plan = plan
+
+    def cursor(self):
+        return _StubCursor4(self._plan)
+
+
+_GAP_ACCOUNT = 'GAP FY ACCOUNT'
+_GAP_AS_OF = date(2025, 6, 1)  # inside FY3 (2025-26)
+_GAP_HISTORY = [
+    (date(2023, 5, 1), 'G-1', 'Journal Entries', 0.0, 500000.0),   # FY1 (2023-24) -- taken
+    # FY2 (2024-25) -- deliberately ZERO transactions
+    (date(2025, 5, 1), 'G-2', 'Journal Entries', 200000.0, 0.0),   # FY3 (2025-26) -- paid
+]
+
+
+def _gap_accounts_rows(params):
+    return [(_GAP_ACCOUNT,)]
+
+
+def _gap_rate_rows(params):
+    return [(_GAP_ACCOUNT, 12.0)]
+
+
+def _gap_history_rows(params):
+    return _GAP_HISTORY
+
+
+gap_plan = [
+    ('GROUP BY account', ['account'], _gap_accounts_rows),
+    ('FROM borrowing_rate br', ['account', 'rate'], _gap_rate_rows),
+    ('b.transaction_date <= %(to_date)s', ['transaction_date', 'voucher_no', 'transaction_name', 'debit', 'credit'], _gap_history_rows),
+]
+gap_stub_conn = _StubConn4(gap_plan)
+
+gap_off = borrowings.compute_borrowings_summary_fy(gap_stub_conn, False, as_of=_GAP_AS_OF)
+gap_on = borrowings.compute_borrowings_summary_fy(gap_stub_conn, True, as_of=_GAP_AS_OF)
+
+check("[include_interest=0] fys contains all three FYs contiguously",
+      ['2023-24', '2024-25', '2025-26'], gap_off['fys'])
+check("[include_interest=1] fys contains all three FYs contiguously",
+      ['2023-24', '2024-25', '2025-26'], gap_on['fys'])
+check("the FY list is identical between include_interest=0 and include_interest=1 "
+      "(the toggle must change interest amounts, never FY coverage)",
+      gap_off['fys'], gap_on['fys'])
+
+check("[include_interest=0] totals['2024-25'] (the dormant middle FY) exists",
+      True, '2024-25' in gap_off['totals'])
+check("[include_interest=1] totals['2024-25'] (the dormant middle FY) exists",
+      True, '2024-25' in gap_on['totals'])
+
+gap_off_row = next(r for r in gap_off['rows'] if r['account'] == _GAP_ACCOUNT)
+fy2_off = gap_off_row['fys']['2024-25']
+fy1_off = gap_off_row['fys']['2023-24']
+check("[include_interest=0] FY2 (dormant) has zero taken/paid/interest",
+      (0.0, 0.0, 0.0), (fy2_off['taken'], fy2_off['paid'], fy2_off['interest']))
+check("[include_interest=0] FY2's opening == FY2's closing (nothing happened that year)",
+      True, fy2_off['opening'] == fy2_off['closing'])
+check("[include_interest=0] FY2's opening == FY1's closing (correctly carried forward across the gap)",
+      fy1_off['closing'], fy2_off['opening'])
+check("[include_interest=0] FY2's opening == closing == 5,00,000.00 (FY1's taken, no interest)",
+      500000.0, fy2_off['opening'])
+
+gap_on_row = next(r for r in gap_on['rows'] if r['account'] == _GAP_ACCOUNT)
+fy2_on = gap_on_row['fys']['2024-25']
+check("[include_interest=1] FY2 (dormant) still has zero taken/paid (no transactions that year)",
+      (0.0, 0.0), (fy2_on['taken'], fy2_on['paid']))
+check("[include_interest=1] FY2's opening == the prior FY's (FY1's) closing",
+      gap_on_row['fys']['2023-24']['closing'], fy2_on['opening'])
+# With a nonzero rate, interest DOES accrue during the dormant FY2 (the
+# engine still walks its month-boundary events even with zero real
+# transactions) -- demonstrating the toggle changes AMOUNTS, never coverage.
+check("[include_interest=1] FY2 accrues nonzero interest (rate=12%, dormant but not interest-free)",
+      True, fy2_on['interest'] > 0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 print(f"\n{'=' * 60}\nTOTAL: {PASS} passed, {FAIL} failed\n{'=' * 60}")
 sys.exit(1 if FAIL else 0)
