@@ -44,8 +44,9 @@ compute_borrowings_interest(conn, account, from_date, to_date) -> dict
     ?include_interest=1) entry point — single shared implementation used by
     BOTH the JSON endpoint and the PDF renderer, per the task's hard
     requirement that "the screen and the PDF must never be able to disagree".
-    Returns {'rows': [...], 'missing_rate_accounts': [...]} — see its
-    docstring for the full row shape / multi-account merge rules.
+    Returns {'rows': [...], 'missing_rate_accounts': [...], 'fy_totals': {...}}
+    — see its docstring for the full row shape / multi-account merge rules /
+    fy_totals semantics (fy_totals added 2026-08-06, single-account mode only).
 """
 
 from __future__ import annotations
@@ -416,6 +417,68 @@ def _account_rows_and_monthly(
     return rows, monthly_interest, month_last_balance
 
 
+def _fy_key(fy_start_year: int) -> str:
+    """'YYYY-YY' label for the FY starting 1 April of `fy_start_year` (e.g.
+    2025 -> '2025-26') — no 'FY ' prefix, matching the fy_totals/summary-fy
+    JSON contract (added 2026-08-06, Task 1 / Task 6)."""
+    return f'{fy_start_year}-{str(fy_start_year + 1)[-2:]}'
+
+
+def _compute_fy_totals(
+    monthly_interest: dict[tuple[int, int], float],
+    month_last_balance: dict[tuple[int, int], float],
+) -> dict[str, dict]:
+    """Per-FY {closing_principal, interest, total}, derived ENTIRELY from the
+    engine's own (unrounded) monthly_interest / month_last_balance — the
+    single source of truth for FY summary figures (added 2026-08-06, fixes
+    the FY-boundary rounding discontinuity: the old PDF renderer re-summed
+    already-2dp-rounded per-row interest values, a double-rounding that could
+    disagree by a paisa or two with the balance the engine itself capitalizes
+    into the next FY's opening balance).
+
+    closing_principal : the running principal as of the LAST event in that FY
+        — i.e. month_last_balance's value for that FY's last (year, month)
+        key — captured BEFORE that FY's own interest is capitalized into the
+        next FY (see compute_interest_segments: the capitalization happens on
+        the FIRST event of the FOLLOWING fy, strictly after this value was
+        already recorded, so it is exactly the pre-capitalization balance).
+    interest : sum of that FY's (unrounded) monthly_interest values, rounded
+        to 2dp exactly once here.
+    total : closing_principal + interest, rounded to 2dp exactly once — this
+        is byte-identical to the balance compute_interest_segments itself
+        computes when it capitalizes this FY (`round(balance + fy_total, 2)`
+        with the SAME unrounded fy_total and the SAME pre-capitalization
+        balance), so "Total Amount" and the next FY's "Brought Forward" can
+        never disagree.
+    """
+    if not monthly_interest and not month_last_balance:
+        return {}
+
+    interest_by_fy: dict[int, float] = {}
+    for (y, m), amt in monthly_interest.items():
+        fy = _fy_start_year(date(y, m, 1))
+        interest_by_fy[fy] = interest_by_fy.get(fy, 0.0) + amt
+
+    closing_principal_by_fy: dict[int, tuple[tuple[int, int], float]] = {}
+    for (y, m), bal in month_last_balance.items():
+        fy = _fy_start_year(date(y, m, 1))
+        key = (y, m)
+        current = closing_principal_by_fy.get(fy)
+        if current is None or key > current[0]:
+            closing_principal_by_fy[fy] = (key, bal)
+
+    fy_totals: dict[str, dict] = {}
+    for fy in sorted(set(interest_by_fy) | set(closing_principal_by_fy)):
+        closing_principal = round(closing_principal_by_fy.get(fy, (None, 0.0))[1], 2)
+        interest = round(interest_by_fy.get(fy, 0.0), 2)
+        fy_totals[_fy_key(fy)] = {
+            'closing_principal': closing_principal,
+            'interest': interest,
+            'total': round(closing_principal + interest, 2),
+        }
+    return fy_totals
+
+
 def _interest_line_rows(
     monthly_interest: dict[tuple[int, int], float],
     to_date: date,
@@ -476,7 +539,7 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
 
     Returns
     -------
-    {'rows': [...], 'missing_rate_accounts': [...]}
+    {'rows': [...], 'missing_rate_accounts': [...], 'fy_totals': {...}}
         rows : list[dict], sorted (transaction_date, row-type rank
             [opening < transaction < interest], voucher_no), sliced to
             transaction_date in [from_date, to_date] (opening rows are
@@ -484,6 +547,17 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
             them — they always survive).
         missing_rate_accounts : sorted list of in-scope accounts that had no
             configured borrowing_rate row (rate defaulted to 0% for them).
+        fy_totals : {fy_label: {closing_principal, interest, total}} (added
+            2026-08-06, Task 1) — SINGLE-ACCOUNT mode only (populated only
+            when `account` is given); empty dict `{}` in all-accounts mode,
+            where a per-account capitalized principal has no well-defined
+            merged analogue (same reasoning the multi-account balance=null
+            rule already documents). Computed via _compute_fy_totals() from
+            the engine's own unrounded monthly_interest/month_last_balance —
+            see that function's docstring for why this is the single source
+            of truth a renderer must read instead of re-summing already-
+            rounded per-row interest values (the double-rounding that caused
+            the FY-boundary discontinuity bug).
     """
     account = (account or '').strip()
     from_d = _parse_iso_date(from_date)
@@ -500,6 +574,7 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
     single_account = bool(account)
     all_rows: list[dict] = []
     combined_monthly: dict[tuple[int, int], float] = {}
+    fy_totals: dict[str, dict] = {}
 
     for acct in accounts:
         rate = rate_map.get(acct, 0.0)
@@ -510,6 +585,9 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
         if single_account:
             all_rows.extend(acct_rows)
             all_rows.extend(_interest_line_rows(monthly, to_d, acct, month_last_balance))
+            # Single account in scope (accounts == [account]) — this runs
+            # exactly once, so no overwrite risk.
+            fy_totals = _compute_fy_totals(monthly, month_last_balance)
         else:
             # A running balance is meaningless once rows from different
             # accounts are interleaved — null it out rather than emit a
@@ -531,4 +609,161 @@ def compute_borrowings_interest(conn, account: str, from_date: str, to_date: str
         r['transaction_date'], _ROW_TYPE_RANK[r['row_type']], r['voucher_no'] or '',
     ))
 
-    return {'rows': all_rows, 'missing_rate_accounts': missing_rate_accounts}
+    return {'rows': all_rows, 'missing_rate_accounts': missing_rate_accounts, 'fy_totals': fy_totals}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# compute_borrowings_summary_fy — "all accounts" FY-summary (added 2026-08-06,
+# Task 6). Shared by GET /borrowings/summary-fy (JSON) and
+# GET /borrowings/summary-fy/pdf so the screen and the PDF can never disagree.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | None = None) -> dict:
+    """Per-account, multi-FY roll-forward across the FULL history of the
+    `borrowings` table — no date params, covers every account and every FY
+    that has any recorded activity.
+
+    Reuses the SAME per-account interest engine `compute_borrowings_interest`
+    is built on (compute_interest_segments + _compute_fy_totals) — no second
+    interest implementation.
+
+    Semantics (see the API docstring in handler.py for the full contract):
+      taken   = that FY's Σ credit for the account (money received)
+      paid    = that FY's Σ debit for the account (repayment)
+      interest = that FY's capitalized interest from the engine (0.0 for
+                 every FY when include_interest is False)
+      closing = opening + taken - paid + interest
+      opening = prior FY's closing (0.0 for the first FY in `fys`, and for
+                any FY before the account's own first appearance — both
+                fall out naturally since taken/paid/interest are all 0.0
+                there, so closing stays equal to the carried-forward
+                opening).
+
+    `fys` is the ascending union of every FY with recorded activity (via
+    taken/paid) across ALL accounts, plus — only when include_interest is
+    True — every FY the interest engine produced a bucket for (its own
+    month-boundary walk can surface a dormant-but-still-accruing FY that had
+    zero real transactions that year). Every account's `fys` map is filled
+    for EVERY key in this list (zero-filled where the account had no
+    activity that year) so the caller can render a rectangular matrix with
+    no null-checks.
+
+    Returns
+    -------
+    {'fys': [...], 'rows': [...], 'totals': {...}, 'missing_rate_accounts': [...]}
+        rows[i] = {'account': str, 'fys': {fy_label: {opening, taken, paid,
+            interest, closing}}, 'closing': float}  (`closing` = the final,
+            most-recent FY's closing balance — the account's current
+            outstanding balance)
+        totals[fy_label] = {opening, taken, paid, interest, closing} —
+            column-wise sums across every account, same shape as a row's
+            per-FY entry.
+        missing_rate_accounts : only meaningful when include_interest is
+            True (empty list otherwise) — sorted list of in-scope accounts
+            with no configured borrowing_rate row (0% was used for them).
+    """
+    as_of_d = as_of or date.today()
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT account FROM borrowings
+            WHERE out_z IS NULL
+            GROUP BY account
+            ORDER BY LOWER(account)
+        """)
+        accounts = [row[0] for row in cur.fetchall()]
+
+    if not accounts:
+        return {'fys': [], 'rows': [], 'totals': {}, 'missing_rate_accounts': []}
+
+    rate_map = compute_borrowing_rate_map(conn, accounts) if include_interest else {}
+    missing_rate_accounts = (
+        sorted(a for a in accounts if a not in rate_map) if include_interest else []
+    )
+
+    per_account_taken: dict[str, dict[int, float]] = {}
+    per_account_paid: dict[str, dict[int, float]] = {}
+    per_account_interest: dict[str, dict[int, float]] = {}
+    all_fy_starts: set[int] = set()
+    in_scope_accounts: list[str] = []
+
+    for acct in accounts:
+        history = _fetch_account_history(conn, acct, as_of_d)
+        if not history:
+            continue
+        in_scope_accounts.append(acct)
+
+        taken_by_fy: dict[int, float] = {}
+        paid_by_fy: dict[int, float] = {}
+        for r in history:
+            fy = _fy_start_year(r['transaction_date'])
+            taken_by_fy[fy] = taken_by_fy.get(fy, 0.0) + r['credit']
+            paid_by_fy[fy] = paid_by_fy.get(fy, 0.0) + r['debit']
+        per_account_taken[acct] = taken_by_fy
+        per_account_paid[acct] = paid_by_fy
+        all_fy_starts.update(taken_by_fy.keys())
+        all_fy_starts.update(paid_by_fy.keys())
+
+        interest_by_fy: dict[int, float] = {}
+        if include_interest:
+            rate = rate_map.get(acct, 0.0)
+            _segments, monthly_interest, month_last_balance, _opening = compute_interest_segments(
+                history, rate, as_of_d,
+            )
+            fy_totals = _compute_fy_totals(monthly_interest, month_last_balance)
+            for fy_key, fy_data in fy_totals.items():
+                fy_start_int = int(fy_key.split('-')[0])
+                interest_by_fy[fy_start_int] = fy_data['interest']
+            all_fy_starts.update(interest_by_fy.keys())
+        per_account_interest[acct] = interest_by_fy
+
+    fy_starts_sorted = sorted(all_fy_starts)
+    fys = [_fy_key(fy) for fy in fy_starts_sorted]
+
+    totals_by_fy: dict[str, dict] = {
+        fy_label: {'opening': 0.0, 'taken': 0.0, 'paid': 0.0, 'interest': 0.0, 'closing': 0.0}
+        for fy_label in fys
+    }
+
+    rows: list[dict] = []
+    for acct in in_scope_accounts:
+        taken_by_fy = per_account_taken[acct]
+        paid_by_fy = per_account_paid[acct]
+        interest_by_fy = per_account_interest[acct]
+
+        acct_fys: dict[str, dict] = {}
+        opening = 0.0
+        for fy in fy_starts_sorted:
+            fy_label = _fy_key(fy)
+            taken = round(taken_by_fy.get(fy, 0.0), 2)
+            paid = round(paid_by_fy.get(fy, 0.0), 2)
+            interest = round(interest_by_fy.get(fy, 0.0), 2)
+            opening_r = round(opening, 2)
+            closing = round(opening_r + taken - paid + interest, 2)
+            acct_fys[fy_label] = {
+                'opening': opening_r,
+                'taken': taken,
+                'paid': paid,
+                'interest': interest,
+                'closing': closing,
+            }
+            t = totals_by_fy[fy_label]
+            t['opening'] += opening_r
+            t['taken'] += taken
+            t['paid'] += paid
+            t['interest'] += interest
+            t['closing'] += closing
+            opening = closing
+
+        rows.append({'account': acct, 'fys': acct_fys, 'closing': round(opening, 2)})
+
+    for fy_label in totals_by_fy:
+        for key in totals_by_fy[fy_label]:
+            totals_by_fy[fy_label][key] = round(totals_by_fy[fy_label][key], 2)
+
+    return {
+        'fys': fys,
+        'rows': rows,
+        'totals': totals_by_fy,
+        'missing_rate_accounts': missing_rate_accounts,
+    }

@@ -115,6 +115,9 @@ def lambda_handler(event, context):
         return _handle_ledger_data(params.get('from_date', ''), params.get('to_date', ''))
     if path == '/borrowings/meta':
         return _handle_borrowings_meta()
+    if path == '/borrowings/summary-fy':
+        params = event.get('queryStringParameters') or {}
+        return _handle_borrowings_summary_fy(_parse_bool_param(params.get('include_interest')))
     if path == '/borrowings':
         params = event.get('queryStringParameters') or {}
         return _handle_borrowings_data(
@@ -215,6 +218,9 @@ def lambda_handler(event, context):
             params.get('to_date', ''),
             _parse_bool_param(params.get('include_interest')),
         )
+    if path == '/borrowings/summary-fy/pdf':
+        params = event.get('queryStringParameters') or {}
+        return _handle_borrowings_summary_fy_pdf(_parse_bool_param(params.get('include_interest')))
     if path == '/stocks/expiry/pdf':
         params = event.get('queryStringParameters') or {}
         return _handle_stocks_expiry_pdf(params)
@@ -698,7 +704,8 @@ def _handle_borrowings_pdf(account: str, from_date: str, to_date: str, include_i
     import borrowings_pdf
     if include_interest:
         pdf_bytes = borrowings_pdf.render_borrowings_interest_pdf(
-            payload['rows'], payload['missing_rate_accounts'], account, from_date, to_date,
+            payload['rows'], payload['missing_rate_accounts'], payload.get('fy_totals', {}),
+            account, from_date, to_date,
         )
     else:
         pdf_bytes = borrowings_pdf.render_borrowings_pdf(rows, account, from_date, to_date)
@@ -706,6 +713,54 @@ def _handle_borrowings_pdf(account: str, from_date: str, to_date: str, include_i
         f'borrowings_{_safe_filename_part(account) or "all"}_'
         f'{_safe_filename_part(from_date)}_{_safe_filename_part(to_date)}.pdf'
     )
+    return _pdf_response(pdf_bytes, filename)
+
+
+def _handle_borrowings_summary_fy(include_interest: bool = False):
+    """GET /borrowings/summary-fy?include_interest=0|1 — all-accounts,
+    all-FYs roll-forward (no date params; the full history view). Delegates
+    to borrowings.compute_borrowings_summary_fy(), the SAME function
+    GET /borrowings/summary-fy/pdf calls, so the screen and the PDF can never
+    disagree. Cache key `iravi:borrowings:summary_fy:{include_interest}`
+    (0/1), TTL _LEDGER_TTL (1 hour) — mirrors the other borrowings routes'
+    caching convention.
+    """
+    cache_key = f'iravi:borrowings:summary_fy:{1 if include_interest else 0}'
+    r = _get_redis()
+    cached = r.get(cache_key)
+    if cached:
+        return _response(200, json.loads(cached))
+
+    conn = _get_db_conn()
+    try:
+        payload = _brw.compute_borrowings_summary_fy(conn, include_interest)
+    finally:
+        conn.close()
+
+    r.set(cache_key, json.dumps(payload), ex=_LEDGER_TTL)
+    logger.info('Borrowings summary-fy cached: key=%s accounts=%d fys=%d',
+                cache_key, len(payload['rows']), len(payload['fys']))
+    return _response(200, payload)
+
+
+def _handle_borrowings_summary_fy_pdf(include_interest: bool = False):
+    """GET /borrowings/summary-fy/pdf?include_interest=0|1 — landscape A4
+    matrix (one row per account, FY column groups), no Redis caching
+    (computed fresh, matching every other PDF export route in this Lambda).
+    Calls the SAME borrowings.compute_borrowings_summary_fy() function
+    GET /borrowings/summary-fy itself calls — the screen and the PDF can
+    never disagree. Local import so a reportlab issue can never break the
+    JSON route.
+    """
+    conn = _get_db_conn()
+    try:
+        payload = _brw.compute_borrowings_summary_fy(conn, include_interest)
+    finally:
+        conn.close()
+
+    import borrowings_pdf
+    pdf_bytes = borrowings_pdf.render_borrowings_summary_fy_pdf(payload, include_interest)
+    filename = f'borrowings_summary_fy_{"with_interest" if include_interest else "no_interest"}.pdf'
     return _pdf_response(pdf_bytes, filename)
 
 
