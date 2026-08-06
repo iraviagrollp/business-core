@@ -99,7 +99,6 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import (
-    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -213,6 +212,100 @@ def _draw_header_footer(canvas, doc):
     letterhead.draw_footer(canvas, doc)
 
 
+# ── shared FY-table style builder (Tasks 2/3/4 — used by BOTH render_borrowings_pdf
+# and render_borrowings_interest_pdf) ────────────────────────────────────────
+#
+# REGRESSION FIX (2026-08-06, same day as the original Task 2 pagination fix):
+# the first cut of the pagination fix split each FY's rows into TWO separate
+# sibling `Table` flowables (a "main" chunk + a "tail" chunk kept with the
+# summary), each with its own `repeatRows=1`. That reintroduced a WORSE bug: a
+# `Table`'s `repeatRows` only repeats ITS OWN header when THAT table splits
+# across a page boundary — it has no idea a sibling table already drew an
+# identical green header higher up the very same page. The tail table's own
+# header row rendered unconditionally at whatever vertical position it
+# happened to land, which was usually mid-page, spliced between two ordinary
+# transaction rows with no page break anywhere nearby.
+#
+# Fix: collapse each FY block back to ONE single `Table` flowable — header +
+# every body row (opening/brought-forward/transaction/interest) + the FY
+# summary rows, all appended as trailing rows of that SAME table, styled via
+# `SPAN`/`BACKGROUND`/`BOX` TableStyle commands scoped to that row range
+# instead of a separate boxed `Table`. With a single table, `repeatRows=1`
+# does exactly the right thing again: the header is drawn once at the top of
+# the FY block and repeats ONLY at genuine page breaks.
+#
+# Tradeoff landed on for summary orphaning: the summary rows are ordinary
+# trailing rows of the single per-FY table, so reportlab's own Table-splitting
+# can, in principle, break between two summary rows (or leave the summary
+# alone at the top of a fresh page) if the split lands there — no
+# `KeepTogether` is used to prevent this, because a `KeepTogether` around the
+# summary would either (a) wrap the summary alone, which does nothing to
+# prevent it starting a fresh page with no table context above it, or (b)
+# wrap the summary + trailing data rows as a second table, which reintroduces
+# the exact sibling-table-header regression this fix exists to eliminate. Per
+# the coordinator's explicit guidance, an occasional cosmetically-orphaned/
+# split summary is accepted as strictly preferable to a spurious mid-page
+# header — a stray header band mid-table is a visible correctness defect; an
+# orphaned summary is only cosmetic. In practice this is rare: the summary is
+# only 1-3 short rows, so it only splits/orphans when a page boundary lands
+# within those specific 1-3 rows.
+
+def _fy_table_style(n_cols: int, total_rows: int, opening_idx: int | None,
+                     interest_idxs: list, summary_start: int | None) -> list:
+    """TableStyle commands for ONE single per-FY Table containing: header
+    (row 0) + body rows (opening/brought-forward/transaction/interest) +
+    trailing FY-summary rows (rows `summary_start` .. `total_rows - 1`, when
+    `summary_start` is given). See the module comment directly above for why
+    this MUST be one Table (never split across sibling Table flowables).
+
+    n_cols        : total column count (for the summary rows' label SPAN).
+    total_rows    : total row count of the table (header + body + summary).
+    opening_idx   : row index of the Opening Balance / Brought Forward row,
+                    or None.
+    interest_idxs : row indices of merged interest rows (Task 3) needing a
+                    SPAN across columns 1-6; empty list when not applicable
+                    (the OFF report, or "all accounts" mode).
+    summary_start : row index where the trailing FY-summary rows begin, or
+                    None when the table has no summary rows at all (never
+                    happens in practice here, but keeps this helper general).
+    """
+    cmds: list = [
+        ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
+        ('FONTSIZE',      (0, 0), (-1, -1), 7.5),
+        ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+        ('TOPPADDING',    (0, 0), (-1, -1), 2.5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 3),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
+        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+    ]
+    if opening_idx is not None:
+        cmds.append(('BACKGROUND', (0, opening_idx), (-1, opening_idx), _TOTAL_BG))
+        cmds.append(('SPAN', (0, opening_idx), (1, opening_idx)))
+    for idx in interest_idxs:
+        cmds.append(('SPAN', (1, idx), (6, idx)))
+
+    zebra_end = summary_start if summary_start is not None else total_rows
+    zebra_start = (opening_idx + 1) if opening_idx is not None else 1
+    for i in range(zebra_start, zebra_end):
+        if (i - zebra_start) % 2 == 1:
+            cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+
+    if summary_start is not None:
+        summary_end = total_rows - 1
+        # Task 4: light-green filled box, 2px solid green border, spanning
+        # the table width — cancel the plain grid lines inside the summary
+        # range first (width 0 overrides the earlier global GRID command for
+        # just these rows), then redraw only the outer perimeter via BOX.
+        cmds.append(('GRID', (0, summary_start), (-1, summary_end), 0, colors.white))
+        cmds.append(('BACKGROUND', (0, summary_start), (-1, summary_end), _SUMMARY_BG))
+        cmds.append(('BOX', (0, summary_start), (-1, summary_end), 2, letterhead.GREEN))
+        for r in range(summary_start, total_rows):
+            cmds.append(('SPAN', (0, r), (n_cols - 2, r)))
+
+    return cmds
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 #
 # render_borrowings_pdf — include_interest OFF report. Reworked 2026-08-06
@@ -221,11 +314,11 @@ def _draw_header_footer(canvas, doc):
 # after the first opens with a "Brought Forward" row carrying the previous
 # FY's closing principal (single-account mode only — see the deviation note
 # below); every FY block ends with a light-green / 2px-green-bordered summary
-# box (same Task 4 treatment as the interest report). No Interest column, no
-# interest rows, no capitalization — pure principal roll-forward
-# (closing = opening + credit - debit). Same Task-2 pagination discipline as
-# the interest report (heading keepWithNext, main chunk flows naturally, only
-# the last _TAIL_ROW_COUNT rows are kept together with the summary box).
+# box (same Task 4 treatment as the interest report), rendered as TRAILING
+# ROWS of the SAME per-FY table (see the `_fy_table_style` comment above — a
+# second-pass fix for the mid-page-header regression the original tail-table
+# split caused). No Interest column, no interest rows, no capitalization —
+# pure principal roll-forward (closing = opening + credit - debit).
 #
 # "all accounts" mode (`account` blank): mirrors render_borrowings_interest_
 # pdf's documented deviation — a per-account closing PRINCIPAL has no
@@ -322,17 +415,7 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
             Paragraph(sixth_header, hdr_l if not single_account else hdr_r),
         ]
 
-    def _table_from_slice(slice_rows, has_header):
-        table_rows = ([_header_row()] if has_header else []) + [c for c, _k in slice_rows]
-        offset = 1 if has_header else 0
-        opening_idx = None
-        for i, (_c, kind) in enumerate(slice_rows):
-            if kind == 'opening':
-                opening_idx = i + offset
-        cmds = _fy_table_style(len(table_rows), opening_idx, [], has_header)
-        tbl = Table(table_rows, colWidths=col_widths, repeatRows=(1 if has_header else 0))
-        tbl.setStyle(TableStyle(cmds))
-        return tbl
+    n_cols = len(col_widths)
 
     # ── Group rows by financial year (ascending) ──────────────────────────────
     fy_groups: dict = {}
@@ -393,43 +476,44 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
         # Task 2: heading glued to the table via keepWithNext (never appended
         # inside a whole-block KeepTogether).
         elements.append(Paragraph(heading_text, fy_head_sty))
-
-        n_body = len(body_rows)
-        n_tail = min(_TAIL_ROW_COUNT, n_body)
-        main_slice = body_rows[: n_body - n_tail]
-        tail_slice = body_rows[n_body - n_tail:]
-
-        if main_slice:
-            elements.append(Spacer(1, 3))
-            elements.append(_table_from_slice(main_slice, has_header=True))
-
-        tail_table = _table_from_slice(tail_slice, has_header=True)
+        elements.append(Spacer(1, 3))
 
         if single_account:
             fy_closing_principal = running
-            summary_rows = [
-                [Paragraph('Total Principal Amount', summary_b_sty), Paragraph(_fmt_inr(fy_closing_principal), summary_b_sty)],
+            summary_lines = [
+                ('Total Principal Amount', fy_closing_principal, True),
             ]
             brought_forward = fy_closing_principal  # exactly the next FY's Brought Forward
         else:
-            summary_rows = [
-                [Paragraph('Total Debit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_debit, 2)), summary_sty)],
-                [Paragraph('Total Credit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_credit, 2)), summary_sty)],
+            summary_lines = [
+                ('Total Debit Amount', round(fy_total_debit, 2), False),
+                ('Total Credit Amount', round(fy_total_credit, 2), False),
             ]
 
-        # Task 4: FY summary as a light-green filled box with a 2px solid
-        # green border, spanning the table width.
-        summary_table = Table(summary_rows, colWidths=[_CONTENT_W * 0.6, _CONTENT_W * 0.4])
-        summary_table.setStyle(TableStyle([
-            ('BACKGROUND',    (0, 0), (-1, -1), _SUMMARY_BG),
-            ('BOX',           (0, 0), (-1, -1), 2, letterhead.GREEN),
-            ('LEFTPADDING',   (0, 0), (-1, -1), 8),
-            ('RIGHTPADDING',  (0, 0), (-1, -1), 8),
-            ('TOPPADDING',    (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ]))
+        # ── Assemble the FY's SINGLE table: header + body rows + trailing
+        # FY-summary rows (see the _fy_table_style comment above for why this
+        # must never be split across sibling Table flowables). ──────────────
+        table_rows: list = [_header_row()]
+        opening_idx = None
+        for i, (cells, kind) in enumerate(body_rows):
+            ridx = i + 1
+            table_rows.append(cells)
+            if kind == 'opening':
+                opening_idx = ridx
 
-        elements.append(KeepTogether([tail_table, Spacer(1, 6), summary_table, Spacer(1, 10)]))
+        summary_start = len(table_rows)
+        for label, value, bold in summary_lines:
+            sty = summary_b_sty if bold else summary_sty
+            table_rows.append(
+                [Paragraph(label, sty)] + [''] * (n_cols - 2) + [Paragraph(_fmt_inr(value), sty)]
+            )
+
+        fy_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
+        fy_table.setStyle(TableStyle(
+            _fy_table_style(n_cols, len(table_rows), opening_idx, [], summary_start)
+        ))
+        elements.append(fy_table)
+        elements.append(Spacer(1, 10))
 
     # ── Build PDF with the letterhead header AND footer repeating on every page ─
     doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
@@ -471,26 +555,19 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
 #   transaction rows, and a light-green-filled / 2px-green-bordered summary
 #   box after each FY block (_SUMMARY_BG + a ('BOX', ..., 2, letterhead.GREEN)
 #   command — reuses the existing green palette, no new brand color).
-# - PAGINATION (fixed 2026-08-06 — no more blank leading page): the OLD code
-#   wrapped the ENTIRE FY block (heading + table + summary) in a single
-#   KeepTogether, which defers the WHOLE block to a fresh page the instant it
-#   doesn't fit on the current one — for the common case of a FY block taller
-#   than one page, that left page 1 mostly blank. Fixed by NOT wrapping the
-#   whole block: the FY heading uses a `keepWithNext=True` paragraph style (so
-#   it's never left dangling alone at the bottom of a page); the bulk of the
-#   FY's data rows ("main" chunk) flow/paginate naturally as a normal
-#   `repeatRows=1` Table (reportlab splits it across pages on its own,
-#   repeating the green header band on every continuation page); only the
-#   LAST few data rows ("tail" chunk, up to `_TAIL_ROW_COUNT` rows) are pulled
-#   into a SEPARATE small table and wrapped in ONE KeepTogether together with
-#   the FY summary box, so the summary can never land alone/orphaned on a
-#   fresh page with no table context above it. The tail table always carries
-#   its own repeated header row (a small, accepted cosmetic tradeoff: if the
-#   tail happens to render immediately after the main chunk on the SAME page,
-#   the green header band appears twice in a row — reads like a natural
-#   "closing entries" sub-table, and is far preferable to the alternative of
-#   an un-headed set of rows floating alone on a fresh page if the tail is
-#   pushed over by KeepTogether).
+# - PAGINATION (fixed 2026-08-06, then FIXED AGAIN the same day after a
+#   regression — see the shared `_fy_table_style` module comment above for the
+#   full story). Summary: the FY heading uses a `keepWithNext=True` paragraph
+#   style (never left dangling alone at the bottom of a page); the ENTIRE FY
+#   block (header + every body row + trailing summary rows) is ONE single
+#   `Table` with `repeatRows=1`, so reportlab paginates it naturally on its
+#   own, repeating the green header ONLY at genuine page breaks — never
+#   mid-page. (The very first fix attempt split the FY into a "main" table +
+#   a separate "tail" table kept with the summary; that caused a WORSE bug —
+#   a spurious green header band appearing mid-page, spliced between two
+#   ordinary transaction rows, because the tail table's own `repeatRows`
+#   header has no way to know a sibling table already drew one higher up the
+#   same page. That approach is gone.)
 # - MERGED INTEREST ROWS (Task 3, single-account mode only): every row with
 #   row_type == 'interest' keeps its Date cell, then SPANs the remaining six
 #   columns (Voucher No, Transaction Name, Debit, Credit, Interest, Balance)
@@ -521,38 +598,10 @@ def render_borrowings_pdf(rows: list, account: str, from_date: str, to_date: str
 #   original task write-up) rather than an oversight.
 # - Zero-row case: same graceful 'No records for the selected period.'
 #   message as the plain report.
-
-_TAIL_ROW_COUNT = 3  # last-N data rows kept together with the FY summary box
-
-
-def _fy_table_style(total_rows: int, opening_idx: int | None, interest_idxs: list,
-                     has_header: bool) -> list:
-    """TableStyle command list for one FY sub-table (main or tail chunk).
-    `total_rows` includes the header row when `has_header` is True. Zebra
-    striping starts right after the opening/brought-forward row (or right
-    after the header when there is none)."""
-    cmds: list = []
-    if has_header:
-        cmds.append(('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN))
-    cmds += [
-        ('FONTSIZE',      (0, 0), (-1, -1), 7.5),
-        ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
-        ('TOPPADDING',    (0, 0), (-1, -1), 2.5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 3),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 3),
-        ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
-    ]
-    if opening_idx is not None:
-        cmds.append(('BACKGROUND', (0, opening_idx), (-1, opening_idx), _TOTAL_BG))
-        cmds.append(('SPAN', (0, opening_idx), (1, opening_idx)))
-    for idx in interest_idxs:
-        cmds.append(('SPAN', (1, idx), (6, idx)))
-    zebra_start = (opening_idx + 1) if opening_idx is not None else (1 if has_header else 0)
-    for i in range(zebra_start, total_rows):
-        if (i - zebra_start) % 2 == 1:
-            cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
-    return cmds
+#
+# (The shared `_fy_table_style` helper this renderer uses lives above, right
+# before `render_borrowings_pdf` — same helper, same single-table discipline,
+# both renderers.)
 
 
 def render_borrowings_interest_pdf(
@@ -657,6 +706,8 @@ def render_borrowings_interest_pdf(
         amt_w = remaining / 3
         col_widths = [date_w, voucher_w, name_w, acct_w, amt_w, amt_w, amt_w]
         seventh_header = None  # 4th column is Account, not a trailing 7th
+
+    n_cols = len(col_widths)
 
     def _header_row():
         if single_account:
@@ -772,36 +823,7 @@ def render_borrowings_interest_pdf(
         # ── Task 2: heading glued to the table via keepWithNext (never
         # append it inside a whole-block KeepTogether) ───────────────────────
         elements.append(Paragraph(heading_text, fy_head_sty))
-
-        # Split into a "main" chunk (flows/paginates naturally) and a "tail"
-        # chunk (last _TAIL_ROW_COUNT rows) kept together with the summary
-        # box so the summary never orphans alone on a fresh page.
-        n_body = len(body_rows)
-        n_tail = min(_TAIL_ROW_COUNT, n_body)
-        main_slice = body_rows[: n_body - n_tail]
-        tail_slice = body_rows[n_body - n_tail:]
-
-        def _table_from_slice(slice_rows, has_header):
-            table_rows = ([_header_row()] if has_header else []) + [c for c, _k in slice_rows]
-            offset = 1 if has_header else 0
-            opening_idx = None
-            interest_idxs = []
-            for i, (_c, kind) in enumerate(slice_rows):
-                ridx = i + offset
-                if kind == 'opening':
-                    opening_idx = ridx
-                elif kind == 'interest':
-                    interest_idxs.append(ridx)
-            cmds = _fy_table_style(len(table_rows), opening_idx, interest_idxs, has_header)
-            tbl = Table(table_rows, colWidths=col_widths, repeatRows=(1 if has_header else 0))
-            tbl.setStyle(TableStyle(cmds))
-            return tbl
-
-        if main_slice:
-            elements.append(Spacer(1, 3))
-            elements.append(_table_from_slice(main_slice, has_header=True))
-
-        tail_table = _table_from_slice(tail_slice, has_header=True)
+        elements.append(Spacer(1, 3))
 
         if single_account:
             fy_key = f'{fy_start}-{str(fy_start + 1)[-2:]}'
@@ -810,38 +832,50 @@ def render_borrowings_interest_pdf(
             fy_total_interest = fy_data.get('interest', 0.0)
             fy_total_amount = fy_data.get('total', round(fy_closing_principal + fy_total_interest, 2))
 
-            summary_rows = [
-                [Paragraph('Total Principal Amount', summary_b_sty), Paragraph(_fmt_inr(fy_closing_principal), summary_b_sty)],
-                [Paragraph('Total Interest Amount', summary_sty), Paragraph(_fmt_inr(fy_total_interest), summary_sty)],
-                [Paragraph('Total Amount', summary_b_sty), Paragraph(_fmt_inr(fy_total_amount), summary_b_sty)],
+            summary_lines = [
+                ('Total Principal Amount', fy_closing_principal, True),
+                ('Total Interest Amount', fy_total_interest, False),
+                ('Total Amount', fy_total_amount, True),
             ]
             brought_forward = fy_total_amount  # carried into the next FY block — byte-identical to the engine's own capitalized balance
         else:
             fy_total_interest = round(
                 sum(r['interest'] for r in fy_rows if r['row_type'] == 'interest'), 2,
             )
-            summary_rows = [
-                [Paragraph('Total Debit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_debit, 2)), summary_sty)],
-                [Paragraph('Total Credit Amount', summary_sty), Paragraph(_fmt_inr(round(fy_total_credit, 2)), summary_sty)],
-                [Paragraph('Total Interest Amount', summary_b_sty), Paragraph(_fmt_inr(fy_total_interest), summary_b_sty)],
+            summary_lines = [
+                ('Total Debit Amount', round(fy_total_debit, 2), False),
+                ('Total Credit Amount', round(fy_total_credit, 2), False),
+                ('Total Interest Amount', fy_total_interest, True),
             ]
 
-        # Task 4: FY summary as a light-green filled box with a 2px solid
-        # green border, spanning the table width.
-        summary_table = Table(summary_rows, colWidths=[_CONTENT_W * 0.6, _CONTENT_W * 0.4])
-        summary_table.setStyle(TableStyle([
-            ('BACKGROUND',    (0, 0), (-1, -1), _SUMMARY_BG),
-            ('BOX',           (0, 0), (-1, -1), 2, letterhead.GREEN),
-            ('LEFTPADDING',   (0, 0), (-1, -1), 8),
-            ('RIGHTPADDING',  (0, 0), (-1, -1), 8),
-            ('TOPPADDING',    (0, 0), (-1, -1), 4),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ]))
+        # ── Assemble the FY's SINGLE table: header + body rows + trailing
+        # FY-summary rows (see the shared _fy_table_style module comment for
+        # why this must never be split across sibling Table flowables — that
+        # was the mid-page spurious-header regression this fixes). ──────────
+        table_rows: list = [_header_row()]
+        opening_idx = None
+        interest_idxs: list = []
+        for i, (cells, kind) in enumerate(body_rows):
+            ridx = i + 1
+            table_rows.append(cells)
+            if kind == 'opening':
+                opening_idx = ridx
+            elif kind == 'interest':
+                interest_idxs.append(ridx)
 
-        # The tail chunk + summary box are kept together as ONE unit so the
-        # summary can never land alone at the top of a page with no table
-        # context above it (Task 2's third requirement).
-        elements.append(KeepTogether([tail_table, Spacer(1, 6), summary_table, Spacer(1, 10)]))
+        summary_start = len(table_rows)
+        for label, value, bold in summary_lines:
+            sty = summary_b_sty if bold else summary_sty
+            table_rows.append(
+                [Paragraph(label, sty)] + [''] * (n_cols - 2) + [Paragraph(_fmt_inr(value), sty)]
+            )
+
+        fy_table = Table(table_rows, colWidths=col_widths, repeatRows=1)
+        fy_table.setStyle(TableStyle(
+            _fy_table_style(n_cols, len(table_rows), opening_idx, interest_idxs, summary_start)
+        ))
+        elements.append(fy_table)
+        elements.append(Spacer(1, 10))
 
     # ── Build PDF with the letterhead header AND footer repeating on every page ─
     doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)

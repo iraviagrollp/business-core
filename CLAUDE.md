@@ -1356,17 +1356,61 @@ rendered sample PDF, not just unit assertions).
 Task 5) `render_borrowings_pdf` no longer wrap the whole FY block (heading + table + summary) in one
 `KeepTogether` — that forced the ENTIRE block to defer to a fresh page the instant it didn't fit,
 leaving page 1 mostly blank for any FY taller than one page. Fix: the FY heading Paragraph style now
-sets `keepWithNext=True` (never left dangling alone at the bottom of a page); the bulk of the FY's
-rows ("main" chunk) flow as a normal `repeatRows=1` Table that reportlab paginates on its own
-(repeating the green header on every continuation page); only the LAST `_TAIL_ROW_COUNT` (3) rows
-("tail" chunk) are pulled into a small separate table and wrapped in ONE `KeepTogether` together with
-the FY summary box, so the summary can never land alone/orphaned at the top of a fresh page. New
-shared helper `borrowings_pdf._fy_table_style(total_rows, opening_idx, interest_idxs, has_header)`
-builds the TableStyle for either chunk. Accepted cosmetic tradeoff: the tail chunk always carries its
-own header row, so if it happens to render immediately after the main chunk on the SAME page, the
-green header band appears twice in a row (reads like a "closing entries" sub-table) — preferred over
-un-headed rows floating alone on a page. Verified: a 3-page rendered sample (LEVAKA, 2 FYs, ~17
-interest rows) has real content on page 1 (`'FY 2025-26'` heading + data, 500+ chars) — no blank page.
+sets `keepWithNext=True` (never left dangling alone at the bottom of a page); the FY's table
+paginates on its own via `repeatRows=1` (see point 2b below for the current single-table shape of
+that table). Verified: a rendered sample (LEVAKA, 2 FYs, ~17 interest rows) has real content on
+page 1 (`'FY 2025-26'` heading + data, 500+ chars) — no blank page.
+
+**2b. REGRESSION + FIX (same day, 2026-08-06) — spurious mid-page header.** The FIRST cut of
+point 2's pagination fix split each FY's rows into TWO sibling `Table` flowables — a "main" chunk
+(flowing/paginating naturally) and a "tail" chunk (last `_TAIL_ROW_COUNT` rows, wrapped in a
+`KeepTogether` with the summary box) — each with its own `repeatRows=1`. A user-generated PDF
+(`Borrowings_LEVAKA_HARANATHA_REDDY_2025-04-30_2026-08-06.pdf`, no-interest report) showed the
+green header band (`Date | Voucher No | Transaction Name | Debit | Credit | Interest | Balance`)
+spliced mid-page between two ordinary transaction rows, with no page break anywhere near it —
+because `repeatRows` only repeats a Table's OWN header when THAT table splits across a page; the
+tail table's header had no way to know a sibling table already drew an identical one higher up
+the same page, so it just drew unconditionally at whatever vertical position it landed (usually
+mid-page). **Fix: collapsed each FY block back to ONE single `Table` flowable** — header + every
+body row (opening/brought-forward/transaction/merged-interest) + the FY-summary rows, the summary
+now appended as TRAILING ROWS of that SAME table (label spans `(0, r)-(n_cols-2, r)`, value in the
+last column) instead of a separate boxed mini-table, styled via `SPAN`/`BACKGROUND`/`BOX`
+TableStyle commands scoped to that row range (the light-green fill + 2px green border from Task 4
+is unchanged in appearance, just applied to a row-range within the main table now). New shared
+`borrowings_pdf._fy_table_style(n_cols, total_rows, opening_idx, interest_idxs, summary_start)`
+(replaces the old two-arg-shape helper) builds the commands for the whole table in one call; the
+old `_TAIL_ROW_COUNT` constant and the `_table_from_slice`/tail-split logic are gone from both
+`render_borrowings_pdf` and `render_borrowings_interest_pdf`. With one table, `repeatRows=1` does
+exactly the right thing again: the header is drawn once at the top of the FY block and repeats
+ONLY at genuine page breaks — never mid-page. `render_borrowings_summary_fy_pdf` (Task 6's
+landscape matrix) was checked and did NOT have this bug — it was already a single `Table` with
+`repeatRows=2`, never split into sibling tables — so it needed no code change.
+**Tradeoff (explicit, per the coordinator's instruction):** the FY-summary rows are now ordinary
+trailing rows of the single per-FY table, so reportlab's own row-level Table-splitting can, in
+principle, break between two summary rows (or leave the summary alone at the top of a fresh page)
+if a page boundary happens to land there — no `KeepTogether` is used to prevent this, because
+wrapping the summary (or summary + trailing rows) in a `KeepTogether` again risks either doing
+nothing (summary alone) or reintroducing a second sibling table (the exact regression). An
+occasional cosmetically-orphaned/split summary — rare in practice, since the summary is only 1-3
+short rows — was accepted as strictly preferable to a spurious mid-page header, per the explicit
+guidance that a stray header band mid-table is a visible correctness defect while an orphaned
+summary is only cosmetic.
+**Verification (this fix, real rendered output, not just reasoning):** re-rendered the same LEVAKA
+HARANATHA REDDY fixtures (with-interest: 2 pages; no-interest: 2 pages; summary-FY: 1 page) into
+the scratchpad and extracted every page's text with `pypdf`. A programmatic check confirmed every
+occurrence of `'Voucher No'` on every page is LEGITIMATE — either at the genuine top of the page
+(a real `repeatRows` continuation, right after the canvas-drawn letterhead) or immediately preceded
+by that table's own `'FY 20...'` heading (a brand-new FY's table legitimately starting partway down
+a page that still has room) — never spliced between ordinary transaction-row text with no heading
+nearby. The EXACT reported sequence (`04-03-2026 BP2526-112` → `31-03-2026 JE2526-32`/`JE2526-87`
+→ `March Interest - ₹52,629.91` → `Total Principal Amount`/`Total Interest Amount`/`Total Amount`)
+was confirmed to render with no header spliced in anywhere in that run. Also re-confirmed Tasks
+1/2/3 still hold: no blank leading page; `'July Interest - ₹34,314.28'`-style merged/centered
+interest rows present; FY 2025-26 `'Total Amount'` reads `₹55,77,494.20` immediately followed by
+`'Brought Forward ... ₹55,77,494.20 Dr'` (byte-identical). `test_borrowings_interest.py` re-run:
+**99/99 assertions still pass** (unaffected — those tests exercise `borrowings.py`'s compute layer,
+not the PDF renderer). Scratch verification script and generated PDFs written to the session
+scratchpad only, never the repo; deleted after use along with `__pycache__`.
 
 **3. Merged interest rows (single-account mode only).** Every `row_type == 'interest'` row keeps its
 Date cell, then SPANs the remaining six columns (Voucher No, Transaction Name, Debit, Credit,
@@ -1390,8 +1434,9 @@ mini-table.
 
 **5. `render_borrowings_pdf` (interest OFF) rebuilt with FY blocks.** Previously one flat table;
 now mirrors the interest report's sectioning: grouped by financial year (1 Apr – 31 Mar), each with
-its own bold FY heading + green-banded table (same `_fy_table_style`/tail-split/`KeepTogether`
-pagination discipline as point 2); every FY after the first opens with a **Brought Forward** row
+its own bold FY heading + ONE single green-banded table (header + body rows + trailing summary
+rows — same `_fy_table_style` single-table discipline as point 2b); every FY after the first opens
+with a **Brought Forward** row
 carrying the previous FY's closing principal (single-account mode; running balance = cumulative
 `credit − debit`, unchanged domain semantics); every FY block ends with the same light-green/
 2px-green-bordered **Total Principal Amount** box (Task 4 treatment) = that FY's closing principal =
