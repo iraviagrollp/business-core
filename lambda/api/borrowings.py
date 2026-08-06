@@ -639,14 +639,25 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
                 there, so closing stays equal to the carried-forward
                 opening).
 
-    `fys` is the ascending union of every FY with recorded activity (via
-    taken/paid) across ALL accounts, plus — only when include_interest is
-    True — every FY the interest engine produced a bucket for (its own
-    month-boundary walk can surface a dormant-but-still-accruing FY that had
-    zero real transactions that year). Every account's `fys` map is filled
-    for EVERY key in this list (zero-filled where the account had no
-    activity that year) so the caller can render a rectangular matrix with
-    no null-checks.
+    `fys` is the CONTIGUOUS ascending range of financial years from the
+    earliest FY with any recorded activity (taken/paid) across ALL accounts
+    through the FY containing `as_of` (today by default) — independent of
+    `include_interest` and independent of per-FY activity. This is
+    deliberate: a FY in which NO account had any transaction, but in which a
+    nonzero balance was still carried forward from a prior FY, must still
+    appear (with `taken=0, paid=0, interest=0` and `opening == closing`) so
+    the report never silently skips a dormant year's outstanding liability.
+    (An earlier version derived `fys` from the union of active FYs — plus,
+    only when `include_interest` was True, whatever FYs the interest
+    engine's month-boundary walk happened to surface — which meant a
+    transaction-free middle year could vanish from the report entirely when
+    `include_interest=0`, and the FY coverage could silently differ
+    depending on the interest toggle. Fixed 2026-08-06.) Every account's
+    `fys` map is filled for EVERY key in this contiguous list (zero-filled
+    where the account had no activity that year) so the caller can render a
+    rectangular matrix with no null-checks — the existing per-account
+    roll-forward loop already carries `opening`/`closing` correctly through
+    a gap year unchanged; only the FY-range construction changed.
 
     Returns
     -------
@@ -684,7 +695,7 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     per_account_taken: dict[str, dict[int, float]] = {}
     per_account_paid: dict[str, dict[int, float]] = {}
     per_account_interest: dict[str, dict[int, float]] = {}
-    all_fy_starts: set[int] = set()
+    earliest_activity_fy: int | None = None
     in_scope_accounts: list[str] = []
 
     for acct in accounts:
@@ -701,8 +712,11 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
             paid_by_fy[fy] = paid_by_fy.get(fy, 0.0) + r['debit']
         per_account_taken[acct] = taken_by_fy
         per_account_paid[acct] = paid_by_fy
-        all_fy_starts.update(taken_by_fy.keys())
-        all_fy_starts.update(paid_by_fy.keys())
+        acct_fys = set(taken_by_fy) | set(paid_by_fy)
+        if acct_fys:
+            acct_min_fy = min(acct_fys)
+            if earliest_activity_fy is None or acct_min_fy < earliest_activity_fy:
+                earliest_activity_fy = acct_min_fy
 
         interest_by_fy: dict[int, float] = {}
         if include_interest:
@@ -714,10 +728,24 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
             for fy_key, fy_data in fy_totals.items():
                 fy_start_int = int(fy_key.split('-')[0])
                 interest_by_fy[fy_start_int] = fy_data['interest']
-            all_fy_starts.update(interest_by_fy.keys())
         per_account_interest[acct] = interest_by_fy
 
-    fy_starts_sorted = sorted(all_fy_starts)
+    # FY enumeration is CONTIGUOUS and independent of include_interest / of
+    # which FYs happen to have activity — the earliest FY with ANY recorded
+    # activity (taken/paid) across all accounts through the FY containing
+    # `as_of_d`, no gaps. A dormant middle year (no transactions that FY, but
+    # a nonzero balance carried forward from a prior FY) must still appear —
+    # see the docstring above for the full rationale. This is deliberately
+    # NOT derived from `interest_by_fy` at all (that used to be the ONLY
+    # thing that could surface a dormant year, and only when
+    # include_interest=True — the exact bug this fixes).
+    if earliest_activity_fy is None:
+        fy_starts_sorted: list[int] = []
+    else:
+        as_of_fy = _fy_start_year(as_of_d)
+        latest_fy = max(earliest_activity_fy, as_of_fy)
+        fy_starts_sorted = list(range(earliest_activity_fy, latest_fy + 1))
+
     fys = [_fy_key(fy) for fy in fy_starts_sorted]
 
     totals_by_fy: dict[str, dict] = {

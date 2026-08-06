@@ -1455,10 +1455,11 @@ column stays Account, no Brought-Forward row, summary reduced to Total Debit/Tot
   capitalized interest from `_compute_fy_totals` (0.0 everywhere when `include_interest=0`),
   `closing = opening + taken − paid + interest`, `opening` = prior FY's closing (0.0 for the first FY
   an account appears in — falls out naturally since taken/paid/interest are all 0 before an account's
-  first activity). `fys` = ascending union of every FY with recorded taken/paid activity across ALL
-  accounts, plus (only when `include_interest=1`) any FY the interest engine's month-boundary walk
-  surfaced on its own (a dormant account can still accrue interest in a year with zero real
-  transactions). Every account's `fys` map is filled for EVERY key in the global `fys` list
+  first activity). `fys` = the **contiguous** ascending range of FYs from the earliest FY with any
+  recorded taken/paid activity across ALL accounts through the FY containing `as_of` — independent of
+  `include_interest` and independent of per-FY activity (fixed 2026-08-06; see the dedicated fix note
+  below this list — a transaction-free middle year with a carried-forward balance must still appear).
+  Every account's `fys` map is filled for EVERY key in the global `fys` list
   (zero-filled, correctly carried-forward opening/closing) — a rectangular matrix, no null-checks
   needed by the caller. `totals` = column-wise sums across accounts, same shape.
   `missing_rate_accounts` — sorted, only meaningful when `include_interest=1` (empty otherwise).
@@ -1477,16 +1478,53 @@ column stays Account, no Brought-Forward row, summary reduced to Total Debit/Tot
   existing borrowings route/caching conventions exactly (same `_LEDGER_TTL`, same `_pdf_response`/
   local-`import borrowings_pdf` pattern as every other PDF route).
 
+**6b. FIX (same day, 2026-08-06) — dormant middle FY silently vanished with `include_interest=0`.**
+Root cause: `compute_borrowings_summary_fy`'s `fys` (and therefore `totals`, keyed off it) was
+enumerated from `all_fy_starts`, populated only from `taken_by_fy.keys()`/`paid_by_fy.keys()` across
+all accounts, plus — ONLY when `include_interest=True` — whatever FYs the interest engine's
+month-boundary walk happened to surface. So a FY with NO transaction for any account but with a
+nonzero balance carried forward from a prior FY was simply MISSING from `fys`/`totals` entirely when
+`include_interest=0` — the all-accounts summary screen and PDF silently skipped that year's column,
+and the year's outstanding liability didn't appear anywhere. With `include_interest=1` this was
+masked (not fixed) as an incidental side effect of the interest engine always walking every month up
+to `as_of` regardless of activity — meaning the report's FY coverage silently differed depending on
+the interest toggle, which was itself wrong (the toggle should only ever change interest AMOUNTS,
+never which years are shown). Fix: FY enumeration is now a **contiguous** range, built independent of
+`include_interest` and of transaction activity — `earliest_activity_fy` (the minimum FY across every
+account's `taken_by_fy`/`paid_by_fy` keys, i.e. the earliest FY ANY account has a row in) through
+`max(earliest_activity_fy, _fy_start_year(as_of))`, via `fy_starts_sorted = list(range(earliest_activity_fy,
+latest_fy + 1))` — no gaps, ever. The per-account roll-forward loop (opening/taken/paid/interest/
+closing per FY, zero-filled where there's no activity) was NOT changed — it already carried a dormant
+FY's `opening == closing` correctly once that FY was present in `fy_starts_sorted`; only the FY-range
+CONSTRUCTION changed (the `all_fy_starts.update(interest_by_fy.keys())` line — the sole mechanism
+that could ever surface a dormant year, and only for `include_interest=1` — was removed entirely).
+Docstring updated to describe the new contiguous-range contract (was: "ascending union of every FY
+with recorded activity ... plus, only when include_interest is True, every FY the interest engine
+produced a bucket for"). **Test coverage (`test_borrowings_interest.py`, new block 8):** a fixture
+account borrows in FY 2023-24, has ZERO transactions in FY 2024-25, and repays in FY 2025-26 —
+asserted for BOTH `include_interest=0` and `include_interest=1`: `fys` contains all three FYs
+contiguously; `totals['2024-25']` exists; FY2's `opening == closing` and equals FY1's `closing` when
+interest is off; FY2 accrues nonzero interest when a rate is configured and interest is on (proving
+the toggle changes amounts, not coverage); and the `fys` list itself is byte-identical between the
+two `include_interest` values. **Rendered-PDF verification (scratchpad only, not committed):**
+rendered `render_borrowings_summary_fy_pdf` for this exact fixture with both `include_interest`
+values — confirmed via `pypdf` text extraction that BOTH PDFs show all three FY column groups
+(`2023-24`/`2024-25`/`2025-26`), with the dormant `2024-25` column showing `Taken: -`, `Paid: -`,
+`Closing: ₹5,00,000.00 Dr` (== FY1's closing) when interest is off, and the SAME column showing a
+nonzero `Interest: ₹66,627.95` (closing correspondingly higher, `₹6,21,860.83 Dr`) when interest is
+on — same FY coverage, different amounts, exactly as intended.
+
 **Verification (2026-08-06):** `python -m py_compile handler.py borrowings.py borrowings_pdf.py
-test_borrowings_interest.py` clean. `test_borrowings_interest.py` extended with two new blocks —
+test_borrowings_interest.py` clean. `test_borrowings_interest.py` extended with three new blocks —
 **block 6** (FY-boundary continuity invariant, on the real LEVAKA data via a stub DB connection: a
 closed FY's `fy_totals[...]['total']` must equal the `balance` on the first row of the next FY when
-no transaction intervenes — confirms the exact bug scenario is fixed) and **block 7**
+no transaction intervenes — confirms the exact bug scenario is fixed), **block 7**
 (`/borrowings/summary-fy` roll-forward invariant, two synthetic accounts across overlapping FYs, both
 `include_interest` values: `closing == opening + taken − paid + interest` for every account/FY, each
 FY's `opening` == the prior FY's `closing`, the `fys` map is rectangular, `totals` are column-wise
-sums) — **99/99 assertions pass** (75 pre-existing + 24 new; verbatim output captured in the task
-response). Sample PDFs rendered locally (real `reportlab`/`pypdf`, no AWS credentials needed — a
+sums), and **block 8** (the dormant-middle-FY fix above) — **111/111 assertions pass** (99
+pre-existing + 12 new; verbatim output captured in the task response). Sample PDFs rendered locally
+(real `reportlab`/`pypdf`, no AWS credentials needed — a
 stub DB connection feeds `compute_borrowings_interest`/`compute_borrowings_summary_fy` the same real
 LEVAKA HARANATHA REDDY row data used in the test file) and written to the session scratchpad (NOT the
 repo), then deleted from the repo along with the scratch verification script and `__pycache__`
