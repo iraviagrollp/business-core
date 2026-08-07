@@ -1653,6 +1653,70 @@ screen — matrix table (accounts × FYs) + PDF export button, an `include_inter
 `missing_rate_accounts` warning banner when non-empty — mirrors the existing Customer/Supplier
 Balances (FY) screens' UX pattern.
 
+**7. `rows[i].rate` field added to the FY-summary payload + a RATE column in the PDF (2026-08-07).**
+The configured `borrowing_rate` is an **account-level** property (one current row per account, no
+effective dating — `compute_borrowing_rate_map` returns only open rows, an account absent from the
+map has no configured rate) — not a per-FY value — so it is surfaced at the ROW level, never inside
+`rows[i]['fys'][fy_label]` or `totals[fy_label]`.
+- `borrowings.compute_borrowings_summary_fy`: `rate_map` is now **always** computed (previously only
+  when `include_interest` was true — the rate is worth showing even in the no-interest view);
+  `missing_rate_accounts` stays gated on `include_interest` exactly as before (unchanged behavior —
+  it drives the existing "rate not configured" warning tied to the interest calculation). Each entry
+  in `rows` gains `'rate': rate_map.get(acct)` — a float percent, or **`None`** (never `0.0`) when the
+  account has no configured rate, so a caller can distinguish "0% configured" from "not configured".
+  No existing key changed; `rows[i]['fys'][...]`/`totals[...]` are untouched.
+- `borrowings_pdf.render_borrowings_summary_fy_pdf`: a fixed-width **RATE** column was inserted
+  immediately after ACCOUNT, spanning both header rows exactly like ACCOUNT/S.No (`('SPAN', (2, 0),
+  (2, 1))`; the per-FY column group start index shifted from `sc = 2 + i*sub_col_count` to `sc = 3 +
+  i*sub_col_count` — the per-FY `SPAN`/sub-column-count math itself is untouched, this is
+  deliberately NOT a per-FY sub-column). Value cells: `f'{rate:.2f}%'` right-aligned in plain body
+  black (e.g. `12.50%` — never colored red/green/amber; a rate is not a money figure, so it stays out
+  of this renderer's `_TAKEN_FG`/`_PAID_FG`/`_INTEREST_FG`/`_POS_FG`/`_NEG_FG` amount color scheme);
+  `None` renders the existing `-` placeholder in `letterhead.MUTED`. The TOTAL row's RATE cell is
+  always the same muted `-` placeholder (a rate has no meaningful total).
+- **Column-width fit check (worst case, `include_interest=True`, 5 sub-columns per FY):** `rate_w` is
+  **n_fys-conditional** — `36.0pt` when `n_fys <= 4`, `32.0pt` when `n_fys > 4` (mirrors how
+  `account_w` already shrinks at `n_fys > 4`) — chosen over a flat `38.0pt` to minimize how much is
+  taken out of the already-tight per-FY sub-column pool at high FY counts, while comfortably fitting
+  the widest possible rate string (`"100.00%"` ≈ 25.7pt at 6.5pt bold + 4pt padding = 29.7pt needed).
+  Measured `sub_col_w` (landscape A4, `content_w ≈ 785.2pt`, `sno_w=22pt`):
+
+  | `n_fys` | `account_w` | `rate_w` | `sub_col_w` (with RATE) | `sub_col_w` (without RATE, for reference) |
+  |---|---|---|---|---|
+  | 2 | 150pt | 36pt | 57.72pt | 61.32pt |
+  | 3 | 150pt | 36pt | 38.48pt | 40.88pt |
+  | 4 | 150pt | 36pt | 28.86pt | 30.66pt |
+  | 6 | 120pt | 32pt | 20.37pt | 21.44pt |
+
+  Adding the RATE column costs 1.07–3.6pt of `sub_col_w` per FY, shrinking with `n_fys` (the
+  n_fys-conditional width is doing its job). At 6.5pt bold, a worst-case Closing/Total Payable cell
+  text (`₹2,46,40,038.94 Dr`) measures ≈56.5pt — already wider than `sub_col_w` at every tested
+  `n_fys` **before and after** this change (e.g. `n_fys=6`'s ~20-21pt column has never had room for a
+  crore-scale Dr-suffixed value; `n_fys=2`'s ~58-61pt column does). This is a **pre-existing**
+  characteristic of the FY-summary matrix's already-tight, zero-slack column budget, not something
+  this task introduced or made categorically worse — the RATE column's own content (`"100.00%"` max,
+  ≈25.7pt) fits its own 32–36pt column with comfortable margin at every `n_fys` tested.
+- **Propagation:** `api/borrowings.py` → `alerts_evaluator/borrowings.py` and `api/borrowings_pdf.py`
+  → `alerts_evaluator/borrowings_pdf.py` re-copied and SHA-256-verified byte-identical after this
+  change (feeds the `borrowings_summary_fy`/`borrowings_summary_fy_interest` scheduled alert emails).
+- **Verification:** `ast.parse` clean on `borrowings.py`, `borrowings_pdf.py`, `handler.py`. Rendered
+  for real (no monkeypatching) via the `api/` copies — a hand-built fixture with an account carrying a
+  configured rate (12.50%), an account with `rate=None`, a zero-configured-rate account (`0.00%`), a
+  positive closing, a negative closing, a zero closing, and a populated TOTAL row — for both
+  `include_interest=False` and `=True`: both produced valid `%PDF`-prefixed bytes (236,732 /
+  237,116 bytes, 1 page each), and `pypdf` text extraction confirmed the `RATE` header, `12.50%` /
+  `0.00%` rate strings positioned correctly per-account, the `-` placeholder for the not-configured
+  account, and the TOTAL row's RATE cell rendering `-` (never a stray value) — in both variants, with
+  the RATE column present even when `include_interest=False` (per the "always computed" change).
+  Driver/verification scripts and generated PDFs were written directly under `lambda/` (this agent's
+  sandbox cannot write to the scratchpad — fenced to `business-core` only), run, then deleted along
+  with every `__pycache__` directory afterward — confirmed via a final directory scan that no
+  underscore-prefixed scratch file remains anywhere under `lambda/`.
+
+**No IaC/DB/UI change needed for item 7** — purely additive (`rows[i].rate: number | null`) on the
+existing `GET /borrowings/summary-fy` JSON route and a presentation-only PDF column; the `ui` change
+against this contract is being made separately (not in this repo).
+
 ---
 
 ## api — Borrowings interest model change: interest NEVER carried forward (2026-08-06)
