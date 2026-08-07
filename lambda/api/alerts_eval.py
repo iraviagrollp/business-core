@@ -6,6 +6,10 @@ Categories
 balances     — per-customer outstanding balance evaluation (FIFO aging)
 sales        — aggregate net customer sales over time windows
 sale_returns — aggregate customer sale returns over time windows
+customer_balances_fy / supplier_balances_fy / monthly_collection /
+borrowings_summary_fy / borrowings_summary_fy_interest
+             — unconditional scheduled-report alerts (no fields; always fire
+               on schedule; the evaluator attaches the matching PDF report)
 
 Used by:
   - lambda/api/handler.py               (POST /alerts/{id}/test, GET /alerts/fields)
@@ -223,6 +227,20 @@ FIELD_CATALOG_MONTHLY_COLLECTION = {
     "frequencies": ["daily", "weekly", "monthly"],
 }
 
+FIELD_CATALOG_BORROWINGS_SUMMARY_FY = {
+    "category":    "borrowings_summary_fy",
+    "fields":      [],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+}
+
+FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST = {
+    "category":    "borrowings_summary_fy_interest",
+    "fields":      [],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+}
+
 # Master catalog lookup by category
 FIELD_CATALOGS: dict[str, dict] = {
     "balances":             FIELD_CATALOG,
@@ -231,6 +249,8 @@ FIELD_CATALOGS: dict[str, dict] = {
     "customer_balances_fy": FIELD_CATALOG_CUSTOMER_BALANCES_FY,
     "supplier_balances_fy": FIELD_CATALOG_SUPPLIER_BALANCES_FY,
     "monthly_collection":   FIELD_CATALOG_MONTHLY_COLLECTION,
+    "borrowings_summary_fy":          FIELD_CATALOG_BORROWINGS_SUMMARY_FY,
+    "borrowings_summary_fy_interest": FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST,
 }
 
 _VALID_CATEGORIES: set[str] = set(FIELD_CATALOGS.keys())
@@ -755,12 +775,15 @@ def validate_alert(body: dict) -> None:
     Raises ValidationError with a descriptive message on the first problem found.
 
     Accepts category in {'balances', 'sales', 'sale_returns', 'customer_balances_fy',
-                          'supplier_balances_fy'}.
+                          'supplier_balances_fy', 'monthly_collection',
+                          'borrowings_summary_fy', 'borrowings_summary_fy_interest'}
+    (see FIELD_CATALOGS — any category registered there is accepted automatically).
     Validates conditions' field keys against the per-category field catalog.
     branch is optional for all categories; for sales/sale_returns it defaults to
     'ALL' (all branches) when absent or null.
 
-    customer_balances_fy / supplier_balances_fy:
+    customer_balances_fy / supplier_balances_fy / monthly_collection /
+    borrowings_summary_fy / borrowings_summary_fy_interest:
       Zero conditions are accepted (unconditional; always fires on schedule).
       Not branch-scoped — branch is accepted and stored but not used in evaluation.
       Fields list is empty so no condition field validation is ever applied.

@@ -57,6 +57,8 @@ import monthly_sales
 import monthly_sales_pdf
 import monthly_collection
 import monthly_collection_pdf
+import borrowings as _brw
+import borrowings_pdf as _brw_pdf
 import pdf_fonts
 
 logger = logging.getLogger()
@@ -646,6 +648,63 @@ def lambda_handler(event, context):
                     "Alert id=%s (monthly_collection) sent to %d recipients — "
                     "PDF %s (%d bytes)",
                     alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                )
+
+            elif category in ("borrowings_summary_fy", "borrowings_summary_fy_interest"):
+                # ── Borrowings Summary (FY) report — always fires ─────────────
+                # Unconditional: the alert fires on every scheduled run. Builds
+                # the all-accounts, all-FY Borrowings Summary matrix (plain or
+                # with-interest variant, keyed on the alert's category) and
+                # attaches it as a PDF to the SES email — clones the
+                # customer_balances_fy / supplier_balances_fy / monthly_collection
+                # unconditional report-alert pattern above verbatim.
+                with_interest = category == "borrowings_summary_fy_interest"
+                date_display  = today.strftime('%d %b %Y')
+                data_brw      = _brw.compute_borrowings_summary_fy(conn, with_interest, as_of=today)
+                pdf_bytes     = _brw_pdf.render_borrowings_summary_fy_pdf(data_brw, with_interest)
+                interest_suffix = "_with_interest" if with_interest else ""
+                pdf_filename  = (
+                    f"IAL_Borrowings_Summary_FY{interest_suffix}_{today.strftime('%d-%b-%Y')}.pdf"
+                )
+                subject = (
+                    f"IRAVI — Borrowings Summary (FY, with interest) — {date_display}"
+                    if with_interest else
+                    f"IRAVI — Borrowings Summary (FY) — {date_display}"
+                )
+                missing_rate_accounts = data_brw.get('missing_rate_accounts') or []
+                missing_rate_note = ''
+                if missing_rate_accounts:
+                    missing_rate_note = (
+                        '<p style="font-size:12px;color:#b45309">'
+                        'Rate not configured (0% used) for: '
+                        f'{", ".join(missing_rate_accounts)}.</p>'
+                    )
+                html_body = (
+                    '<!DOCTYPE html>'
+                    '<html><head><meta charset="UTF-8"></head>'
+                    '<body style="font-family:Arial,sans-serif;color:#333;'
+                    'max-width:700px;margin:0 auto">'
+                    f'<p style="font-size:15px">Attached is the Borrowings Summary (FY) '
+                    f'report for <strong>{date_display}</strong>.</p>'
+                    f'{missing_rate_note}'
+                    '<p style="margin-top:20px;font-size:11px;color:#888">'
+                    'This is an automated message from the IRAVI Dashboard. '
+                    'Please do not reply to this email.'
+                    '</p>'
+                    '</body></html>'
+                )
+                _send_ses_email_with_pdf(
+                    subject,
+                    alert["recipients"],
+                    html_body,
+                    pdf_bytes,
+                    pdf_filename,
+                )
+                status        = "sent"
+                matched_count = 1
+                logger.info(
+                    "Alert id=%s (%s) sent to %d recipients — PDF %s (%d bytes)",
+                    alert_id, category, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
                 )
 
             else:
