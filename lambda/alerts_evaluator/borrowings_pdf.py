@@ -1069,22 +1069,32 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     # (cumulative_interest is always 0).
     sno_w = 22.0
     account_w = 150.0 if n_fys <= 4 else 120.0
+    # RATE column — fixed-width, spans both header rows (like S.No/Account),
+    # deliberately NOT a per-FY sub-column (the account's rate is a single
+    # CURRENT value, not FY-scoped — see borrowings.py's compute_borrowings_
+    # summary_fy docstring). n_fys-conditional (mirrors account_w's own
+    # break at n_fys > 4): 36pt when there's more headroom (n_fys <= 4),
+    # 32pt at higher FY counts where the sub-column budget is already
+    # tightest — both comfortably fit the widest possible rate string
+    # ("100.00%", ~25.7pt at 6.5pt bold + 4pt padding) while minimizing how
+    # much is taken out of the already-tight per-FY sub-column pool.
+    rate_w = 36.0 if n_fys <= 4 else 32.0
     sub_col_count = 5 if include_interest else 3
-    fixed_w = sno_w + account_w
+    fixed_w = sno_w + account_w + rate_w
     fy_pool = content_w - fixed_w
     sub_col_w = fy_pool / (n_fys * sub_col_count) if n_fys > 0 else fy_pool / sub_col_count
 
-    col_widths: list = [sno_w, account_w]
+    col_widths: list = [sno_w, account_w, rate_w]
     for _ in range(n_fys):
         col_widths.extend([sub_col_w] * sub_col_count)
     n_cols = len(col_widths)
 
     # ── Two-row header ────────────────────────────────────────────────────────
-    row0: list = [Paragraph('S.No', hdr_c), Paragraph('Account', hdr_l)]
+    row0: list = [Paragraph('S.No', hdr_c), Paragraph('Account', hdr_l), Paragraph('Rate', hdr_c)]
     for fy in fys:
         row0.append(Paragraph(fy, hdr_c))
         row0.extend([''] * (sub_col_count - 1))
-    row1: list = ['', '']
+    row1: list = ['', '', '']
     for _ in range(n_fys):
         sub_headers = [f'Taken ({_RS})', f'Paid ({_RS})']
         if include_interest:
@@ -1097,9 +1107,10 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     span_cmds: list = [
         ('SPAN', (0, 0), (0, 1)),
         ('SPAN', (1, 0), (1, 1)),
+        ('SPAN', (2, 0), (2, 1)),
     ]
     for i in range(n_fys):
-        sc = 2 + i * sub_col_count
+        sc = 3 + i * sub_col_count
         span_cmds.append(('SPAN', (sc, 0), (sc + sub_col_count - 1, 0)))
 
     table_rows: list = [row0, row1]
@@ -1140,13 +1151,35 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
             ))
         return cells
 
+    def _rate_cell(rate, sty, muted_sty):
+        """RATE cell text — 'NN.NN%' right-aligned in plain body black
+        (`sty`) for an actual configured value, or the existing `-`
+        placeholder in `letterhead.MUTED` (`muted_sty`) when `rate` is
+        `None` (account-level rate not configured — see
+        borrowings.compute_borrowings_summary_fy's `rate` field docs).
+        Deliberately never colored red/green/amber — the rate is not a
+        money figure, so it stays out of this renderer's amount color
+        scheme (_TAKEN_FG/_PAID_FG/_INTEREST_FG/_POS_FG/_NEG_FG)."""
+        if rate is None:
+            return Paragraph('-', muted_sty)
+        return Paragraph(f'{rate:.2f}%', sty)
+
     for idx, row in enumerate(rows):
-        dr: list = [Paragraph(str(idx + 1), dat_c), Paragraph(row['account'], dat_l)]
+        dr: list = [
+            Paragraph(str(idx + 1), dat_c),
+            Paragraph(row['account'], dat_l),
+            _rate_cell(row.get('rate'), dat_r, dat_r_zero),
+        ]
         for fy in fys:
             dr.extend(_fy_cells(row['fys'].get(fy)))
         table_rows.append(dr)
 
-    total_row: list = [Paragraph('', tot_c), Paragraph('TOTAL', tot_l)]
+    total_row: list = [
+        Paragraph('', tot_c), Paragraph('TOTAL', tot_l),
+        # A rate has no meaningful total — always blank, same muted `-`
+        # treatment the other empty TOTAL-row cells use.
+        Paragraph('-', tot_r_zero),
+    ]
     for fy in fys:
         fy_totals = totals.get(fy)
         if not fy_totals:

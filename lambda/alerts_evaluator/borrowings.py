@@ -671,13 +671,24 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     Returns
     -------
     {'fys': [...], 'rows': [...], 'totals': {...}, 'missing_rate_accounts': [...]}
-        rows[i] = {'account': str, 'fys': {fy_label: {opening, taken, paid,
-            interest, closing, cumulative_interest, total_payable}},
-            'closing': float, 'total_payable': float}  (`closing` = the
-            final, most-recent FY's closing PRINCIPAL — the account's
-            current outstanding principal, interest excluded; `total_payable`
-            = that same `closing` plus the account's final cumulative
-            interest — the account's true current outstanding liability)
+        rows[i] = {'account': str, 'rate': float | None, 'fys': {fy_label:
+            {opening, taken, paid, interest, closing, cumulative_interest,
+            total_payable}}, 'closing': float, 'total_payable': float}
+            (`closing` = the final, most-recent FY's closing PRINCIPAL — the
+            account's current outstanding principal, interest excluded;
+            `total_payable` = that same `closing` plus the account's final
+            cumulative interest — the account's true current outstanding
+            liability). `rate` is the account's SINGLE CURRENT annual
+            interest rate (percent) from `borrowing_rate` — `None` when no
+            rate is configured for that account (never coerced to 0.0, so
+            the caller can distinguish "0% configured" from "not
+            configured"). Always populated (independent of
+            `include_interest`) — worth showing even in the no-interest
+            view. Because `borrowing_rate` has no effective dating (one row
+            per account, no date range), this single current rate is applied
+            uniformly across every FY shown for that account — it is NOT a
+            per-FY value and is therefore never placed inside
+            `rows[i]['fys'][fy_label]` or `totals[fy_label]`.
         totals[fy_label] = {opening, taken, paid, interest, closing,
             cumulative_interest, total_payable} — column-wise sums across
             every account, same shape as a row's per-FY entry.
@@ -699,7 +710,10 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
     if not accounts:
         return {'fys': [], 'rows': [], 'totals': {}, 'missing_rate_accounts': []}
 
-    rate_map = compute_borrowing_rate_map(conn, accounts) if include_interest else {}
+    # Rate is always looked up (worth showing even in the no-interest view) —
+    # only `missing_rate_accounts` (the "rate not configured" warning tied to
+    # the interest calculation) stays gated on include_interest, unchanged.
+    rate_map = compute_borrowing_rate_map(conn, accounts)
     missing_rate_accounts = (
         sorted(a for a in accounts if a not in rate_map) if include_interest else []
     )
@@ -809,6 +823,12 @@ def compute_borrowings_summary_fy(conn, include_interest: bool, as_of: date | No
 
         rows.append({
             'account': acct,
+            # Single CURRENT borrowing_rate row per account (no effective
+            # dating — see compute_borrowing_rate_map) applied across every
+            # FY shown. float percent, or None when no rate is configured for
+            # this account — callers must distinguish "0% configured" (0.0)
+            # from "not configured" (None), so this is never coerced to 0.0.
+            'rate': rate_map.get(acct),
             'fys': acct_fys,
             'closing': round(opening, 2),
             'total_payable': round(opening + cumulative_interest, 2),
