@@ -1717,6 +1717,125 @@ map has no configured rate) — not a per-FY value — so it is surfaced at the 
 existing `GET /borrowings/summary-fy` JSON route and a presentation-only PDF column; the `ui` change
 against this contract is being made separately (not in this repo).
 
+**8. `render_borrowings_summary_fy_pdf` — content-measured column-width pass, fixes the TOTAL
+row's Closing/Total Payable cells wrapping and dropping their Dr/Cr suffix onto a second line
+(2026-08-07).** Root cause: the previous column-width split divided the leftover width EQUALLY
+among `n_fys * sub_col_count` sub-columns with no reference to actual content
+(`sub_col_w = fy_pool / (n_fys * sub_col_count)`) — at `n_fys=3, include_interest=True` that gave
+~38.5pt per sub-column, but a widest-observed TOTAL-row value (`₹2,46,40,038.94 Dr`, BOLD — the
+TOTAL row is set bold, so it's wider than the same value on a data row) measures ~56.5pt at
+6.5pt, wrapping the `Dr`/`Cr` suffix onto its own line. This was pre-existing — item 7's RATE
+column contributes only ~1-3.6pt per sub-column, nowhere near the actual cause.
+
+Replaced with a **measured-width pass**, entirely inside `render_borrowings_summary_fy_pdf`
+(nothing else in the module changed — the colored number cells, Dr/Cr wording, RATE column's
+existence/`n_fys`-conditional width, header band, TOTAL shading, and zebra striping are all
+untouched):
+1. A new `_measure_cell(text, font, size)` helper measures every rendered cell string with
+   `pdfmetrics.stringWidth` at the EXACT font each cell actually uses — data rows in `_BASE`,
+   header + the TOTAL row in `_BOLD` (the TOTAL row is the binding constraint, so it must be
+   measured bold, never the lighter data-row font). `_RS` (the `₹` token) is
+   `'<font name="DejaVuSans">₹</font>'` Paragraph markup (confirmed by reading
+   `letterhead.register_fonts()` before writing this) — `_measure_cell` splits the text on the
+   literal `_RS` string, measures the `₹` glyph in `DejaVuSans` and everything else in the cell's
+   own font, or every currency cell is under-measured (Helvetica has no `₹` glyph at all, and
+   `DejaVuSans`'s `₹` is not the same width as a Helvetica character). Degrades to a single plain
+   `stringWidth` call when `_RS` has fallen back to the ASCII `'Rs.'` string (TTF load failure —
+   no markup token ever appears in that case).
+2. ONE measured width per **sub-column TYPE** (`taken`/`paid`/`interest`/`closing`/
+   `total_payable`) — the max across every FY and every row, data AND the TOTAL row — so a
+   logical column is never a different width in different FY groups (would look broken
+   otherwise).
+3. Fit to the page: `total_required = sno_w + account_w + rate_w + n_fys * sum(per_type_widths)`.
+   When it fits with room to spare, the surplus is distributed by **widening the sub-columns
+   proportionally** (chosen over leaving it as trailing margin — a wide blank strip on the right
+   of an otherwise-full-width table reads as unfinished, and a uniform scale keeps every FY
+   group's sub-columns the same width as each other).
+4. Degradation ladder when it doesn't fit, in order, stopping as soon as it fits: (a) cell
+   padding 2pt → 1pt; (b) font 6.5pt → 5.0pt in 0.25pt steps, re-measured at each step; (c) — only
+   if (a)+(b) together still don't fit — `account_w` shrunk to the EXACT value that makes the
+   table fit (no wasted margin), clamped to a 90pt floor, with `_truncate_account()`
+   ellipsis-truncating (plain ASCII `'...'`, matching this codebase's existing non-ASCII-glyph
+   avoidance convention) any account name that no longer fits. If even the 90pt floor doesn't
+   fit, the table is allowed to overflow the page — never silently clipped — and a
+   `logging.getLogger('borrowings_pdf').warning(...)` records the exact overflow amount and the
+   `n_fys`/`include_interest` combination.
+5. Whatever `font_size` the fit pass lands on is applied UNIFORMLY to the header, data, and
+   TOTAL rows (the style-definition block — `hdr_c`/`hdr_l`/`hdr_r`/`dat_*`/`tot_*` and every
+   colored variant — was moved from its old fixed-`6.5` position to right after the fit pass,
+   parameterized on `font_size`).
+6. Belt-and-braces: a local `_bal_nbsp(value)` helper (defined INSIDE
+   `render_borrowings_summary_fy_pdf` only) takes `_bal()`'s plain-text output and swaps the
+   Dr/Cr suffix's separating space for `&nbsp;`, so the amount and its suffix can never split
+   across lines even if a future change re-tightens the columns. Applied only at this function's
+   call sites (`_fy_cells`/the TOTAL-row loop) — `_bal()` itself was left untouched because
+   `render_borrowings_pdf` and `render_borrowings_interest_pdf` in this same module also call it
+   and expect its existing plain-text contract (checked both callers before deciding this).
+
+**Verification — real renders, no monkeypatching**, matrix of `n_fys` = 2, 3, 4, 6 ×
+`include_interest` = True, False × TOTAL-row value = the reported `₹2,46,40,038.94 Dr` and a
+wider `₹12,46,40,038.94 Dr` (16 cases total):
+- **Geometric proof (the strongest one):** for every case, the exact same `font_size`/`padding`/
+  `sub_widths` the renderer itself computed were used to build the REAL `Paragraph` object for
+  every TOTAL-row and data-row Closing/Total Payable cell (same style class, same
+  `_bal_nbsp`-processed text) and called reportlab's own `Paragraph.wrap(avail_width, 1000)` —
+  the actual layout engine, not a re-implementation — asserting the returned height equals a
+  single line's `leading`, never more. **360/360 assertions passed** across all 16 cases (8-48
+  per case depending on `n_fys`/`include_interest`).
+- Independently corroborated via `pdfmetrics.stringWidth` arithmetic re-deriving the same
+  font/padding/widths (the fit-pass algorithm re-run read-only against the fixture) and asserting
+  every rendered string fits its own column's available width — same 16-case matrix, same result.
+- `pypdf` text extraction confirmed every PDF renders (`%PDF`-prefixed bytes, `TOTAL`/account
+  names/letterhead company name all present) and 1 page in every case.
+- Separately exercised the account-name truncation path with a deliberately very long name at
+  `n_fys=6, include_interest=True` — confirmed (via `pypdf`) the full name is ABSENT from the
+  extracted text and a `'...'`-truncated form IS present.
+- **`n_fys` at which the table genuinely overflows the page even at the smallest degradation step
+  (font 5.0pt, padding 1pt, `account_w` floor 90pt)**, observed on this test matrix's fixture data
+  (3 accounts): `include_interest=False` first overflows at **`n_fys=6`** (69-128pt over,
+  depending on the TOTAL value); `include_interest=True` first overflows starting at **`n_fys=4`**
+  (130-180pt over) and gets much worse at `n_fys=6` (510-585pt over) — 5 sub-columns per FY at the
+  font/padding floor simply needs more room than 6 FYs' worth of a landscape A4 page has. This is
+  fixture-dependent (the exact threshold shifts with the real amounts/rates present, since widths
+  are content-measured), not a fixed number — every one of these overflow cases still passed the
+  no-per-cell-wrap assertion (individual cells never wrap; only the whole table can exceed the
+  page in these edge cases, which is the accepted, logged fallback per the task brief).
+
+**Fit table (font size / padding / column widths), this test matrix's 3-account fixture:**
+
+| `n_fys` | `include_interest` | font | pad | `account_w` | `sub_widths` (pt) |
+|---|---|---|---|---|---|
+| 2 | False | 6.5 | 2.0 | 150.0 | taken 51.5, paid 46.1, closing 60.5 |
+| 2 | True  | 6.5 | 2.0 | 150.0 | taken 51.5, paid 46.1, interest 37.75, closing 60.5, total_payable 60.5 |
+| 3 | False | 6.5 | 2.0 | 150.0 | taken 51.5, paid 46.1, closing 60.5 |
+| 3 | True  | 5.0 | 1.0 | 150.0 (114.1 at wider value) | taken 38.5, paid 34.4, interest 28.0, closing 45.5, total_payable 45.5 |
+| 4 | False | 6.0 (5.5 at wider value) | 1.0 | 150.0 | taken ~45.5-45.9, paid ~40.9-42.2, closing ~52.9-54.2 |
+| 4 | True  | 5.0 | 1.0 | 90.0 (floor) | taken 38.5, paid 34.4, interest 28.0, closing 45.5, total_payable 45.5 |
+| 6 | False | 5.0 | 1.0 | 90.0 (floor) | taken 38.5, paid 34.4, closing 45.5 |
+| 6 | True  | 5.0 | 1.0 | 90.0 (floor) | taken 38.5, paid 34.4, interest 28.0, closing 45.5, total_payable 45.5 |
+
+(`sno_w=22.0` and `rate_w` — 36.0 at `n_fys<=4`, 32.0 at `n_fys=6` — are unchanged/fixed, per the
+"do not touch RATE" instruction; widths shown are pre-surplus-distribution where the fit pass
+found spare room, i.e. `n_fys=2`/`3` no-interest and `n_fys=2` with-interest actually render
+slightly wider than the bare numbers above once the proportional-widening step runs.)
+
+**Propagation:** `api/borrowings_pdf.py` → `alerts_evaluator/borrowings_pdf.py` re-copied and
+SHA-256-verified byte-identical after this change (feeds the `borrowings_summary_fy`/
+`borrowings_summary_fy_interest` scheduled alert emails — same category as item 7's
+propagation). A real render was ALSO run through the `alerts_evaluator` copy directly (not just a
+hash check) to confirm it functions there, not only in `api/`. `borrowings.py` and
+`letterhead.py` were re-checked and remain byte-identical between the two packages (untouched by
+this change).
+
+**Cleanup:** all driver/verification scripts (6 files) and their `__pycache__` were written
+directly under `lambda/api/` and `lambda/alerts_evaluator/` (this agent's sandbox cannot write to
+the scratchpad — fenced to `business-core` only), run, then deleted — confirmed via a final
+directory scan (`**/_verify*`, `**/__pycache__/**`, `**/*.pdf` under `lambda/`) that nothing
+scratch-related remains in the repo.
+
+**No IaC/DB/UI change needed** — presentation-only fix on the existing `GET
+/borrowings/summary-fy/pdf` route; no field/response-shape change on the JSON route.
+
 ---
 
 ## api — Borrowings interest model change: interest NEVER carried forward (2026-08-06)
