@@ -80,6 +80,22 @@ render_borrowings_summary_fy_pdf(data, include_interest) -> bytes
     borrowings.compute_borrowings_summary_fy() — the SAME function
     GET /borrowings/summary-fy itself calls, so the screen and this PDF can
     never disagree. See the function's own comment block for full detail.
+    Column-width layout FIXED 2026-08-07: the old equal-division split
+    (leftover width / (n_fys * sub_col_count), no reference to actual
+    content) let the TOTAL row's widest cells (Closing / Total Payable —
+    rendered BOLD, so wider than the same value on a data row) wrap and
+    drop their Dr/Cr suffix onto a second line at n_fys=3 (and worse at
+    higher n_fys). Replaced with a content-MEASURED width pass: every
+    rendered cell string (header + data rows + the TOTAL row, each in its
+    own actual font) is measured with pdfmetrics.stringWidth, one width
+    computed per SUB-COLUMN TYPE (Taken/Paid/Interest/Closing/Total
+    Payable) as the max across every FY and every row so all FY groups
+    stay visually uniform, with a degradation ladder (padding 2->1pt, font
+    6.5->5.0pt in 0.25 steps, then account_w shrunk toward a 90pt floor
+    with ellipsis truncation) if the measured requirement exceeds the
+    page. See the function's own inline comments for the full algorithm
+    and CLAUDE.md's "render_borrowings_summary_fy_pdf — measured-width
+    column-fit pass" entry for the fit table / verification writeup.
 
 ₹ / em-dash handling
 ---------------------
@@ -92,6 +108,7 @@ render_borrowings_summary_fy_pdf(data, include_interest) -> bytes
 
 from __future__ import annotations
 
+import logging
 from datetime import date as _date, datetime as _datetime
 from io import BytesIO
 
@@ -100,6 +117,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -1002,35 +1020,6 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     note_sty   = _ps('BSFYNote', _BASE, 7.5, TA_LEFT, color=letterhead.MUTED)
     empty_sty  = _ps('BSFYEmpty', _BASE, 9.5, TA_CENTER, color=letterhead.MUTED)
 
-    hdr_c = _ps('BSFYHdrC', _BOLD, 6.5, TA_CENTER, color=_W)
-    hdr_l = _ps('BSFYHdrL', _BOLD, 6.5, TA_LEFT,   color=_W)
-    hdr_r = _ps('BSFYHdrR', _BOLD, 6.5, TA_RIGHT,  color=_W)
-
-    dat_l = _ps('BSFYDatL', _BASE, 6.5, TA_LEFT)
-    dat_c = _ps('BSFYDatC', _BASE, 6.5, TA_CENTER)
-    dat_r = _ps('BSFYDatR', _BASE, 6.5, TA_RIGHT)
-
-    tot_l = _ps('BSFYTotL', _BOLD, 6.5, TA_LEFT)
-    tot_c = _ps('BSFYTotC', _BOLD, 6.5, TA_CENTER)
-    tot_r = _ps('BSFYTotR', _BOLD, 6.5, TA_RIGHT)
-
-    # Colored right-aligned variants (data weight + total/bold weight) mirroring
-    # the on-screen UI's TAKEN/PAID/INTEREST/CLOSING/TOTAL PAYABLE colors — see
-    # the _TAKEN_FG/_PAID_FG/_INTEREST_FG/_POS_FG/_NEG_FG constants above.
-    dat_r_taken = _ps('BSFYDatRTaken', _BASE, 6.5, TA_RIGHT, color=_TAKEN_FG)
-    dat_r_paid  = _ps('BSFYDatRPaid',  _BASE, 6.5, TA_RIGHT, color=_PAID_FG)
-    dat_r_int   = _ps('BSFYDatRInt',   _BASE, 6.5, TA_RIGHT, color=_INTEREST_FG)
-    dat_r_pos   = _ps('BSFYDatRPos',   _BASE, 6.5, TA_RIGHT, color=_POS_FG)
-    dat_r_neg   = _ps('BSFYDatRNeg',   _BASE, 6.5, TA_RIGHT, color=_NEG_FG)
-    dat_r_zero  = _ps('BSFYDatRZero',  _BASE, 6.5, TA_RIGHT, color=letterhead.MUTED)
-
-    tot_r_taken = _ps('BSFYTotRTaken', _BOLD, 6.5, TA_RIGHT, color=_TAKEN_FG)
-    tot_r_paid  = _ps('BSFYTotRPaid',  _BOLD, 6.5, TA_RIGHT, color=_PAID_FG)
-    tot_r_int   = _ps('BSFYTotRInt',   _BOLD, 6.5, TA_RIGHT, color=_INTEREST_FG)
-    tot_r_pos   = _ps('BSFYTotRPos',   _BOLD, 6.5, TA_RIGHT, color=_POS_FG)
-    tot_r_neg   = _ps('BSFYTotRNeg',   _BOLD, 6.5, TA_RIGHT, color=_NEG_FG)
-    tot_r_zero  = _ps('BSFYTotRZero',  _BOLD, 6.5, TA_RIGHT, color=letterhead.MUTED)
-
     today_str = _date.today().strftime('%d-%m-%Y')
     title_row = Table(
         [[Paragraph('BORROWINGS SUMMARY (FY)', title_sty), Paragraph(f'Date: {today_str}', right_sty)]],
@@ -1059,35 +1048,227 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
         doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
         return buffer.getvalue()
 
-    # ── Column widths ─────────────────────────────────────────────────────────
-    # Sub-columns per FY: Taken, Paid, [Interest, Total Payable — only when
-    # include_interest], Closing. 'Total Payable' added 2026-08-06 (interest
-    # never carried forward model change) — 'Closing' is now PRINCIPAL ONLY,
-    # so the account's true outstanding liability (principal + every FY's
-    # interest accrued so far) needs its own column; omitted when
-    # include_interest is False since it would be identical to Closing there
-    # (cumulative_interest is always 0).
+    # ── Column widths — measured pass (fixed 2026-08-07; see the function's
+    # docstring note above and CLAUDE.md for the full writeup). Every
+    # rendered cell string is measured with pdfmetrics.stringWidth at the
+    # EXACT font each cell actually uses — data rows in _BASE, header + the
+    # TOTAL row in _BOLD (the TOTAL row is the binding constraint: it's
+    # wider than the same value on a data row, so it must be measured in
+    # bold, not the lighter data-row font). The ₹ in _fmt_inr()/_bal()'s
+    # output is emitted via _RS, an inline
+    # '<font name="DejaVuSans">₹</font>' Paragraph-markup token (see
+    # letterhead.register_fonts()) — _measure_cell() below measures that
+    # glyph in DejaVuSans and everything else in the cell's own font; a bare
+    # stringWidth() call would under-measure every currency cell (Helvetica
+    # has no ₹ glyph, and DejaVuSans's ₹ is not the same width as a
+    # Helvetica character). ────────────────────────────────────────────────
     sno_w = 22.0
-    account_w = 150.0 if n_fys <= 4 else 120.0
-    # RATE column — fixed-width, spans both header rows (like S.No/Account),
-    # deliberately NOT a per-FY sub-column (the account's rate is a single
-    # CURRENT value, not FY-scoped — see borrowings.py's compute_borrowings_
-    # summary_fy docstring). n_fys-conditional (mirrors account_w's own
-    # break at n_fys > 4): 36pt when there's more headroom (n_fys <= 4),
-    # 32pt at higher FY counts where the sub-column budget is already
-    # tightest — both comfortably fit the widest possible rate string
-    # ("100.00%", ~25.7pt at 6.5pt bold + 4pt padding) while minimizing how
-    # much is taken out of the already-tight per-FY sub-column pool.
+    account_w_initial = 150.0 if n_fys <= 4 else 120.0
+    # RATE column — UNCHANGED (do not touch): fixed-width, n_fys-conditional,
+    # deliberately NOT a measured/per-FY sub-column — see the pre-existing
+    # comment this replaced for the full rationale (the account's rate is a
+    # single CURRENT value, not FY-scoped).
     rate_w = 36.0 if n_fys <= 4 else 32.0
-    sub_col_count = 5 if include_interest else 3
-    fixed_w = sno_w + account_w + rate_w
-    fy_pool = content_w - fixed_w
-    sub_col_w = fy_pool / (n_fys * sub_col_count) if n_fys > 0 else fy_pool / sub_col_count
+
+    sub_col_keys = ['taken', 'paid']
+    if include_interest:
+        sub_col_keys.append('interest')
+    sub_col_keys.append('closing')
+    if include_interest:
+        sub_col_keys.append('total_payable')
+    sub_col_count = len(sub_col_keys)
+
+    header_labels = {
+        'taken': f'Taken ({_RS})', 'paid': f'Paid ({_RS})', 'interest': f'Interest ({_RS})',
+        'closing': f'Closing ({_RS})', 'total_payable': f'Total Payable ({_RS})',
+    }
+
+    def _measure_cell(text: str, font: str, size: float) -> float:
+        """pdfmetrics.stringWidth, honoring the _RS inline-font ₹ markup
+        token — the ₹ glyph is measured in DejaVuSans (the only font it's
+        registered in), everything else in `font`. When _RS has degraded to
+        the ASCII 'Rs.' fallback (bundled TTF failed to load), no markup
+        token is ever present in `text` and this is a single plain call."""
+        if _RS.startswith('<font') and _RS in text:
+            before, after = text.split(_RS, 1)
+            return (
+                pdfmetrics.stringWidth(before, font, size)
+                + pdfmetrics.stringWidth('₹', 'DejaVuSans', size)
+                + pdfmetrics.stringWidth(after, font, size)
+            )
+        return pdfmetrics.stringWidth(text, font, size)
+
+    # One measured width per SUB-COLUMN TYPE (not per FY) — the max over
+    # every FY and every row INCLUDING the TOTAL row, per the task's "keep
+    # the FY groups visually uniform" requirement: a logical column must
+    # never end up a different width in different FY groups.
+    reg_texts: dict = {k: [] for k in sub_col_keys}                    # data rows — _BASE
+    bold_texts: dict = {k: [header_labels[k]] for k in sub_col_keys}   # header + TOTAL — _BOLD
+    for r in rows:
+        for fy in fys:
+            fy_data = r['fys'].get(fy)
+            if not fy_data:
+                for k in sub_col_keys:
+                    reg_texts[k].append('-')
+                continue
+            reg_texts['taken'].append(_amt(fy_data['taken']))
+            reg_texts['paid'].append(_amt(fy_data['paid']))
+            if include_interest:
+                reg_texts['interest'].append(_amt(fy_data['interest']))
+            reg_texts['closing'].append(_bal(fy_data['closing']))
+            if include_interest:
+                reg_texts['total_payable'].append(_bal(fy_data['total_payable']))
+    for fy in fys:
+        fy_totals = totals.get(fy)
+        if not fy_totals:
+            for k in sub_col_keys:
+                bold_texts[k].append('-')
+            continue
+        bold_texts['taken'].append(_amt(fy_totals['taken']))
+        bold_texts['paid'].append(_amt(fy_totals['paid']))
+        if include_interest:
+            bold_texts['interest'].append(_amt(fy_totals['interest']))
+        bold_texts['closing'].append(_bal(fy_totals['closing']))
+        if include_interest:
+            bold_texts['total_payable'].append(_bal(fy_totals['total_payable']))
+
+    def _sub_col_widths(font_size: float, pad: float) -> dict:
+        widths = {}
+        for k in sub_col_keys:
+            w = 0.0
+            for t in reg_texts[k]:
+                w = max(w, _measure_cell(t, _BASE, font_size))
+            for t in bold_texts[k]:
+                w = max(w, _measure_cell(t, _BOLD, font_size))
+            widths[k] = w + 2 * pad
+        return widths
+
+    # Fit to the page — degrade in order, stopping as soon as it fits:
+    # (a) cell padding 2pt -> 1pt; (b) font 6.5pt -> 5.0pt in 0.25pt steps
+    # (re-measured at each step). account_w shrink (c) is a separate, final
+    # step below, only reached if (a)+(b) together still don't fit.
+    _PAD_FONT_STEPS = [
+        (2.0, 6.5),
+        (1.0, 6.5), (1.0, 6.25), (1.0, 6.0), (1.0, 5.75), (1.0, 5.5), (1.0, 5.25), (1.0, 5.0),
+    ]
+    padding = font_size = None
+    sub_widths = None
+    for pad_try, font_try in _PAD_FONT_STEPS:
+        widths_try = _sub_col_widths(font_try, pad_try)
+        required = sno_w + account_w_initial + rate_w + n_fys * sum(widths_try.values())
+        if required <= content_w:
+            padding, font_size, sub_widths = pad_try, font_try, widths_try
+            break
+
+    account_w = account_w_initial
+    truncate_account_names = False
+    if sub_widths is None:
+        # (c) — the ladder's floor (padding=1, font=5.0) still doesn't fit at
+        # the original account_w: shrink account_w to the EXACT value that
+        # makes the table fit (no wasted margin), clamped to a 90pt floor. If
+        # even the floor doesn't fit, let it overflow — never clip silently —
+        # and log a warning naming the n_fys this happened at.
+        padding, font_size = 1.0, 5.0
+        sub_widths = _sub_col_widths(font_size, padding)
+        needed_without_account = sno_w + rate_w + n_fys * sum(sub_widths.values())
+        account_w = min(account_w_initial, content_w - needed_without_account)
+        account_w = max(90.0, account_w)
+        truncate_account_names = True
+        total_required = needed_without_account + account_w
+        if total_required > content_w:
+            logging.getLogger('borrowings_pdf').warning(
+                'render_borrowings_summary_fy_pdf: table does not fit landscape A4 even at '
+                'the smallest degradation step (font=%.2fpt pad=%.1fpt account_w=90pt) — '
+                'n_fys=%d, include_interest=%s, required=%.1fpt, content_w=%.1fpt, '
+                'overflow=%.1fpt',
+                font_size, padding, n_fys, include_interest, total_required, content_w,
+                total_required - content_w,
+            )
+    else:
+        # Fits comfortably at the original account_w — distribute the
+        # surplus by widening the sub-columns proportionally. Chosen over
+        # leaving it as trailing margin: a wide blank strip on the right of
+        # an otherwise-full-width table reads as unfinished, and a uniform
+        # proportional widening keeps every FY group's sub-columns the same
+        # width as each other (never favours one FY over another).
+        total_required = sno_w + account_w + rate_w + n_fys * sum(sub_widths.values())
+        surplus = content_w - total_required
+        sub_total = sum(sub_widths.values())
+        if surplus > 0 and sub_total > 0:
+            scale = 1 + surplus / (n_fys * sub_total)
+            sub_widths = {k: w * scale for k, w in sub_widths.items()}
 
     col_widths: list = [sno_w, account_w, rate_w]
     for _ in range(n_fys):
-        col_widths.extend([sub_col_w] * sub_col_count)
+        col_widths.extend(sub_widths[k] for k in sub_col_keys)
     n_cols = len(col_widths)
+
+    # ── Styles — font_size is whatever the fit pass above landed on, applied
+    # uniformly to the header, data, and TOTAL rows (never leave the header
+    # at a larger size while data/TOTAL shrink). ───────────────────────────
+    hdr_c = _ps('BSFYHdrC', _BOLD, font_size, TA_CENTER, color=_W)
+    hdr_l = _ps('BSFYHdrL', _BOLD, font_size, TA_LEFT,   color=_W)
+    hdr_r = _ps('BSFYHdrR', _BOLD, font_size, TA_RIGHT,  color=_W)
+
+    dat_l = _ps('BSFYDatL', _BASE, font_size, TA_LEFT)
+    dat_c = _ps('BSFYDatC', _BASE, font_size, TA_CENTER)
+    dat_r = _ps('BSFYDatR', _BASE, font_size, TA_RIGHT)
+
+    tot_l = _ps('BSFYTotL', _BOLD, font_size, TA_LEFT)
+    tot_c = _ps('BSFYTotC', _BOLD, font_size, TA_CENTER)
+    tot_r = _ps('BSFYTotR', _BOLD, font_size, TA_RIGHT)
+
+    # Colored right-aligned variants (data weight + total/bold weight) mirroring
+    # the on-screen UI's TAKEN/PAID/INTEREST/CLOSING/TOTAL PAYABLE colors — see
+    # the _TAKEN_FG/_PAID_FG/_INTEREST_FG/_POS_FG/_NEG_FG constants above.
+    dat_r_taken = _ps('BSFYDatRTaken', _BASE, font_size, TA_RIGHT, color=_TAKEN_FG)
+    dat_r_paid  = _ps('BSFYDatRPaid',  _BASE, font_size, TA_RIGHT, color=_PAID_FG)
+    dat_r_int   = _ps('BSFYDatRInt',   _BASE, font_size, TA_RIGHT, color=_INTEREST_FG)
+    dat_r_pos   = _ps('BSFYDatRPos',   _BASE, font_size, TA_RIGHT, color=_POS_FG)
+    dat_r_neg   = _ps('BSFYDatRNeg',   _BASE, font_size, TA_RIGHT, color=_NEG_FG)
+    dat_r_zero  = _ps('BSFYDatRZero',  _BASE, font_size, TA_RIGHT, color=letterhead.MUTED)
+
+    tot_r_taken = _ps('BSFYTotRTaken', _BOLD, font_size, TA_RIGHT, color=_TAKEN_FG)
+    tot_r_paid  = _ps('BSFYTotRPaid',  _BOLD, font_size, TA_RIGHT, color=_PAID_FG)
+    tot_r_int   = _ps('BSFYTotRInt',   _BOLD, font_size, TA_RIGHT, color=_INTEREST_FG)
+    tot_r_pos   = _ps('BSFYTotRPos',   _BOLD, font_size, TA_RIGHT, color=_POS_FG)
+    tot_r_neg   = _ps('BSFYTotRNeg',   _BOLD, font_size, TA_RIGHT, color=_NEG_FG)
+    tot_r_zero  = _ps('BSFYTotRZero',  _BOLD, font_size, TA_RIGHT, color=letterhead.MUTED)
+
+    def _truncate_account(name: str, font: str, size: float, max_w: float) -> str:
+        """Ellipsis-truncate an account name to fit `max_w` — only invoked
+        when the fit pass had to shrink account_w below its usual value (see
+        step (c) above); otherwise the Paragraph wraps the full name onto
+        multiple lines exactly as before this task. Plain ASCII '...' (not
+        the U+2026 glyph) — matches this codebase's existing convention of
+        avoiding non-ASCII placeholder glyphs in Helvetica-styled text."""
+        if _measure_cell(name, font, size) <= max_w:
+            return name
+        ell = '...'
+        lo, hi = 0, len(name)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            candidate = name[:mid].rstrip() + ell
+            if _measure_cell(candidate, font, size) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (name[:lo].rstrip() + ell) if lo > 0 else ell
+
+    def _bal_nbsp(value: float) -> str:
+        """_bal() text with the Dr/Cr suffix's separating space swapped for
+        a non-breaking space (&nbsp;) so the amount and its suffix can never
+        split across lines — belt-and-braces on top of the measured-width
+        fit pass above. Applied at THIS call site only, not inside _bal()
+        itself: _bal() is also called by render_borrowings_pdf and
+        render_borrowings_interest_pdf in this module, and its plain-text
+        contract must stay intact for them (see the module docstring)."""
+        text = _bal(value)
+        if text.endswith(' Dr'):
+            return text[:-3] + '&nbsp;Dr'
+        if text.endswith(' Cr'):
+            return text[:-3] + '&nbsp;Cr'
+        return text
 
     # ── Two-row header ────────────────────────────────────────────────────────
     row0: list = [Paragraph('S.No', hdr_c), Paragraph('Account', hdr_l), Paragraph('Rate', hdr_c)]
@@ -1096,13 +1277,7 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
         row0.extend([''] * (sub_col_count - 1))
     row1: list = ['', '', '']
     for _ in range(n_fys):
-        sub_headers = [f'Taken ({_RS})', f'Paid ({_RS})']
-        if include_interest:
-            sub_headers.append(f'Interest ({_RS})')
-        sub_headers.append(f'Closing ({_RS})')
-        if include_interest:
-            sub_headers.append(f'Total Payable ({_RS})')
-        row1.extend(Paragraph(h, hdr_r) for h in sub_headers)
+        row1.extend(Paragraph(header_labels[k], hdr_r) for k in sub_col_keys)
 
     span_cmds: list = [
         ('SPAN', (0, 0), (0, 1)),
@@ -1142,11 +1317,11 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
                 _amt(fy_data['interest']), dat_r_int if fy_data['interest'] > 0 else dat_r_zero,
             ))
         cells.append(Paragraph(
-            _bal(fy_data['closing']), _bal_style(fy_data['closing'], dat_r_pos, dat_r_neg, dat_r_zero),
+            _bal_nbsp(fy_data['closing']), _bal_style(fy_data['closing'], dat_r_pos, dat_r_neg, dat_r_zero),
         ))
         if include_interest:
             cells.append(Paragraph(
-                _bal(fy_data['total_payable']),
+                _bal_nbsp(fy_data['total_payable']),
                 _bal_style(fy_data['total_payable'], dat_r_pos, dat_r_neg, dat_r_zero),
             ))
         return cells
@@ -1164,10 +1339,14 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
             return Paragraph('-', muted_sty)
         return Paragraph(f'{rate:.2f}%', sty)
 
+    account_max_w = account_w - 2 * padding
     for idx, row in enumerate(rows):
+        account_text = row['account']
+        if truncate_account_names:
+            account_text = _truncate_account(account_text, _BASE, font_size, account_max_w)
         dr: list = [
             Paragraph(str(idx + 1), dat_c),
-            Paragraph(row['account'], dat_l),
+            Paragraph(account_text, dat_l),
             _rate_cell(row.get('rate'), dat_r, dat_r_zero),
         ]
         for fy in fys:
@@ -1199,12 +1378,12 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
                     _amt(fy_totals['interest']), tot_r_int if fy_totals['interest'] > 0 else tot_r_zero,
                 ))
             cells.append(Paragraph(
-                _bal(fy_totals['closing']),
+                _bal_nbsp(fy_totals['closing']),
                 _bal_style(fy_totals['closing'], tot_r_pos, tot_r_neg, tot_r_zero),
             ))
             if include_interest:
                 cells.append(Paragraph(
-                    _bal(fy_totals['total_payable']),
+                    _bal_nbsp(fy_totals['total_payable']),
                     _bal_style(fy_totals['total_payable'], tot_r_pos, tot_r_neg, tot_r_zero),
                 ))
         total_row.extend(cells)
@@ -1214,12 +1393,12 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     tbl_cmds: list = span_cmds + [
         ('BACKGROUND', (0, 0), (-1, 1), letterhead.GREEN),
         ('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG),
-        ('FONTSIZE',      (0, 0), (-1, -1), 6.5),
+        ('FONTSIZE',      (0, 0), (-1, -1), font_size),
         ('GRID',          (0, 0), (-1, -1), 0.3, _CELL_BORDER),
         ('TOPPADDING',    (0, 0), (-1, -1), 2),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-        ('LEFTPADDING',   (0, 0), (-1, -1), 2),
-        ('RIGHTPADDING',  (0, 0), (-1, -1), 2),
+        ('LEFTPADDING',   (0, 0), (-1, -1), padding),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), padding),
         ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
     ]
     for i in range(2, total_row_idx):
