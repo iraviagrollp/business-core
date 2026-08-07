@@ -120,6 +120,18 @@ _CELL_BORDER = colors.HexColor('#cccccc')
 # new brand color invented, per the task brief).
 _SUMMARY_BG = colors.HexColor('#e4f0e8')
 
+# Number colors mirrored from the UI's Borrowings Summary (FY) table
+# (ui/src/pages/Finances/Borrowings.tsx) so the PDF reads the same as the
+# screen. Light-mode Tailwind shades - the PDF is always on white (the UI's
+# dark-mode -400 shades were deliberately NOT used). Used only by
+# render_borrowings_summary_fy_pdf — render_borrowings_pdf and
+# render_borrowings_interest_pdf already have their own balance coloring.
+_TAKEN_FG    = colors.HexColor('#dc2626')   # tailwind red-600
+_PAID_FG     = colors.HexColor('#15803d')   # tailwind green-700
+_INTEREST_FG = colors.HexColor('#b45309')   # tailwind amber-700
+_POS_FG      = colors.HexColor('#dc2626')   # tailwind red-600 (Closing/Total Payable > 0)
+_NEG_FG      = colors.HexColor('#15803d')   # tailwind green-700 (Closing/Total Payable < 0)
+
 _PAGE_W, _PAGE_H = A4                      # 595.27 x 841.89 pt (portrait)
 _MARGIN = 1.0 * cm
 _CONTENT_W = _PAGE_W - 2 * _MARGIN         # ~538 pt usable width
@@ -1002,6 +1014,23 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     tot_c = _ps('BSFYTotC', _BOLD, 6.5, TA_CENTER)
     tot_r = _ps('BSFYTotR', _BOLD, 6.5, TA_RIGHT)
 
+    # Colored right-aligned variants (data weight + total/bold weight) mirroring
+    # the on-screen UI's TAKEN/PAID/INTEREST/CLOSING/TOTAL PAYABLE colors — see
+    # the _TAKEN_FG/_PAID_FG/_INTEREST_FG/_POS_FG/_NEG_FG constants above.
+    dat_r_taken = _ps('BSFYDatRTaken', _BASE, 6.5, TA_RIGHT, color=_TAKEN_FG)
+    dat_r_paid  = _ps('BSFYDatRPaid',  _BASE, 6.5, TA_RIGHT, color=_PAID_FG)
+    dat_r_int   = _ps('BSFYDatRInt',   _BASE, 6.5, TA_RIGHT, color=_INTEREST_FG)
+    dat_r_pos   = _ps('BSFYDatRPos',   _BASE, 6.5, TA_RIGHT, color=_POS_FG)
+    dat_r_neg   = _ps('BSFYDatRNeg',   _BASE, 6.5, TA_RIGHT, color=_NEG_FG)
+    dat_r_zero  = _ps('BSFYDatRZero',  _BASE, 6.5, TA_RIGHT, color=letterhead.MUTED)
+
+    tot_r_taken = _ps('BSFYTotRTaken', _BOLD, 6.5, TA_RIGHT, color=_TAKEN_FG)
+    tot_r_paid  = _ps('BSFYTotRPaid',  _BOLD, 6.5, TA_RIGHT, color=_PAID_FG)
+    tot_r_int   = _ps('BSFYTotRInt',   _BOLD, 6.5, TA_RIGHT, color=_INTEREST_FG)
+    tot_r_pos   = _ps('BSFYTotRPos',   _BOLD, 6.5, TA_RIGHT, color=_POS_FG)
+    tot_r_neg   = _ps('BSFYTotRNeg',   _BOLD, 6.5, TA_RIGHT, color=_NEG_FG)
+    tot_r_zero  = _ps('BSFYTotRZero',  _BOLD, 6.5, TA_RIGHT, color=letterhead.MUTED)
+
     today_str = _date.today().strftime('%d-%m-%Y')
     title_row = Table(
         [[Paragraph('BORROWINGS SUMMARY (FY)', title_sty), Paragraph(f'Date: {today_str}', right_sty)]],
@@ -1075,21 +1104,40 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
 
     table_rows: list = [row0, row1]
 
+    def _bal_style(value, pos_sty, neg_sty, zero_sty):
+        """Pick the ParagraphStyle for a Closing/Total Payable cell by the RAW
+        numeric value (never by inspecting _bal()'s returned text)."""
+        if value > 0:
+            return pos_sty
+        if value < 0:
+            return neg_sty
+        return zero_sty
+
     def _fy_cells(fy_data):
         if not fy_data:
-            cells = [Paragraph('-', dat_r), Paragraph('-', dat_r)]
+            cells = [Paragraph('-', dat_r_zero), Paragraph('-', dat_r_zero)]
             if include_interest:
-                cells.append(Paragraph('-', dat_r))
-            cells.append(Paragraph('-', dat_r))
+                cells.append(Paragraph('-', dat_r_zero))
+            cells.append(Paragraph('-', dat_r_zero))
             if include_interest:
-                cells.append(Paragraph('-', dat_r))
+                cells.append(Paragraph('-', dat_r_zero))
             return cells
-        cells = [Paragraph(_amt(fy_data['taken']), dat_r), Paragraph(_amt(fy_data['paid']), dat_r)]
+        cells = [
+            Paragraph(_amt(fy_data['taken']), dat_r_taken if fy_data['taken'] > 0 else dat_r_zero),
+            Paragraph(_amt(fy_data['paid']), dat_r_paid if fy_data['paid'] > 0 else dat_r_zero),
+        ]
         if include_interest:
-            cells.append(Paragraph(_amt(fy_data['interest']), dat_r))
-        cells.append(Paragraph(_bal(fy_data['closing']), dat_r))
+            cells.append(Paragraph(
+                _amt(fy_data['interest']), dat_r_int if fy_data['interest'] > 0 else dat_r_zero,
+            ))
+        cells.append(Paragraph(
+            _bal(fy_data['closing']), _bal_style(fy_data['closing'], dat_r_pos, dat_r_neg, dat_r_zero),
+        ))
         if include_interest:
-            cells.append(Paragraph(_bal(fy_data['total_payable']), dat_r))
+            cells.append(Paragraph(
+                _bal(fy_data['total_payable']),
+                _bal_style(fy_data['total_payable'], dat_r_pos, dat_r_neg, dat_r_zero),
+            ))
         return cells
 
     for idx, row in enumerate(rows):
@@ -1102,19 +1150,30 @@ def render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False)
     for fy in fys:
         fy_totals = totals.get(fy)
         if not fy_totals:
-            cells = [Paragraph('-', tot_r), Paragraph('-', tot_r)]
+            cells = [Paragraph('-', tot_r_zero), Paragraph('-', tot_r_zero)]
             if include_interest:
-                cells.append(Paragraph('-', tot_r))
-            cells.append(Paragraph('-', tot_r))
+                cells.append(Paragraph('-', tot_r_zero))
+            cells.append(Paragraph('-', tot_r_zero))
             if include_interest:
-                cells.append(Paragraph('-', tot_r))
+                cells.append(Paragraph('-', tot_r_zero))
         else:
-            cells = [Paragraph(_amt(fy_totals['taken']), tot_r), Paragraph(_amt(fy_totals['paid']), tot_r)]
+            cells = [
+                Paragraph(_amt(fy_totals['taken']), tot_r_taken if fy_totals['taken'] > 0 else tot_r_zero),
+                Paragraph(_amt(fy_totals['paid']), tot_r_paid if fy_totals['paid'] > 0 else tot_r_zero),
+            ]
             if include_interest:
-                cells.append(Paragraph(_amt(fy_totals['interest']), tot_r))
-            cells.append(Paragraph(_bal(fy_totals['closing']), tot_r))
+                cells.append(Paragraph(
+                    _amt(fy_totals['interest']), tot_r_int if fy_totals['interest'] > 0 else tot_r_zero,
+                ))
+            cells.append(Paragraph(
+                _bal(fy_totals['closing']),
+                _bal_style(fy_totals['closing'], tot_r_pos, tot_r_neg, tot_r_zero),
+            ))
             if include_interest:
-                cells.append(Paragraph(_bal(fy_totals['total_payable']), tot_r))
+                cells.append(Paragraph(
+                    _bal(fy_totals['total_payable']),
+                    _bal_style(fy_totals['total_payable'], tot_r_pos, tot_r_neg, tot_r_zero),
+                ))
         total_row.extend(cells)
     table_rows.append(total_row)
     total_row_idx = len(table_rows) - 1
