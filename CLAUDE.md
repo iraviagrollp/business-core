@@ -179,12 +179,29 @@ business-core/
         │                        conditions/threshold logic; computes the CURRENT month via
         │                        `today.strftime('%Y-%m')` each run, unlike the FY branches which
         │                        always request 'all')
+        │                        Added 2026-08-07: borrowings_summary_fy / borrowings_summary_fy_interest
+        │                        branch (one elif keyed on category, always fires → PDF attachment;
+        │                        clones the customer_balances_fy block verbatim). New module-level
+        │                        imports `import borrowings as _brw` / `import borrowings_pdf as
+        │                        _brw_pdf`. See the "alerts — Scheduled Alerts" section's category
+        │                        dispatch list for full subject/filename/body detail. RESOLVED
+        │                        2026-08-07 (same day): this branch's real PDF render was blocked by
+        │                        letterhead.draw_header being missing from this package's
+        │                        letterhead.py — see the letterhead.py entry below for the fix
+        │                        (letterhead.py was resynced wholesale from api/letterhead.py, a
+        │                        confirmed strict superset). Real (non-monkeypatched) renders of
+        │                        both category variants now succeed with no AttributeError.
         ├── alerts_eval.py    ← copy of shared module (same source, duplicated per package)
         │                        Added 2026-07-06: FIELD_CATALOG_CUSTOMER_BALANCES_FY + FIELD_CATALOGS entry
         │                        Added 2026-07-06: FIELD_CATALOG_SUPPLIER_BALANCES_FY + FIELD_CATALOGS entry
         │                        Added 2026-07-12: FIELD_CATALOG_MONTHLY_COLLECTION (fields=[], not
         │                        branch-scoped, accepts 0 conditions) + FIELD_CATALOGS entry —
         │                        identical addition applied to api/alerts_eval.py to keep both in sync
+        │                        Added 2026-08-07: FIELD_CATALOG_BORROWINGS_SUMMARY_FY +
+        │                        FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST (both fields=[], not
+        │                        branch-scoped, accept 0 conditions) + FIELD_CATALOGS entries —
+        │                        identical addition applied to api/alerts_eval.py; both copies
+        │                        re-verified byte-identical after the edit
         ├── monthly_collection.py ← SHARED: byte-identical copy of api/monthly_collection.py
         │                        compute_monthly_collection(conn, month_str) → dict (added 2026-07-12;
         │                        previously api-only per that module's docstring — now also consumed
@@ -303,6 +320,72 @@ business-core/
         │                        computer-generated and is valid without signature." (reworded from
         │                        po_pdf.py's PO-specific wording), reads doc.pagesize/leftMargin/
         │                        rightMargin so it works on both portrait and landscape documents.
+        │                        **RESYNCED to byte-identical with api/letterhead.py (2026-08-07).**
+        │                        Previously (since 2026-07-21) this copy was missing api/letterhead.py's
+        │                        additive `draw_header(canvas, doc)` + `HEADER_TOP_PAD`/`HEADER_HEIGHT`
+        │                        constants (+ a `Frame` import) — see the "borrowings_pdf.py" entry
+        │                        below for why that blocked the two new borrowings alert categories.
+        │                        Before copying, a full line-by-line diff (`difflib.unified_diff`)
+        │                        confirmed api/letterhead.py is a STRICT SUPERSET of this file: every
+        │                        symbol this copy already had (`register_fonts`, `_header_styles`,
+        │                        `build_header`, `draw_footer`, every palette constant, both footer
+        │                        text lines) was byte-identical in api/letterhead.py, and the diff was
+        │                        100% additive (the new import/constants/function only). Per that
+        │                        confirmation, `api/letterhead.py` was copied over this file WHOLESALE
+        │                        (not a minimal additive port) — the two copies are byte-identical
+        │                        again, restoring this repo's normal cross-package-copy convention.
+        │                        The 4 existing renderers below (customer_balances_fy_pdf.py,
+        │                        supplier_balances_fy_pdf.py, monthly_sales_pdf.py,
+        │                        monthly_collection_pdf.py) were re-grepped for every `letterhead.`
+        │                        reference post-resync — all four call ONLY `register_fonts`,
+        │                        `BASE_FONT`, `BOLD_FONT`, `GREEN`, `MUTED`, `build_header(...)` (as a
+        │                        leading flowable, unchanged), and `draw_footer` (as a page callback,
+        │                        unchanged) — none call the new `draw_header`/`HEADER_TOP_PAD`/
+        │                        `HEADER_HEIGHT` symbols, so they are provably unaffected by this
+        │                        resync (confirmed both by the symbol-level diff, which shows those 4
+        │                        functions/constants byte-identical before and after, and by actually
+        │                        re-rendering `customer_balances_fy_pdf.py` — see the borrowings_pdf.py
+        │                        entry below).
+        ├── borrowings.py     ← SHARED: byte-identical copy of api/borrowings.py (added 2026-08-07).
+        │                        compute_borrowings_summary_fy(conn, include_interest, as_of=None)
+        │                        → dict is the only entry point this package's handler.py calls;
+        │                        the include_interest-ON per-transaction engine
+        │                        (compute_borrowings_interest/compute_interest_segments/
+        │                        compute_borrowing_rate_map) also ships in this copy (unused by the
+        │                        evaluator today, kept only for byte-identity with api/borrowings.py
+        │                        per this package's "copy the whole module, not a slice" convention
+        │                        — see customer_balances_fy.py/supplier_balances_fy.py above).
+        ├── borrowings_pdf.py ← SHARED: byte-identical copy of api/borrowings_pdf.py (added
+        │                        2026-08-07, copied AFTER the colored-number-cells change to
+        │                        render_borrowings_summary_fy_pdf so the emailed PDF carries the new
+        │                        colors). render_borrowings_summary_fy_pdf(data, include_interest)
+        │                        → bytes is the only function this package's handler.py calls
+        │                        (render_borrowings_pdf/render_borrowings_interest_pdf also ship in
+        │                        this copy, unused by the evaluator, same "copy the whole module"
+        │                        reasoning as borrowings.py above).
+        │                        **RESOLVED 2026-08-07 (same day as the initial copy):** the earlier
+        │                        AttributeError blocker (letterhead.draw_header missing) is fixed —
+        │                        see the letterhead.py entry above for the resync detail. Verified with
+        │                        a REAL (non-monkeypatched) render: a hand-built
+        │                        compute_borrowings_summary_fy()-shaped fixture (4 accounts — a
+        │                        positive closing, a negative closing, a zero closing, and an account
+        │                        with a genuinely-missing FY key to exercise `_fy_cells()`'s
+        │                        `if not fy_data:` path — plus a populated TOTAL row and a non-empty
+        │                        `missing_rate_accounts`) was rendered through THIS package's own
+        │                        `render_borrowings_summary_fy_pdf` for both `include_interest=False`
+        │                        and `=True` — both produced valid `%PDF`-prefixed bytes (236,717 /
+        │                        237,131 bytes, 1 page each) with every expected string present via
+        │                        `pypdf` text extraction (account names, `TOTAL`, the letterhead
+        │                        company name confirming `draw_header` actually ran, and — ON variant
+        │                        only, matching the renderer's own logic — `Interest`/`Total Payable`/
+        │                        `Rate not configured`). `customer_balances_fy_pdf.py` (one of the 4
+        │                        sibling renderers) was also re-rendered from a hand-built fixture as
+        │                        an explicit no-regression check — 236,861 bytes, 1 page, letterhead
+        │                        company name present, no exception. Driver script + a
+        │                        SHA-256-hash-pair verifier were written directly in this directory
+        │                        (this agent's sandbox cannot write to the scratchpad — fenced to
+        │                        `business-core` only), run, then deleted along with `__pycache__`
+        │                        afterward — nothing left in the repo.
         ├── pdf_fonts.py      ← SHARED: idempotent register_fonts() — registers DejaVuSans and
         │                        DejaVuSans-Bold with reportlab pdfmetrics; falls back to Helvetica
         │                        with warning on failure. Fixes ₹ (U+20B9) + — (U+2014) KeyError
@@ -2435,6 +2518,9 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);
 | `sale_returns` | Aggregate customer sale returns over time windows | Yes |
 | `customer_balances_fy` | Scheduled Customer Balances (FY) PDF report — always fires, no conditions | No |
 | `supplier_balances_fy` | Scheduled Supplier Balances (FY) PDF report — always fires, no conditions | No |
+| `monthly_collection` | Scheduled Monthly Collection PDF report (current month) — always fires, no conditions | No |
+| `borrowings_summary_fy` | Scheduled Borrowings Summary (FY) PDF report, plain variant (`include_interest=False`) — always fires, no conditions (added 2026-08-07) | No |
+| `borrowings_summary_fy_interest` | Scheduled Borrowings Summary (FY) PDF report, with-interest variant (`include_interest=True`) — always fires, no conditions (added 2026-08-07) | No |
 
 ### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
 
@@ -2619,6 +2705,17 @@ Each Lambda package includes a copy; `lambda/api/alerts_eval.py` is the source o
 - `_query_aggregate_metrics(conn, category, branch, windows, windows_needed)` — internal SQL helper
 - `validate_alert(body)` — validates all three categories; field keys are per-category; auto-accepts `net_sales_current_month` / `sale_returns_current_month` via catalog-driven validation
 - `is_alert_due_today(frequency, schedule_day, today)` — scheduling helper (unchanged)
+- `FIELD_CATALOG_BORROWINGS_SUMMARY_FY`, `FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST` (added
+  2026-08-07) — `fields=[]`, not branch-scoped, both registered in `FIELD_CATALOGS` under
+  `borrowings_summary_fy` / `borrowings_summary_fy_interest`; `_VALID_CATEGORIES` and
+  `_VALID_FIELDS_BY_CATEGORY` pick both up automatically (derived from `FIELD_CATALOGS`, no
+  separate registration step). `validate_alert()` needed NO other change — its only
+  category-specific branch is `if category == "balances" and len(conditions) == 0: raise` (every
+  other registered category, including these two, already falls on the zero-conditions-allowed
+  side automatically); there is no explicit category allow-list anywhere else in the validation
+  path (branch/match_type/frequency validation is category-agnostic), so both new categories are
+  handled identically to `customer_balances_fy`/`supplier_balances_fy`/`monthly_collection`
+  with no extra code.
 
 ### alerts_evaluator Lambda (`lambda/alerts_evaluator/handler.py`)
 
@@ -2639,6 +2736,55 @@ All existing gating is unchanged (due-today, time-reached, success-dedupe, 5/day
   - Sent via `_send_ses_email_with_pdf()`.
   - `alert_runs.matched` = 1 (always); `status` = `sent` or `failed`.
   - Does NOT call `evaluate_aggregate()` — has no conditions.
+- `borrowings_summary_fy` / `borrowings_summary_fy_interest` → **always fire** (unconditional) →
+  PDF attachment email, cloned verbatim from the `customer_balances_fy` block above (added
+  2026-08-07). One `elif category in ("borrowings_summary_fy", "borrowings_summary_fy_interest"):`
+  branch handles both category strings, keyed on `with_interest = category ==
+  "borrowings_summary_fy_interest"`.
+  - Calls `borrowings.compute_borrowings_summary_fy(conn, with_interest, as_of=today)` (module
+    imported as `_brw`) then `borrowings_pdf.render_borrowings_summary_fy_pdf(data, with_interest)`
+    (imported as `_brw_pdf`) — the SAME shared compute/render pair `GET /borrowings/summary-fy`
+    and `GET /borrowings/summary-fy/pdf` call in the `api` Lambda, so the emailed PDF can never
+    disagree with the on-screen report.
+  - Subject: `IRAVI — Borrowings Summary (FY) — <DD Mon YYYY>` (plain) /
+    `IRAVI — Borrowings Summary (FY, with interest) — <DD Mon YYYY>` (interest variant).
+  - Attachment filename: `IAL_Borrowings_Summary_FY_<DD-Mon-YYYY>.pdf` (plain) /
+    `IAL_Borrowings_Summary_FY_with_interest_<DD-Mon-YYYY>.pdf` (interest variant — `_with_interest`
+    inserted before the date, mirroring how the other filenames are built).
+  - Body: same minimal "Attached is the Borrowings Summary (FY) report ..." paragraph as the other
+    unconditional report alerts, PLUS an extra amber-colored line
+    (`"Rate not configured (0% used) for: <names>."`) when the compute result's
+    `missing_rate_accounts` is non-empty — additive, does not fail the send.
+  - Sent via `_send_ses_email_with_pdf()`.
+  - `alert_runs.matched` = 1 (always); `status` = `sent` or `failed`.
+  - **Blocker RESOLVED 2026-08-07 (same day it was flagged):** `borrowings_pdf.
+    render_borrowings_summary_fy_pdf` calls `letterhead.draw_header`/`letterhead.HEADER_TOP_PAD`/
+    `letterhead.HEADER_HEIGHT` — added to `api/letterhead.py` on 2026-07-21 for the every-page-
+    header work, but at the time intentionally not ported to `alerts_evaluator/letterhead.py`
+    (whose 4 pre-existing PDF renderers used the older `build_header()`-as-a-leading-flowable
+    pattern instead). A full symbol-level diff (`difflib.unified_diff`) confirmed `api/
+    letterhead.py` is a STRICT SUPERSET of `alerts_evaluator/letterhead.py` — the diff is 100%
+    additive (the new `Frame` import + `draw_header` + the two constants only); every symbol
+    `alerts_evaluator/letterhead.py` already had (`register_fonts`, `_header_styles`,
+    `build_header`, `draw_footer`, every palette constant, both footer lines) was byte-identical
+    in `api/letterhead.py`. Per that confirmation, **`api/letterhead.py` was copied wholesale over
+    `alerts_evaluator/letterhead.py`** (Path 1 of the two options originally offered — the
+    coordinator's explicit choice, given the superset finding), restoring byte-identity between
+    the two copies and the repo's normal cross-package-copy convention (no divergence was
+    introduced or left in place). The 4 pre-existing `alerts_evaluator` renderers were re-grepped
+    for every `letterhead.` reference post-resync — none call the new `draw_header`/
+    `HEADER_TOP_PAD`/`HEADER_HEIGHT` symbols (only `register_fonts`/`BASE_FONT`/`BOLD_FONT`/
+    `GREEN`/`MUTED`/`build_header`/`draw_footer`, all byte-identical before and after) — confirmed
+    unaffected both by the diff and by actually re-rendering `customer_balances_fy_pdf.py` from a
+    hand-built fixture (236,861 bytes, 1 page, no exception, letterhead company name present).
+    The dispatch branch was then re-verified with a REAL (non-monkeypatched) render — a hand-built
+    `compute_borrowings_summary_fy()`-shaped fixture (positive/negative/zero closings, an account
+    missing a FY key, a populated TOTAL row, non-empty `missing_rate_accounts`) rendered through
+    `render_borrowings_summary_fy_pdf` for both `include_interest` values, both producing valid
+    `%PDF` bytes (236,717 / 237,131 bytes) with the letterhead company name present (proving
+    `draw_header` actually executes) and no `AttributeError`. See the `letterhead.py` /
+    `borrowings_pdf.py` file-tree entries above for full verification detail. `alert_runs.status`
+    will now be `sent` (not `failed`) once these alerts actually fire in production.
 - `sales` → `evaluate_aggregate()` → **PDF attachment email** if `matched=True` (wired 2026-07-05)
   - Subject: `IRAVI — Daily Net Sales Report — <DD Mon YYYY>`
   - Body: minimal HTML paragraph "Attached is the Daily Net Sales Report" + "do not reply" footer. No Conditions table, no Window Metrics table.
@@ -2687,6 +2833,131 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **Follow-up (same day, 2026-08-07): resolved the `alerts_evaluator/letterhead.py` drift
+  blocker flagged by the previous task, and proved the borrowings alert PDFs actually render.**
+  1. **Full symbol-level diff, both directions:** `difflib.unified_diff('alerts_evaluator/
+     letterhead.py', 'api/letterhead.py')` showed the change is 100% ADDITIVE on the `api/` side
+     (new `Frame` import, `HEADER_TOP_PAD`, `HEADER_HEIGHT`, `draw_header`) — `alerts_evaluator/
+     letterhead.py` has ZERO symbols/lines that `api/letterhead.py` lacks, and every symbol it DID
+     already have (`register_fonts`, `_header_styles`, `build_header`, `draw_footer`, every
+     palette constant, both footer text lines) is byte-identical in both files (confirmed no
+     changed signature, no changed constant value, no altered `build_header`). `api/pdf_fonts.py`
+     vs `alerts_evaluator/pdf_fonts.py` was also diffed — byte-identical, no drift there.
+  2. **Path taken: Path 1 (coordinator's explicit instruction, given the strict-superset
+     finding)** — `api/letterhead.py` copied WHOLESALE over `alerts_evaluator/letterhead.py`
+     (not the minimal additive port) — restores byte-identity between the two copies (verified via
+     SHA-256, both hash to `779e1dcfe38a...`), the repo's normal cross-package-copy convention. No
+     divergence was introduced or left in place for this file.
+  3. **Regression-checked the other three report PDFs the evaluator ships** (`customer_balances_
+     fy_pdf.py`, `supplier_balances_fy_pdf.py`, `monthly_sales_pdf.py`, `monthly_collection_
+     pdf.py` — all four the evaluator actually has, per its file tree) — grepped every
+     `letterhead.` reference in each: all four call only `register_fonts()`, `BASE_FONT`,
+     `BOLD_FONT`, `GREEN`, `MUTED`, `build_header(...)` (as a leading flowable), and `draw_footer`
+     (as a page callback) — none reference the new `draw_header`/`HEADER_TOP_PAD`/`HEADER_HEIGHT`
+     symbols, and all of those referenced symbols are byte-identical before/after the resync — so
+     all four are provably unaffected.
+  4. **Rendered for real — no monkeypatching.** Called `render_borrowings_summary_fy_pdf` through
+     the evaluator's own (now-resynced) copies of `borrowings.py`/`borrowings_pdf.py`/
+     `letterhead.py` against a hand-built fixture (4 accounts: a positive closing, a negative
+     closing, a zero closing, and an account with a genuinely-missing FY key to exercise
+     `_fy_cells()`'s `if not fy_data:` defensive path; a populated TOTAL row; a non-empty
+     `missing_rate_accounts`), for both `include_interest=False` and `=True`. Both produced valid
+     `%PDF`-prefixed bytes (236,717 / 237,131 bytes, 1 page each) with every expected string
+     present via `pypdf` text extraction — account names, `TOTAL`, the letterhead company name
+     `IRAVI AGRO LIFE LLP` (proving `draw_header` actually executed on the canvas), and — ON
+     variant only, matching the renderer's own `if include_interest and missing_rate_accounts:`
+     logic — `Interest`, `Total Payable`, `Rate not configured`. No `AttributeError`, no other
+     exception. Then rendered `customer_balances_fy_pdf.py` (one of the three sibling renderers)
+     from a separate hand-built fixture as an explicit no-regression proof — 236,861 bytes, 1
+     page, letterhead company name present, no exception.
+  5. **Re-verified every byte-identical file pair after the change:** `api/letterhead.py` ==
+     `alerts_evaluator/letterhead.py`, `api/pdf_fonts.py` == `alerts_evaluator/pdf_fonts.py`,
+     `api/borrowings.py` == `alerts_evaluator/borrowings.py`, `api/borrowings_pdf.py` ==
+     `alerts_evaluator/borrowings_pdf.py`, `api/alerts_eval.py` == `alerts_evaluator/alerts_
+     eval.py` — all 5 pairs SHA-256-identical.
+  6. **Cleanup:** the diff/render/hash driver scripts were written inside `lambda/
+     alerts_evaluator/` (this agent's sandbox is fenced to `business-core` only — cannot write to
+     the scratchpad), run, then deleted along with `__pycache__` — confirmed via a final directory
+     listing that only the 18 real deliverable files remain in `lambda/alerts_evaluator/`.
+  **Net effect:** the `borrowings_summary_fy`/`borrowings_summary_fy_interest` alert categories
+  documented in the task above are now genuinely unblocked — `alert_runs.status` will be `sent`
+  (not `failed`) the first time either fires in production. No further IaC/DB/UI change from this
+  follow-up.
+
+- [x] **Two new report-only alert categories `borrowings_summary_fy` /
+  `borrowings_summary_fy_interest` (2026-08-07):** cloned the `customer_balances_fy` /
+  `supplier_balances_fy` / `monthly_collection` unconditional scheduled-report-alert pattern
+  exactly — no condition fields, always fire when due, attach the Borrowings Summary (FY) PDF
+  (plain / with-interest variant per category).
+  - **Copied byte-identical into `alerts_evaluator/`:** `lambda/api/borrowings.py` →
+    `lambda/alerts_evaluator/borrowings.py`, `lambda/api/borrowings_pdf.py` →
+    `lambda/alerts_evaluator/borrowings_pdf.py` (copied AFTER the colored-number-cells change to
+    `render_borrowings_summary_fy_pdf`, so the emailed PDF carries the new colors). Verified
+    byte-identical via SHA-256 hash comparison. No extra dependency files were needed —
+    `compute_borrowing_rate_map` (the migration-`054` `borrowing_rate` helper) lives inside
+    `borrowings.py` itself; `borrowings_pdf.py`'s only cross-file dependency is `letterhead.py`,
+    already present in `alerts_evaluator/` (see the blocker below).
+  - **Drift found and NOT silently overwritten (per instruction):** diffed
+    `alerts_evaluator/letterhead.py` against `api/letterhead.py` and `alerts_evaluator/pdf_fonts.py`
+    against `api/pdf_fonts.py`. `pdf_fonts.py` is byte-identical (no drift). `letterhead.py` HAS
+    drifted — `api/letterhead.py` gained `draw_header(canvas, doc)` + `HEADER_TOP_PAD`/
+    `HEADER_HEIGHT` constants (+ a `Frame` import) on 2026-07-21 for the "every-page letterhead
+    header" work; this was **intentionally not ported** to `alerts_evaluator/letterhead.py` at the
+    time (documented in that same 2026-07-21 CLAUDE.md entry — the 4 existing `alerts_evaluator`
+    PDF renderers were deliberately left on the older `build_header()`-as-a-leading-flowable
+    pattern). `borrowings_pdf.py`'s `render_borrowings_summary_fy_pdf` (and the other two
+    renderers in the file) call `letterhead.draw_header`/`HEADER_TOP_PAD`/`HEADER_HEIGHT` — which
+    do not exist on `alerts_evaluator/letterhead.py` as it stands today. **`letterhead.py` was NOT
+    modified by this task** — flagging this drift and asking rather than silently patching it, per
+    the task's explicit instruction. See "What Is Next" for the two remediation options.
+  - **`alerts_eval.py` (both copies, re-verified byte-identical after edit):** added
+    `FIELD_CATALOG_BORROWINGS_SUMMARY_FY` and `FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST`
+    (`fields=[]`, not branch-scoped, mirroring `FIELD_CATALOG_CUSTOMER_BALANCES_FY`'s exact shape),
+    registered both in `FIELD_CATALOGS` (`_VALID_CATEGORIES`/`_VALID_FIELDS_BY_CATEGORY` derive
+    from it automatically — no separate registration needed). Confirmed `validate_alert()`'s only
+    category-specific branch is the `balances`-requires-≥1-condition check — both new categories
+    fall on the zero-conditions-allowed side automatically, with no other explicit category
+    allow-list anywhere in the validation path (branch/match_type/frequency are all
+    category-agnostic) — so no further validation code was needed.
+  - **`alerts_evaluator/handler.py` dispatch:** new module-level `import borrowings as _brw` /
+    `import borrowings_pdf as _brw_pdf`; new
+    `elif category in ("borrowings_summary_fy", "borrowings_summary_fy_interest"):` branch placed
+    after the `monthly_collection` branch and before the trailing `else`, cloning the
+    `customer_balances_fy` block's structure verbatim (one branch handles both category strings,
+    keyed on `with_interest = category == "borrowings_summary_fy_interest"`). Calls
+    `_brw.compute_borrowings_summary_fy(conn, with_interest, as_of=today)` then
+    `_brw_pdf.render_borrowings_summary_fy_pdf(data_brw, with_interest)` — confirmed these
+    signatures against the real code first (`compute_borrowings_summary_fy(conn,
+    include_interest: bool, as_of: date | None = None) -> dict`,
+    `render_borrowings_summary_fy_pdf(data: dict, include_interest: bool = False) -> bytes` — both
+    matched the task brief exactly, no deviation needed). Subject:
+    `IRAVI — Borrowings Summary (FY) — <DD Mon YYYY>` / `IRAVI — Borrowings Summary (FY, with
+    interest) — <DD Mon YYYY>`. Filename: `IAL_Borrowings_Summary_FY_<DD-Mon-YYYY>.pdf` /
+    `IAL_Borrowings_Summary_FY_with_interest_<DD-Mon-YYYY>.pdf`. Body: the same minimal paragraph
+    as the other unconditional report alerts, plus an amber-colored
+    `"Rate not configured (0% used) for: <names>."` line when `data_brw['missing_rate_accounts']`
+    is non-empty (courtesy, does not fail the send). `status='sent'`/`matched_count=1`, same
+    logging format as the sibling branches.
+  - **Verification:** `python -c "import ast; ..."` parsed all 7 touched/created files clean.
+    SHA-256 confirmed `api/alerts_eval.py` == `alerts_evaluator/alerts_eval.py`,
+    `api/borrowings.py` == `alerts_evaluator/borrowings.py`, `api/borrowings_pdf.py` ==
+    `alerts_evaluator/borrowings_pdf.py`. Exercised the new dispatch branch end-to-end with a
+    stubbed DB connection (`FakeConn`/`FakeCursor` returning two active alerts, one per new
+    category, plus stubbed `alert_conditions`/`alert_recipients`/`alert_runs` queries) and
+    monkeypatched `_brw.compute_borrowings_summary_fy` / `_brw_pdf.render_borrowings_summary_fy_pdf`
+    / `_send_ses_email_with_pdf` — confirmed both category strings reach the branch, `with_interest`
+    threads through correctly to both the compute and render calls (`False`/`True` for the two
+    alerts respectively), the exact subject/filename strings match the spec for both variants, and
+    the `missing_rate_accounts` note appears only in the with-interest email body. Driver script
+    was written inside `lambda/alerts_evaluator/` (this agent's sandbox cannot write to the
+    scratchpad — fenced to `business-core` only), run, then deleted along with `__pycache__`
+    afterward — nothing left in the repo. **This test monkeypatched the render function, so it did
+    NOT exercise the real `letterhead.draw_header` call path — the blocker above was found by code
+    reading, not by this test failing.**
+  - **No DB migration, no Terraform change** — `alerts.category` has no CHECK constraint; SES
+    permissions and `/alerts*` routes already exist; `reportlab==4.2.2` already in
+    `alerts_evaluator/requirements.txt`.
 
 - [x] **`etl_borrowings` — skip synthetic "Brought Forward" opening-balance rows (2026-08-06):**
   see the new "Synthetic opening-balance rows skipped" note in the "etl_borrowings — Borrowings

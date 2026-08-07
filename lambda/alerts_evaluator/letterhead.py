@@ -56,7 +56,7 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.platypus import HRFlowable, Image, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import Frame, HRFlowable, Image, Paragraph, Spacer, Table, TableStyle
 
 import pdf_fonts
 
@@ -86,6 +86,13 @@ FOOTER_LINE1 = (
     'Shanthi Nagar, Kukatpally, Hyderabad, Telangana 500072'
 )
 FOOTER_LINE2 = 'This document is computer-generated and is valid without signature.'
+
+# Reserved vertical band for draw_header() (below) — callers that use draw_header()
+# as a page callback (rather than build_header() as a leading flowable) should set
+# their SimpleDocTemplate's topMargin to at least HEADER_TOP_PAD + HEADER_HEIGHT
+# (plus a small gap) so flowing content never overlaps the canvas-drawn header.
+HEADER_TOP_PAD = 0.35 * cm
+HEADER_HEIGHT  = 3.0 * cm
 
 
 def register_fonts() -> str:
@@ -140,6 +147,38 @@ def build_header(dw) -> list:
         HRFlowable(width=dw, thickness=2.2, color=GREEN, spaceBefore=2, spaceAfter=1.5),
         HRFlowable(width=dw, thickness=0.8, color=ORANGE, spaceAfter=3),
     ]
+
+
+def draw_header(canvas, doc):
+    """onFirstPage/onLaterPages callback — draws the SAME letterhead content
+    build_header() produces (logo + centered company-name/tagline/identity-line
+    + the green/orange double-rule) directly onto the canvas at the top of
+    EVERY page, via a throwaway reportlab Frame that renders build_header()'s
+    own flowables (so the look is guaranteed identical to the flowable
+    version — no re-implementation/drift risk). For reports that need the
+    header to repeat on every page of a multi-page document (build_header()
+    alone, used as a leading flowable, only appears once — on whichever page
+    the flowable stream happens to start on).
+
+    Does NOT alter build_header() or draw_footer() in any way, and existing
+    callers that use build_header() as a flowable (customer_balances_fy_pdf.py,
+    supplier_balances_fy_pdf.py, monthly_sales_pdf.py, monthly_collection_pdf.py,
+    supplier_ledger_statement_pdf.py) are completely unaffected — this is an
+    additive, opt-in alternative. Callers using draw_header() as a page
+    callback should NOT also add build_header() as a flowable (that would
+    double-render the header on page 1), and must reserve enough topMargin —
+    see HEADER_TOP_PAD / HEADER_HEIGHT above — so flowing content starts
+    below this band."""
+    canvas.saveState()
+    dw = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
+    frame_y = doc.pagesize[1] - HEADER_TOP_PAD - HEADER_HEIGHT
+    frame = Frame(
+        doc.leftMargin, frame_y, dw, HEADER_HEIGHT,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+        showBoundary=0,
+    )
+    frame.addFromList(list(build_header(dw)), canvas)
+    canvas.restoreState()
 
 
 def draw_footer(canvas, doc):
