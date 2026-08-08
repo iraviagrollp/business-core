@@ -2353,7 +2353,7 @@ Mirror of #3 on `supplier_ledger`/`supplier_accounts`: `invoice_category='Cr'`, 
 
 **5. `GET /pdc`** — read-only JSON array mirroring the procurement PDC screen (`procurement.pdc` LEFT JOIN `procurement.supplier_companies`/`procurement.technicals`), reusing `procurement_api/handler.py`'s `_PDC_SELECT` verbatim (module constant `_PDC_SELECT` in `handler.py`, shared by `_handle_pdc`/`_handle_pdc_pdf`). GET only — this Lambda never writes to `procurement.*`; create/update/delete stays exclusively in `procurement_api`. No Redis cache. **DB credential check (per task requirement):** `api/handler.py` and `procurement_api/handler.py` have byte-identical `_get_db_conn()` implementations, both reading `os.environ['DB_SECRET_ARN']` — and per this project's IaC docs there is only ONE database secret in the whole system (`iravi/dashboard/db`, `IaC/terraform/environments/production/secrets.tf`). Strong code-level evidence (identical connection code, single documented DB secret, no second secret referenced anywhere in this repo) says both Lambdas connect as the SAME Postgres user, so no GRANT is needed for `api` to read the `procurement` schema. This agent cannot inspect `IaC/` directly to give a 100%-certain confirmation (out of scope/fenced) — **flagged for the `iac` agent to do a final one-line confirmation** that `lambda_api.tf` and the procurement module's Lambda both reference the same `db_secret_arn` Terraform output before relying on this in production.
 
-**6. `GET /pdc/pdf?supplier=&product=&pdc_from=&pdc_to=`** — `supplier`/`product` are EXACT matches on `company_name`/`technical_name`; `pdc_from`/`pdc_to` are an inclusive range on `pdc_date`; all optional, applied server-side via the same `_PDC_SELECT` base query. Title `Issued PDC`; subtitle always starts with `All amounts in ₹`, followed by whichever filters are set, else `All records`. 16 columns (PO, Date, Supplier, Product, Brand, Cr.Days, Qty, Rate, Gross, GST, Amount, Disc, Adv, Bal, PDC Amt, PDC Date) — Qty/Rate are plain numbers, the 7 money columns are Indian-grouped 2dp with NO per-cell ₹ glyph (see the unit note in the subtitle), dates DD-MM-YYYY, `None` → `-`. TOTAL row sums the 7 money columns. Filename `Issued_PDC.pdf`. **Column widths are measured per render, not fixed** — see the dedicated 2026-08-05 bug-fix entry below the routes list.
+**6. `GET /pdc/pdf?supplier=&product=&pdc_from=&pdc_to=`** — `supplier`/`product` are EXACT matches on `company_name`/`technical_name`; `pdc_from`/`pdc_to` are an inclusive range on `pdc_date`; all optional, applied server-side via the same `_PDC_SELECT` base query. Title `Issued PDC`; subtitle always starts with `All amounts in ₹`, followed by whichever filters are set, else `All records`. 16 columns (PO, Date, Supplier, Product, Brand, Cr.Days, Qty, Rate, Gross, GST, Amount, Disc, Adv, Bal, PDC Amt, PDC Date) — Qty/Rate are plain numbers, the 7 money columns are Indian-grouped 2dp with NO per-cell ₹ glyph (see the unit note in the subtitle), dates DD-MM-YYYY, `None` → `-`. **Grouped month-wise by `pdc_date` (added 2026-08-08)** — the body is a sequence of month sections (chronological ascending, `No PDC Date` group last), each with its own repeating header + a distinctly-lighter per-month subtotal row, closed by a single grand TOTAL row summing the 7 money columns across ALL rows — see the dedicated "What Is Built" entry for full detail. Filename `Issued_PDC.pdf`. **Column widths are measured per render, not fixed** — see the dedicated 2026-08-05 bug-fix entry below the routes list.
 
 **Verification (2026-08-05):** `python -m py_compile handler.py aging.py aging_pdf.py customer_aging_pdf.py supplier_aging_pdf.py transactions_register_pdf.py sales_register_pdf.py purchases_register_pdf.py issued_pdc_pdf.py` clean. Smoke-tested (scratchpad-only script, not committed) with `reportlab` 5.0.0 + `pypdf`: Sales/Purchases Register at 200 synthetic rows (None qty/rate/amount/branch/party sprinkled in, one intentionally very long party name, negative amounts) → 10 pages each, plus a 0-row edge case → 1 page; Customer/Supplier Aging at 80 synthetic rows (mixed positive/negative nets, missing cities, missing last-receipt data) → 4 pages each, plus 0-row edge cases → 1 page each (confirmed `'Cr'`/`'Dr'` suffix text present via `pypdf` extraction); Issued PDC at 60 rows (None brand/technical_name/company_name/credit_days/disc/adv sprinkled in) → 5 pages, a supplier-filtered 5-row case → 1 page, and a 0-row case → 1 page. Every call returned non-empty `%PDF`-prefixed bytes with no exceptions. Routes verified reachable by re-reading the routing block in `handler.py` after editing.
 
@@ -3016,6 +3016,56 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **Issued PDC PDF (`GET /pdc/pdf`) — grouped month-wise by `pdc_date` (2026-08-08):**
+  `lambda/api/issued_pdc_pdf.py`'s `render_issued_pdc_pdf` no longer renders one flat table — the
+  body is now a sequence of month sections, in chronological ASCENDING order of `pdc_date`, each
+  with its own repeating 16-column header (`repeatRows=1`), its own rows, and its own subtotal row
+  (7 money columns, styled distinctly lighter than the grand TOTAL row — new `_MONTH_TOTAL_BG`
+  `#f7f7f7` / `_MONTH_TOTAL_FG` `#444444` constants vs. the existing `_TOTAL_BG` `#f0f0f0` bold-black
+  grand-TOTAL row). A single grand TOTAL row (unchanged shape/position) closes the document, across
+  ALL rows.
+  - **Month key** = `pdc_date[:7]`; heading = full English month name (explicit `_MONTH_NAMES`
+    list — never locale-dependent `strftime`, per the task's explicit instruction) + `-` + 4-digit
+    year, e.g. `October-2026`. Rows with NULL/blank `pdc_date` group last, headed `No PDC Date` —
+    never dropped (`_month_key`/`_month_heading`/`_group_rows_by_month`).
+  - **Within a month:** sorted `pdc_date ASC, po_date DESC NULLS LAST, id DESC` via a new
+    `_pdc_row_cmp` comparator (`functools.cmp_to_key`) — applied defensively IN THE RENDERER
+    regardless of the caller's SQL order. This requires `id` to survive into the payload, so
+    `handler.py`'s `_handle_pdc_pdf` row-rebuild gained an `id` key (additive; `id` is never
+    rendered as a column, only used for the tertiary sort. `_handle_pdc`, the JSON list endpoint
+    backing the on-screen table, was NOT touched — its ordering and row shape are unchanged, per
+    the task's explicit instruction).
+  - **Ordering source:** `_handle_pdc_pdf`'s SQL `ORDER BY` changed from `po_date DESC NULLS LAST,
+    id DESC` to `pdc_date ASC NULLS LAST, po_date DESC NULLS LAST, id DESC` — the renderer's own
+    defensive sort makes this belt-and-suspenders, not load-bearing, but the two are kept in
+    agreement. `_handle_pdc`'s `ORDER BY` (`po_date DESC NULLS LAST, id DESC`) is unchanged.
+  - **Layout computed exactly ONCE per render** (unchanged principle from the original
+    measured-column-width design) — `_compute_layout`/`_measure` now also fold in every month's
+    subtotal LABEL TEXT (e.g. `"Oct-2026 Total"`) into the 'po' column's width measurement (a new
+    `extra_po_labels` param), since that text is new relative to the pre-grouping design and the
+    'po' column is one of the 13 unbreakable columns — this is still ONE global measurement, not a
+    per-month one; every month's table and the grand-total row share the identical
+    `col_widths`/font size/padding.
+  - **Month headings** use `keepWithNext=True` on their `ParagraphStyle` (the same house pattern
+    `borrowings_pdf.py`'s FY headings use) rather than wrapping a whole month's table in
+    `KeepTogether` — avoids orphaned headings at the bottom of a page without risking a
+    `LayoutError` on a month whose table itself spans multiple pages.
+  - **Empty-rows case** unchanged — still a single header + `TOTAL` row (dashes) table, no month
+    sections.
+  - Verified: `python -m py_compile handler.py issued_pdc_pdf.py` clean. A throwaway script
+    (written directly under `lambda/api/` — this agent's sandbox cannot write to the scratchpad,
+    fenced to `business-core` only — run, then deleted along with `__pycache__` afterward)
+    rendered a 6-row fixture spanning October 2026, November 2026, January 2027, and two
+    `pdc_date=None`/`''` rows: confirmed group order `['2026-10', '2026-11', '2027-01', None]`;
+    within-month `id` ordering matched the `po_date DESC` expectation for two same-`pdc_date` rows;
+    both `None`/`''` rows landed in the same trailing "No PDC Date" group; both the full-payload
+    PDF (238,324 bytes, `%PDF`-prefixed) and the empty-rows PDF (236,268 bytes) rendered without
+    exception; `pypdf` text extraction (also available locally) confirmed every expected month
+    heading, every per-month subtotal label (`Oct-2026 Total` / `Nov-2026 Total` / `Jan-2027
+    Total` / `No PDC Date Total`), and the grand `TOTAL` row all present in the rendered text.
+  - No IaC/DB/UI change required — same route (`GET /pdc/pdf`), same query params/response
+    envelope, presentation-only.
 
 - [x] **Follow-up (same day, 2026-08-07): resolved the `alerts_evaluator/letterhead.py` drift
   blocker flagged by the previous task, and proved the borrowings alert PDFs actually render.**

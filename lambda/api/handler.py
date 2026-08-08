@@ -2187,7 +2187,11 @@ def _handle_pdc_pdf(params: dict):
     if pdc_to:
         query += ' AND p.pdc_date <= %s'
         query_params.append(pdc_to)
-    query += ' ORDER BY p.po_date DESC NULLS LAST, p.id DESC'
+    # Month-wise grouping (renderer) needs pdc_date ASC as the primary sort —
+    # deliberately DIFFERENT from _handle_pdc's po_date-DESC ordering, which
+    # drives the on-screen table and must stay unchanged. See
+    # issued_pdc_pdf.render_issued_pdc_pdf's month-grouping docstring.
+    query += ' ORDER BY p.pdc_date ASC NULLS LAST, p.po_date DESC NULLS LAST, p.id DESC'
 
     conn = _get_db_conn()
     try:
@@ -2202,6 +2206,10 @@ def _handle_pdc_pdf(params: dict):
     for raw in raw_rows:
         row = dict(zip(col_names, raw))
         rows.append({
+            # 'id' is carried through purely as a defensive tertiary sort key
+            # for issued_pdc_pdf's month-grouping (pdc_date ASC, po_date DESC
+            # NULLS LAST, id DESC) — never rendered as a column.
+            'id': row['id'],
             'po_no': row['po_no'],
             'po_date': row['po_date'].isoformat() if row['po_date'] else None,
             'company_name': row['company_name'],
