@@ -8,13 +8,15 @@ render_issued_pdc_pdf(data: dict) -> bytes
         'rows': [
             {po_no, po_date, company_name, technical_name, brand,
              credit_days, qty, rate, gross, gst, amount, disc, adv, bal,
-             pdc_amt, pdc_date}, ...
+             pdc_amt, pdc_date, id}, ...
         ],
         'supplier': str|None, 'product': str|None,
         'pdc_from': 'YYYY-MM-DD'|None, 'pdc_to': 'YYYY-MM-DD'|None,
     } — built by handler._handle_pdc_pdf from procurement.pdc (joined to
     procurement.supplier_companies / procurement.technicals), server-side
-    filtered on supplier/product/pdc_from/pdc_to.
+    filtered on supplier/product/pdc_from/pdc_to. `id` is carried through
+    purely as a defensive tertiary sort key for the month-grouping below —
+    it is never rendered as a column.
     returns : raw PDF bytes (landscape A4)
 
 Design mirrors the house report-PDF convention (customer_balances_fy_pdf.py /
@@ -31,6 +33,32 @@ sizing" note below.
   Rate (right) | Gross (right) | GST (right) | Amount (right) | Disc (right)
   | Adv (right) | Bal (right) | PDC Amt (right) | PDC Date
 
+Month-wise grouping (added — see the task's "Issued PDC PDF, grouped
+month-wise" spec)
+--------------------------------------------------------------------------
+The body is no longer one flat table. Rows are grouped by `pdc_date[:7]`
+('YYYY-MM'), rendered as a sequence of month sections in chronological
+ASCENDING order, each with its own repeating 16-column header row
+(`repeatRows=1`) and its own subtotal row at the bottom (7 money columns,
+styled distinctly lighter than the grand TOTAL row). Rows with a
+NULL/blank `pdc_date` are grouped last, under the heading "No PDC Date" —
+never dropped. Within a month, rows are sorted `pdc_date ASC, po_date DESC
+NULLS LAST, id DESC` (`_pdc_row_cmp`) — a DEFENSIVE sort applied here in
+the renderer regardless of the SQL's own ORDER BY (`handler.py`'s
+`_handle_pdc_pdf` also orders `pdc_date ASC NULLS LAST, po_date DESC NULLS
+LAST, id DESC` for the same rows, so in practice the two agree — this is
+belt-and-suspenders, not a correction of the SQL). A single grand TOTAL row
+(identical in shape/position to the pre-grouping design) closes the
+document, across ALL rows regardless of month.
+
+`_compute_layout()` is still called EXACTLY ONCE, over the full row set
+(and the grand totals) — not per month — so every month's table shares the
+identical `col_widths`/font size/padding and lines up perfectly with its
+neighbours. The 'po' column's width measurement additionally accounts for
+the per-month subtotal label strings (e.g. "Oct-2026 Total"), since that
+column is one of the 13 unbreakable columns and subtotal labels are new
+text the pre-grouping design never had to measure.
+
 Column sizing (measured, not guessed)
 --------------------------------------
 Every column here except Supplier/Product/Brand holds a value that can NEVER
@@ -41,9 +69,9 @@ just overflows the cell instead. A fixed weight-based column-width split
 dates, lakh/crore-scale amounts).
 
 `_measure()` / `_compute_layout()` instead measure, PER RENDER, the actual
-`pdfmetrics.stringWidth` of every header label, every data cell, and the
-TOTAL row cell in this specific payload, at the exact font/size that cell
-will be drawn with:
+`pdfmetrics.stringWidth` of every header label, every data cell, the
+TOTAL row cell, and every per-month subtotal label in this specific
+payload, at the exact font/size that cell will be drawn with:
   - The 13 unbreakable columns (PO, Date, PDC Date, Cr.Days, Qty, Rate, and
     the 7 money columns) always get AT LEAST their measured required width.
   - Supplier/Product/Brand wrap on spaces, so they get a measured MINIMUM
@@ -73,6 +101,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from functools import cmp_to_key
 from io import BytesIO
 
 from reportlab.lib import colors
@@ -94,7 +123,9 @@ import letterhead
 _LOG = logging.getLogger('issued_pdc_pdf')
 
 # ── constants ─────────────────────────────────────────────────────────────────
-_TOTAL_BG    = colors.HexColor('#f0f0f0')
+_TOTAL_BG       = colors.HexColor('#f0f0f0')
+_MONTH_TOTAL_BG = colors.HexColor('#f7f7f7')  # lighter than _TOTAL_BG — per-month subtotal
+_MONTH_TOTAL_FG = colors.HexColor('#444444')  # muted text — distinguishes from the grand TOTAL
 _ALT_BG      = colors.HexColor('#fafafa')
 _CELL_BORDER = colors.HexColor('#cccccc')
 
@@ -109,6 +140,11 @@ _BOLD_FONT = letterhead.BOLD_FONT
 # glyph. Used ONLY in the subtitle ("All amounts in <_RS>") — data/TOTAL
 # cells are plain Helvetica numbers now (see module docstring).
 _RS = letterhead.register_fonts()
+
+_MONTH_NAMES = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+]
 
 
 # ── formatting helpers ────────────────────────────────────────────────────────
@@ -165,10 +201,82 @@ def _fmt_date(date_str) -> str:
         return date_str
 
 
+# ── month-grouping helpers ────────────────────────────────────────────────────
+
+def _month_key(pdc_date) -> str | None:
+    """'YYYY-MM-DD' -> 'YYYY-MM'; None/blank -> None (the "No PDC Date"
+    bucket)."""
+    if not pdc_date:
+        return None
+    return pdc_date[:7]
+
+
+def _month_heading(month_key: str | None) -> str:
+    """'YYYY-MM' -> 'October-2026' (full English month name, explicitly
+    mapped — never locale-dependent strftime, which could break in the
+    Lambda runtime). None -> 'No PDC Date'."""
+    if month_key is None:
+        return 'No PDC Date'
+    year_str, month_str = month_key.split('-')
+    month_num = int(month_str)
+    return f'{_MONTH_NAMES[month_num - 1]}-{year_str}'
+
+
+def _month_subtotal_label(month_key: str | None) -> str:
+    """'YYYY-MM' -> 'Oct-2026 Total'; None -> 'No PDC Date Total'."""
+    if month_key is None:
+        return 'No PDC Date Total'
+    year_str, month_str = month_key.split('-')
+    month_num = int(month_str)
+    return f'{_MONTH_NAMES[month_num - 1][:3]}-{year_str} Total'
+
+
+def _pdc_row_cmp(a: dict, b: dict) -> int:
+    """Defensive in-renderer sort comparator — pdc_date ASC, then po_date
+    DESC NULLS LAST, then id DESC. Applied within each month group
+    regardless of the caller's SQL ORDER BY (see module docstring)."""
+    a_pdc, b_pdc = a.get('pdc_date') or '', b.get('pdc_date') or ''
+    if a_pdc != b_pdc:
+        return -1 if a_pdc < b_pdc else 1
+
+    a_po, b_po = a.get('po_date'), b.get('po_date')
+    if a_po != b_po:
+        if a_po is None:
+            return 1
+        if b_po is None:
+            return -1
+        return -1 if a_po > b_po else 1
+
+    a_id, b_id = a.get('id') or 0, b.get('id') or 0
+    if a_id != b_id:
+        return -1 if a_id > b_id else 1
+    return 0
+
+
+def _group_rows_by_month(rows: list) -> list[tuple]:
+    """rows -> [(month_key, sorted_rows), ...] in chronological ASCENDING
+    order of month_key, with the None ("No PDC Date") group, if present,
+    always last."""
+    groups: dict = {}
+    for row in rows:
+        key = _month_key(row.get('pdc_date'))
+        groups.setdefault(key, []).append(row)
+
+    for key, group_rows in groups.items():
+        groups[key] = sorted(group_rows, key=cmp_to_key(_pdc_row_cmp))
+
+    ordered_keys = sorted(k for k in groups if k is not None)
+    ordered = [(k, groups[k]) for k in ordered_keys]
+    if None in groups:
+        ordered.append((None, groups[None]))
+    return ordered
+
+
 # ── paragraph style factory ───────────────────────────────────────────────────
 
 def _ps(name: str, font: str, size: float, align: int,
-        color=colors.black, leading: float | None = None) -> ParagraphStyle:
+        color=colors.black, leading: float | None = None,
+        keep_with_next: bool = False) -> ParagraphStyle:
     return ParagraphStyle(
         name,
         fontName=font,
@@ -176,6 +284,7 @@ def _ps(name: str, font: str, size: float, align: int,
         alignment=align,
         leading=leading or (size + 1),
         textColor=color,
+        keepWithNext=keep_with_next,
     )
 
 
@@ -239,25 +348,36 @@ _DEGRADE_STEPS = [
 ]
 
 
-def _total_cell_text(spec: dict, totals: dict, has_rows: bool) -> str:
-    """TOTAL row text for one column — 'TOTAL' label in PO, summed amount in
-    the 7 money columns (only when there is at least one row), blank
-    everywhere else (matches the pre-existing TOTAL row shape)."""
+def _summary_cell_text(spec: dict, label: str, totals: dict, has_rows: bool) -> str:
+    """Summary-row (grand TOTAL or per-month subtotal) text for one column —
+    `label` in PO, summed amount in the 7 money columns (only when there is
+    at least one row), blank everywhere else."""
     if spec['key'] == 'po':
-        return 'TOTAL'
+        return label
     if spec['money']:
         return _amt(totals.get(spec['key'])) if has_rows else '-'
     return ''
 
 
-def _measure(rows: list, totals: dict, font_size: float, pad: float):
+def _total_cell_text(spec: dict, totals: dict, has_rows: bool) -> str:
+    """Backward-compatible wrapper — the grand TOTAL row's label is always
+    'TOTAL'."""
+    return _summary_cell_text(spec, 'TOTAL', totals, has_rows)
+
+
+def _measure(rows: list, totals: dict, font_size: float, pad: float,
+             extra_po_labels: list | None = None):
     """Required width for the 13 unbreakable columns, and (minimum, 'want')
     width for the 3 wrap columns, measured over THIS render's actual header
-    label / data cells / TOTAL cell, at `font_size`/`pad`."""
+    label / data cells / TOTAL cell / per-month subtotal labels, at
+    `font_size`/`pad`. `extra_po_labels` (the per-month subtotal label
+    strings, e.g. 'Oct-2026 Total') are folded into the 'po' column's width
+    so subtotal labels never overflow it — see module docstring."""
     nonwrap: dict = {}
     wrap_min: dict = {}
     wrap_want: dict = {}
     has_rows = bool(rows)
+    extra_po_labels = extra_po_labels or []
 
     for spec in _COL_SPECS:
         header_w = pdfmetrics.stringWidth(spec['header'], _BOLD_FONT, font_size)
@@ -283,20 +403,27 @@ def _measure(rows: list, totals: dict, font_size: float, pad: float):
             total_text = _total_cell_text(spec, totals, has_rows)
             total_w = (pdfmetrics.stringWidth(total_text, _BOLD_FONT, font_size)
                        if total_text else 0.0)
-            nonwrap[spec['key']] = max(header_w, data_w, total_w) + 2 * pad
+            extra_w = 0.0
+            if spec['key'] == 'po' and extra_po_labels:
+                extra_w = max(
+                    pdfmetrics.stringWidth(label, _BOLD_FONT, font_size)
+                    for label in extra_po_labels
+                )
+            nonwrap[spec['key']] = max(header_w, data_w, total_w, extra_w) + 2 * pad
 
     return nonwrap, wrap_min, wrap_want
 
 
-def _compute_layout(rows: list, totals: dict):
+def _compute_layout(rows: list, totals: dict, extra_po_labels: list | None = None):
     """Pick the least-aggressive degradation step that fits, then distribute
     any leftover width across Supplier/Product/Brand proportional to their
     measured 'want'. Returns (col_widths_in_COL_SPECS_order, font_size, pad,
-    margin, content_w)."""
+    margin, content_w). Called EXACTLY ONCE per render, over the full row
+    set (+ grand totals + per-month subtotal labels) — never per month."""
     chosen = None
     for font_size, pad, margin in _DEGRADE_STEPS:
         content_w = _PAGE_W - 2 * margin
-        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad)
+        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad, extra_po_labels)
         nonwrap_total = sum(nonwrap.values())
         wrap_min_total = sum(wrap_min.values())
         remaining = content_w - nonwrap_total
@@ -319,7 +446,7 @@ def _compute_layout(rows: list, totals: dict):
         # This is NOT scaled/silenced: it is a bounded, reported edge case.
         font_size, pad, margin = _DEGRADE_STEPS[-1]
         content_w = _PAGE_W - 2 * margin
-        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad)
+        nonwrap, wrap_min, wrap_want = _measure(rows, totals, font_size, pad, extra_po_labels)
         nonwrap_total = sum(nonwrap.values())
         wrap_min_total = sum(wrap_min.values())
         total = nonwrap_total + wrap_min_total
@@ -349,6 +476,33 @@ def _compute_layout(rows: list, totals: dict):
     return col_widths, font_size, pad, margin, content_w
 
 
+# ── row/table-building helpers ────────────────────────────────────────────────
+
+def _header_row_cells(hdr_align: dict) -> list:
+    return [Paragraph(spec['header'], hdr_align[spec['align']]) for spec in _COL_SPECS]
+
+
+def _data_row_cells(row: dict, dat_align: dict) -> list:
+    return [Paragraph(spec['cell'](row), dat_align[spec['align']]) for spec in _COL_SPECS]
+
+
+def _summary_row_cells(label: str, totals: dict, align_styles: dict, has_rows: bool) -> list:
+    """One summary row (grand TOTAL or a per-month subtotal) — `align_styles`
+    is a dict of {TA_LEFT/TA_CENTER/TA_RIGHT: ParagraphStyle}."""
+    row = []
+    for spec in _COL_SPECS:
+        if spec['wrap']:
+            row.append(Paragraph('', align_styles[TA_LEFT]))
+        else:
+            text = _summary_cell_text(spec, label, totals, has_rows)
+            row.append(Paragraph(text, align_styles[spec['align']]))
+    return row
+
+
+def _month_totals(rows: list) -> dict:
+    return {key: sum(row.get(key) or 0.0 for row in rows) for key in _MONEY_KEYS}
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def render_issued_pdc_pdf(data: dict) -> bytes:
@@ -358,9 +512,15 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
     pdc_from = data.get('pdc_from')
     pdc_to = data.get('pdc_to')
 
-    totals = {key: sum(row.get(key) or 0.0 for row in rows) for key in _MONEY_KEYS}
+    grand_totals = {key: sum(row.get(key) or 0.0 for row in rows) for key in _MONEY_KEYS}
+    grouped = _group_rows_by_month(rows)
+    subtotal_labels = [_month_subtotal_label(month_key) for month_key, _ in grouped]
 
-    col_widths, font_size, pad, margin, content_w = _compute_layout(rows, totals)
+    # Shared layout — computed ONCE over the full row set + grand totals +
+    # every month's subtotal label — then reused verbatim for every month's
+    # table and the grand-total row. See module docstring.
+    col_widths, font_size, pad, margin, content_w = _compute_layout(
+        rows, grand_totals, subtotal_labels)
 
     buffer = BytesIO()
 
@@ -379,6 +539,10 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
 
     title_sty = _ps('PDCTitle', _BOLD_FONT, 12, TA_LEFT, color=letterhead.GREEN)
     subtitle_sty = _ps('PDCSubtitle', _BASE_FONT, 8, TA_LEFT, color=letterhead.MUTED)
+    month_heading_sty = _ps(
+        'PDCMonthHeading', _BOLD_FONT, max(font_size + 2.5, 10.5), TA_LEFT,
+        color=letterhead.GREEN, keep_with_next=True,
+    )
 
     hdr_align = {
         TA_LEFT: _ps('PDCHdrL', _BOLD_FONT, font_size, TA_LEFT, color=_W),
@@ -394,6 +558,13 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
         TA_LEFT: _ps('PDCTotL', _BOLD_FONT, font_size, TA_LEFT),
         TA_CENTER: _ps('PDCTotC', _BOLD_FONT, font_size, TA_CENTER),
         TA_RIGHT: _ps('PDCTotR', _BOLD_FONT, font_size, TA_RIGHT),
+    }
+    # Per-month subtotal row — distinctly lighter than the grand TOTAL row
+    # (muted gray text, lighter background — see _MONTH_TOTAL_BG/_FG).
+    subtot_align = {
+        TA_LEFT: _ps('PDCSubtotL', _BOLD_FONT, font_size, TA_LEFT, color=_MONTH_TOTAL_FG),
+        TA_CENTER: _ps('PDCSubtotC', _BOLD_FONT, font_size, TA_CENTER, color=_MONTH_TOTAL_FG),
+        TA_RIGHT: _ps('PDCSubtotR', _BOLD_FONT, font_size, TA_RIGHT, color=_MONTH_TOTAL_FG),
     }
 
     title_row = Table(
@@ -428,45 +599,72 @@ def render_issued_pdc_pdf(data: dict) -> bytes:
         Spacer(1, 5),
     ]
 
-    table_rows: list = [
-        [Paragraph(spec['header'], hdr_align[spec['align']]) for spec in _COL_SPECS]
-    ]
+    def _base_table_style(total_row_idx: int, is_total_bold: bool = True) -> list:
+        cmds = [
+            ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
+            ('FONTSIZE', (0, 0), (-1, -1), font_size),
+            ('GRID', (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('LEFTPADDING', (0, 0), (-1, -1), pad),
+            ('RIGHTPADDING', (0, 0), (-1, -1), pad),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]
+        for i in range(1, total_row_idx):
+            if (i - 1) % 2 == 1:
+                cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+        return cmds
 
-    for row in rows:
-        table_rows.append([
-            Paragraph(spec['cell'](row), dat_align[spec['align']]) for spec in _COL_SPECS
-        ])
+    if not rows:
+        # Empty-state: unchanged behaviour — header row + a single TOTAL row
+        # (dashes, has_rows=False).
+        table_rows = [_header_row_cells(hdr_align)]
+        table_rows.append(_summary_row_cells('TOTAL', grand_totals, tot_align, has_rows=False))
+        total_row_idx = len(table_rows) - 1
 
-    has_rows = bool(rows)
-    total_row: list = []
-    for spec in _COL_SPECS:
-        if spec['wrap']:
-            total_row.append(Paragraph('', tot_align[TA_LEFT]))
-        else:
-            text = _total_cell_text(spec, totals, has_rows)
-            total_row.append(Paragraph(text, tot_align[spec['align']]))
-    table_rows.append(total_row)
-    total_row_idx = len(table_rows) - 1
+        tbl_cmds = _base_table_style(total_row_idx)
+        tbl_cmds.append(('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG))
 
-    tbl_cmds: list = [
-        ('BACKGROUND', (0, 0), (-1, 0), letterhead.GREEN),
-        ('BACKGROUND', (0, total_row_idx), (-1, total_row_idx), _TOTAL_BG),
-        ('FONTSIZE', (0, 0), (-1, -1), font_size),
-        ('GRID', (0, 0), (-1, -1), 0.3, _CELL_BORDER),
-        ('TOPPADDING', (0, 0), (-1, -1), 2),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
-        ('LEFTPADDING', (0, 0), (-1, -1), pad),
-        ('RIGHTPADDING', (0, 0), (-1, -1), pad),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]
-    # Zebra stripe on alternate data rows (row 0 is the header)
-    for i in range(1, total_row_idx):
-        if (i - 1) % 2 == 1:
-            tbl_cmds.append(('BACKGROUND', (0, i), (-1, i), _ALT_BG))
+        data_tbl = Table(table_rows, colWidths=col_widths, repeatRows=1)
+        data_tbl.setStyle(TableStyle(tbl_cmds))
+        elements.append(data_tbl)
+    else:
+        for idx, (month_key, month_rows) in enumerate(grouped):
+            elements.append(Spacer(1, 10 if idx > 0 else 2))
+            elements.append(Paragraph(_month_heading(month_key), month_heading_sty))
+            elements.append(Spacer(1, 3))
 
-    data_tbl = Table(table_rows, colWidths=col_widths, repeatRows=1)
-    data_tbl.setStyle(TableStyle(tbl_cmds))
-    elements.append(data_tbl)
+            table_rows = [_header_row_cells(hdr_align)]
+            for row in month_rows:
+                table_rows.append(_data_row_cells(row, dat_align))
+            month_totals = _month_totals(month_rows)
+            table_rows.append(_summary_row_cells(
+                _month_subtotal_label(month_key), month_totals, subtot_align, has_rows=True))
+            subtotal_row_idx = len(table_rows) - 1
+
+            tbl_cmds = _base_table_style(subtotal_row_idx)
+            tbl_cmds.append(
+                ('BACKGROUND', (0, subtotal_row_idx), (-1, subtotal_row_idx), _MONTH_TOTAL_BG))
+
+            month_tbl = Table(table_rows, colWidths=col_widths, repeatRows=1)
+            month_tbl.setStyle(TableStyle(tbl_cmds))
+            elements.append(month_tbl)
+
+        # Grand TOTAL row — across ALL rows, at the very end of the document.
+        elements.append(Spacer(1, 8))
+        grand_total_cells = _summary_row_cells('TOTAL', grand_totals, tot_align, has_rows=True)
+        grand_tbl = Table([grand_total_cells], colWidths=col_widths)
+        grand_tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), _TOTAL_BG),
+            ('FONTSIZE', (0, 0), (-1, -1), font_size),
+            ('GRID', (0, 0), (-1, -1), 0.3, _CELL_BORDER),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('LEFTPADDING', (0, 0), (-1, -1), pad),
+            ('RIGHTPADDING', (0, 0), (-1, -1), pad),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ]))
+        elements.append(grand_tbl)
 
     doc.build(elements, onFirstPage=_draw_header_footer, onLaterPages=_draw_header_footer)
     return buffer.getvalue()
