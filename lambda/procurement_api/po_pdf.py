@@ -316,6 +316,62 @@ def _vendor_box(po, st, dw):
     return vbox
 
 
+def _vendor_box_bulk(po, st, dw):
+    """BULK-only variant of the vendor/supplier identity box (the shared `_vendor_box` above
+    is used by JOB_WORK's "JOB WORKER" section and by GENERIC — verified both call it — so it
+    is left untouched and this separate helper exists instead). Matches the manually-written
+    reference PO's address format: name bold on its own line, then each address line
+    (line1/line2/line3) on its own line, then `GSTIN: ...` on its own final line — no
+    comma-joining, no GSTIN appended inline to the last address line."""
+    ven = [Paragraph(_esc(po.get('supplier_company_name')), st['name'])]
+    lines = [po.get(k) for k in
+             ('supplier_address_line1', 'supplier_address_line2', 'supplier_address_line3') if po.get(k)]
+    if po.get('supplier_gstin'):
+        lines.append(f'GSTIN: {po["supplier_gstin"]}')
+    if lines:
+        ven.append(Paragraph('<br/>'.join(_esc(x) for x in lines), st['body']))
+    vbox = Table([[ven]], colWidths=[dw])
+    vbox.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOX', (0, 0), (-1, -1), 0.5, _RULE),
+        ('BACKGROUND', (0, 0), (-1, -1), _TINT),
+        ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 9), ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+    ]))
+    return vbox
+
+
+def _bulk_order_details_flow(po, st, dw, qty, rate, gst_lbl):
+    """BULK-only ORDER DETAILS body: a plain label : value list (reference-PO style) —
+    replaces the old 6-column gridded goods table (SL/DESCRIPTION/QUANTITY/UOM/RATE/AMOUNT).
+    No borders, no grid lines, no background shading, no header row. Terms/Dispatch/Transport
+    move here from the now-deleted COMMERCIAL TERMS section, so no data is lost."""
+    rows = [
+        ('Product', _esc(po.get('technical_name')), True),
+        ('Quantity', f'{_fmt_qty(qty)} {_esc(po.get("quantity_unit"))}', True),
+        ('Price', f'{_RS} {_inr(rate)}/{_esc(po.get("quantity_unit"))}', True),
+        ('GST', f'{gst_lbl}%', False),
+    ]
+    for label, key in (('Terms', 'terms'), ('Dispatch', 'dispatch'), ('Transport', 'transport')):
+        val = po.get(key)
+        if val:
+            rows.append((label, _esc(val), False))
+
+    colon_style = ParagraphStyle('bulk_od_colon', parent=st['ctval'], alignment=TA_CENTER)
+    data = []
+    for label, value, bold in rows:
+        val_html = f'<font name="{_BOLD}">{value}</font>' if bold else value
+        data.append([Paragraph(label, st['ctlabel']), Paragraph(':', colon_style),
+                     Paragraph(val_html, st['ctval'])])
+    tab = Table(data, colWidths=[3.6 * cm, 0.4 * cm, dw - 4.0 * cm])
+    tab.setStyle(TableStyle([
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('TOPPADDING', (0, 0), (-1, -1), 2.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    return tab
+
+
 def _note_flow(po, st, dw):
     """Highlighted note callout — empty list if there's no note."""
     note = po.get('note')
@@ -420,42 +476,26 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     flow.append(trow)
 
     # Vendor / Supplier — boxed so it reads as a distinct unit, separate from the
-    # salutation below.
+    # salutation below. BULK uses its own address treatment (_vendor_box_bulk) — each
+    # address line on its own line, GSTIN on its own final line — matching the reference
+    # PO; the shared _vendor_box (comma-joined address, inline GSTIN) is still used
+    # unchanged by JOB_WORK/GENERIC.
     flow += _section_label('VENDOR / SUPPLIER', st, dw)
-    flow.append(_vendor_box(po, st, dw))
+    flow.append(_vendor_box_bulk(po, st, dw))
 
-    # Salutation + body.
+    # Salutation + intro paragraph (reference-PO wording, adapted since Terms & Conditions
+    # are removed for BULK — see the include_terms note at the bottom of this function).
     flow.append(Spacer(1, 11))
     flow.append(Paragraph('Dear Sir / Madam,', st['bodyb']))
     po_no = _esc(po.get('po_no'))
-    body = (f'We are pleased to place the following order with you, on the terms set out below. Please '
-            f'<font name="{_BOLD}" color="#c8641e">acknowledge this order</font> and quote '
-            f'<font name="{_BOLD}" color="#c8641e">{po_no}</font> on every invoice, delivery challan, '
-            f'e-way bill and communication relating to this supply.')
+    body = (f'Please supply the under mentioned goods on the terms set out below. Please also quote '
+            f'this order reference <font name="{_BOLD}" color="#c8641e">{po_no}</font> in all your '
+            f'supply documents, invoices, delivery challans, e-way bills and future correspondence.')
     flow.append(Paragraph(body, st['bodyb']))
 
-    # Order details table.
+    # Order details — plain label : value list (reference-PO style), not a gridded table.
     flow += _section_label('ORDER DETAILS', st, dw)
-    head = [Paragraph('SL.', st['thc']), Paragraph('DESCRIPTION OF GOODS', st['th']),
-            Paragraph('QUANTITY', st['thc']), Paragraph('UOM', st['thc']),
-            Paragraph(f'RATE ({_RS})', st['thr']), Paragraph(f'AMOUNT ({_RS})', st['thr'])]
-    desc = Paragraph(_esc(po.get('technical_name')), st['prod'])
-    row = [Paragraph('1', st['cellc']), desc, Paragraph(_fmt_qty(qty), st['cellc']),
-           Paragraph(_esc(po.get('quantity_unit')), st['cellc']),
-           Paragraph(_inr(rate), st['cellr']), Paragraph(_inr(amount), st['cellr'])]
-    col = [1.15 * cm, dw - 1.15 * cm - 2.3 * cm - 1.3 * cm - 2.5 * cm - 2.9 * cm, 2.3 * cm, 1.3 * cm, 2.5 * cm, 2.9 * cm]
-    gtab = Table([head, row], colWidths=col)
-    gtab.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), _GREEN),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('VALIGN', (1, 1), (1, 1), 'TOP'),
-        # Column separators — lighter green in the header row, light gray in the data row.
-        ('LINEBEFORE', (1, 0), (5, 0), 0.7, _GREEN2),
-        ('LINEBEFORE', (1, 1), (5, 1), 0.7, _GRAYLABEL),
-        ('LINEBELOW', (0, 1), (-1, 1), 0.6, colors.HexColor('#dcdcdc')),
-        ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ('LEFTPADDING', (0, 0), (-1, -1), 5), ('RIGHTPADDING', (0, 0), (-1, -1), 5),
-    ]))
-    flow.append(gtab)
+    flow.append(_bulk_order_details_flow(po, st, dw, qty, rate, gst_lbl))
 
     # Totals: words (left) + taxable/gst/total (right).
     words_cell = [Paragraph('TOTAL ORDER VALUE IN WORDS', st['seclabel']), Spacer(1, 3),
@@ -484,10 +524,13 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     flow.append(Spacer(1, 4))
     flow.append(tot)
 
-    # Bill To / Ship To.
+    # Bill To Address / Ship To Address — labels match the reference PO
+    # ("BILL TO ADDRESS" / "SHIP TO ADDRESS", not the plain "BILL TO" / "SHIP TO" used
+    # by JOB_WORK/GENERIC); everything else about this bordered two-column table is
+    # unchanged. This is the reference PO's only bordered element, same as here.
     flow.append(Spacer(1, 3))
     bs = Table(
-        [[Paragraph('BILL TO', st['seclabel']), Paragraph('SHIP TO', st['seclabel'])],
+        [[Paragraph('BILL TO ADDRESS', st['seclabel']), Paragraph('SHIP TO ADDRESS', st['seclabel'])],
          [_addr_para(po, 'bill_to', st), _addr_para(po, 'ship_to', st)]],
         colWidths=[dw / 2, dw / 2])
     bs.setStyle(TableStyle([
@@ -498,32 +541,18 @@ def _render_bulk_po_pdf(po: dict) -> bytes:
     ]))
     flow.append(bs)
 
-    # Commercial terms.
-    flow += _section_label('COMMERCIAL TERMS', st, dw)
-    ct = [
-        ('Payment Terms', po.get('terms')),
-        ('Dispatch Schedule', po.get('dispatch')),
-        ('Mode of Transport', po.get('transport')),
-        ('Taxes', f'GST @ {gst_lbl}% extra as applicable; rate quoted is exclusive of GST'),
-    ]
-    ctd = [[Paragraph(lbl, st['ctlabel']), Paragraph(_esc(val) if val else '&mdash;', st['ctval'])] for lbl, val in ct]
-    ctab = Table(ctd, colWidths=[4.6 * cm, dw - 4.6 * cm])
-    ctab.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (0, -1), _GRAYLABEL), ('GRID', (0, 0), (-1, -1), 0.5, _RULE),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 2.5), ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-    ]))
-    flow.append(ctab)
+    # COMMERCIAL TERMS section deleted for BULK — Terms/Dispatch/Transport now live in
+    # the ORDER DETAILS list above; the "Taxes" line is dropped (the GST row in that
+    # list already covers it).
 
-    # Note band, then signature — both are "core" content that must stay on page 1
-    # alongside everything above. Terms & Conditions (below) is the section that may
-    # be pushed to a fresh page 2 if the core content doesn't leave room for it.
+    # Note band, then signature.
     flow += _note_flow(po, st, dw)
     flow += _signature_flow(po, st, dw)
 
-    terms_flow = _terms_flow(st, dw) if po.get('include_terms', True) else []
-    return _build_pdf(flow, terms_flow, f'Purchase Order {po.get("po_no", "")}')
+    # Terms & Conditions — intentionally OMITTED for BULK (the reference PO has none);
+    # po.get('include_terms') is ignored here on purpose. JOB_WORK/GENERIC still honor
+    # that flag via _terms_flow() unchanged.
+    return _build_pdf(flow, [], f'Purchase Order {po.get("po_no", "")}')
 
 
 # ── Job Work Purchase Order ────────────────────────────────────────────────────
