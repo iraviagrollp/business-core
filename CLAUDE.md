@@ -3017,6 +3017,58 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **BULK Purchase Order PDF — body restructured to follow a manually-written reference PO
+  layout, house chrome/styling unchanged (2026-08-08):** `lambda/procurement_api/po_pdf.py`'s
+  `_render_bulk_po_pdf` only — `_render_job_work_po_pdf`/`_render_generic_po_pdf`/`render_po_pdf`
+  untouched; `_TERMS`/`_terms_flow` untouched (still used by JOB_WORK/GENERIC).
+  - **VENDOR / SUPPLIER box:** new BULK-only `_vendor_box_bulk(po, st, dw)` helper (the shared
+    `_vendor_box` is used by JOB_WORK's "JOB WORKER" section and by GENERIC — verified before
+    editing, so it was left alone and this separate helper was added instead). Renders the
+    supplier name bold on its own line, then EACH address line (`supplier_address_line1`/
+    `_line2`/`_line3`) on its own line (not comma-joined, unlike `_vendor_box`), then
+    `GSTIN: <supplier_gstin>` on its own final line.
+  - **Intro paragraph rewritten** to the reference wording, adapted for BULK now having no
+    Terms & Conditions section: *"Please supply the under mentioned goods on the terms set out
+    below. Please also quote this order reference **{po_no}** in all your supply documents,
+    invoices, delivery challans, e-way bills and future correspondence."* — PO number still bold
+    orange, salutation kept gender-neutral ("Dear Sir / Madam,", not narrowed to "Dear Sir,").
+  - **ORDER DETAILS replaced**: the old 6-column gridded goods table (SL/DESCRIPTION/QUANTITY/
+    UOM/RATE/AMOUNT) is gone for BULK, replaced by a new `_bulk_order_details_flow` helper — a
+    plain label : value list, no borders/grid/shading/header row (label ~3.6cm, colon 0.4cm
+    centered, value = remainder). Rows: **Product** (bold), **Quantity** (bold, e.g.
+    `1,000.00 KGS`), **Price** (bold, e.g. `₹ 775.00/KGS`), **GST** (plain, `{rate}%`), then
+    **Terms** / **Dispatch** / **Transport** (plain, each skipped if empty) — these three moved
+    here from the deleted COMMERCIAL TERMS section, so no data is lost. Labels use the existing
+    `ctlabel` (green bold) style, values use `ctval`.
+  - **Totals block kept exactly as before** (tinted "TOTAL ORDER VALUE IN WORDS" cell + right-hand
+    Taxable Value / GST / green Total Order Value stack) — the reference PO has no totals, but the
+    client explicitly wants them retained; placed directly after the ORDER DETAILS list.
+  - **BILL TO / SHIP TO relabeled** `BILL TO ADDRESS` / `SHIP TO ADDRESS` (same bordered
+    two-column table, same `_addr_para`, otherwise unchanged — this is the reference's only
+    bordered element too). **COMMERCIAL TERMS section deleted entirely** for BULK (its
+    Payment Terms/Dispatch Schedule/Mode of Transport content now lives in ORDER DETAILS; the
+    "Taxes" line is dropped — the GST row already covers it).
+  - **Note band + signature block unchanged** (`_note_flow`/`_signature_flow`, shared helpers,
+    untouched).
+  - **Terms & Conditions removed for BULK** — `_build_pdf(flow, [], ...)` is now called
+    unconditionally; `po.get('include_terms')` is intentionally ignored on the BULK path (still
+    fully functional for JOB_WORK/GENERIC via `_terms_flow`, untouched).
+  - **Verified:** `python -m py_compile po_pdf.py handler.py` clean. Rendered a realistic BULK PO
+    (po_no `IAL/2627/30`, technical_name `DIAFENTHIURON 50% WP (in 25g solvable pouch)`, qty 1000
+    KGS @ ₹775, GST 18%, terms/dispatch/transport/note, full supplier/bill-to/ship-to addresses,
+    signatory) via `render_po_pdf` — 238,108 bytes, **1 page** (confirmed via `pypdf` page count),
+    text extraction confirmed the label list (Product/Quantity/Price/GST/Terms/Dispatch/
+    Transport), the totals block, `BILL TO ADDRESS`/`SHIP TO ADDRESS`, the note, and the
+    signatory name all present, and confirmed `TERMS & CONDITIONS`/`COMMERCIAL TERMS`/the T&C
+    clause text are ABSENT. Also rendered a 2-item JOB_WORK PO (240,272 bytes, 2 pages — item
+    grid + terms page, unchanged from before) and a 2-column/2-row GENERIC PO (217,554 bytes, 2
+    pages — table + terms page, unchanged from before) to prove no regression on the two
+    untouched PO types. Throwaway test script + `__pycache__` written under
+    `lambda/procurement_api/` (this agent's sandbox cannot reach the scratchpad — fenced to
+    `business-core` only) and deleted after use.
+  - **No IaC/DB/UI change needed** — same route (`POST`/`GET /purchase-orders/{id}/pdf`), same
+    `po` dict shape read from `_PO_SELECT` (no new fields consumed), presentation-only.
+
 - [x] **Issued PDC PDF (`GET /pdc/pdf`) — grouped month-wise by `pdc_date` (2026-08-08):**
   `lambda/api/issued_pdc_pdf.py`'s `render_issued_pdc_pdf` no longer renders one flat table — the
   body is now a sequence of month sections, in chronological ASCENDING order of `pdc_date`, each
