@@ -3017,6 +3017,416 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 
 ## What Is Built
 
+- [x] **JOB_WORK Purchase Order PDF — three follow-up fixes: TOTAL label, totals-box
+  verification, one-page reached (2026-08-08, same day as the two entries below):**
+  `lambda/procurement_api/po_pdf.py`, `_render_job_work_po_pdf` (+ two small shared-helper
+  parameterisations) only — BULK/GENERIC untouched. This is a direct follow-up to the "one-page
+  density follow-up + orphan-page check" entry below, which had stopped short of one page and
+  left a ~62pt residual gap. Every claim here was verified against an actual PyMuPDF rasterization
+  (and, for the totals-box question, a vector-drawing/`TableStyle`-diff check), not by reading
+  code.
+  1. **Totals-box `BOX` — verified ALREADY CORRECT, no code change made.** The task description
+     said JOB_WORK's Taxable Value/GST/Total Order Value table was missing the `BOX(0.5,_RULE)`
+     border BULK has. Checked the actual `TableStyle` on JOB_WORK's `right` table and it was
+     already byte-for-byte identical to BULK's (`BOX` present, same `LINEBELOW` hairlines, same
+     4/8pt row/column padding) — confirmed both by a source-level diff of the two code blocks and,
+     independently, by rasterizing the render and inspecting `page.get_drawings()`: JOB_WORK's
+     totals table produces the identical 4-sided box-line pattern (same coordinates pattern,
+     same `0.5pt`/`#c9c9c9` stroke) as BULK's, at both the freshly-rendered PDF and the
+     already-shipped `IAL_JOBWORK_sample_NEW.pdf`. The outer `tot` wrapper's right-cell padding
+     (`RIGHTPADDING=0`, `TOPPADDING`/`BOTTOMPADDING=2`) was also already identical to BULK's. No
+     edit was made for this item — adding a second `BOX` command would have been a no-op at best.
+     Zoomed crops of both BULK's and JOB_WORK's totals panels look visually equivalent (thin pale
+     `#c9c9c9` border around both) — the border was always there, just easy to miss on-screen at
+     normal zoom given how pale `_RULE` is.
+  2. **TOTAL row now actually prints "TOTAL" — fixed.** Confirmed via `pypdf` text extraction on
+     the pre-fix render that the row after the 3 line items showed only the bare amount
+     (`6,37,500.00`) with no label — exactly as the task described. Root cause confirmed: the
+     `SPAN (0, idx) -> (3, idx)` on the total row means reportlab renders ONLY cell index 0's
+     content; the `'TOTAL'` `Paragraph` was sitting in cell index 1, which is discarded once
+     spanned. Fix: moved the label into cell 0 (`total_row = [Paragraph('TOTAL',
+     total_label_style), '', '', '', Paragraph(_inr(amount), st['cellr'])]`), with a new
+     right-aligned bold `ParagraphStyle('jw_total_label', parent=st['bodyb'],
+     alignment=TA_RIGHT)` so the word sits flush against the amount column rather than at the far
+     left of the 4-column span. Re-rendered and confirmed "TOTAL" now visibly renders,
+     right-aligned, immediately left of the amount.
+  3. **3-item JOB_WORK PO now fits on ONE page** (was 2 — Note + signature stranded alone on
+     page 2). The prior pass's own measurement said it needed ~62pt more than its reclaimable-
+     space list could free; this pass got there via a bigger structural change plus a second
+     round of the same style of small trims, all still avoiding the 4 explicitly fenced items
+     (vendor box padding 7/11 + address leading 11.5; `Spacer(1,16)` before the salutation;
+     `Spacer(1,8)` between salutation and intro; the regular-weight `intro` style and heading
+     centering):
+     - **Dropped the separate PRODUCT section (heading + its own tinted box) and folded the
+       product line into the JOB WORKER box instead** — by far the biggest single lever
+       (~45-50pt). `_vendor_box_stacked(po, st, dw, extra_flow=None)` gained an `extra_flow`
+       param (a list of extra flowables appended inside the SAME bordered/tinted box, after the
+       address block); default `None` means BULK/GENERIC (which never pass it) render
+       byte-identically to before — confirmed via unchanged output byte counts (238,087 /
+       216,294 bytes, exactly matching the pre-this-task baseline). JOB_WORK now passes a thin
+       `HRFlowable` rule + one compact `Product: {name} — Brand: {x} — Quantity: {qty} {unit}`
+       line as `extra_flow`, so the "JOB WORKER" box now shows the job worker's identity AND the
+       product summary in one panel instead of two.
+     - `_signature_flow(po, st, dw, sig_gap=20)` gained a `sig_gap` param (default `20`, the
+       original value — BULK/GENERIC's calls are unparameterised and therefore byte-identical);
+       JOB_WORK calls it with `sig_gap=13` (within the task's suggested 12–14pt range).
+     - JOB WORKER heading tightened to match ORDER DETAILS/COMMERCIAL TERMS's already-tightened
+       treatment (`0.4cm/5.5` → `0.28cm/4`); ORDER DETAILS and COMMERCIAL TERMS headings'
+       `space_after` also tightened `5.5` → `4` (round 1 had explicitly left `space_after` alone
+       per its own narrower scope; that scope is lifted for this pass).
+     - Item-grid row `TOPPADDING`/`BOTTOMPADDING` `3` → `2.5`; COMMERCIAL TERMS `row_padding`
+       `3.5` → `3`; the JOB_WORK-only "TO BE BILLED ON/DELIVERED AT" table's row padding `3` →
+       `2.5` and header-row padding `6` → `5` (this table is JOB_WORK's own, not shared with
+       BULK, so untouched by BULK's identical-looking table); the JOB WORKER box's internal
+       separator-rule `spaceBefore`/`spaceAfter` `5/4` → `3/3`; `Spacer` before the totals block
+       `6` → `4`; `Spacer` before TO BE BILLED ON `6` → `4`.
+     - Measured the actual remaining page-1 room at each step via `page.get_drawings()`
+       (**note:** PyMuPDF's drawing coordinates are TOP-DOWN/image-space, not raw bottom-up PDF
+       space — got this backwards on the first pass and had to redo the arithmetic) rather than
+       guessing: before the PRODUCT-merge, ~74pt were free after the Note vs. ~86pt needed for
+       the signature block at `sig_gap=13`; after the PRODUCT merge alone, room grew to ~95pt
+       (already enough on paper), but the render still needed a second page — evidence that a
+       Frame's default internal padding (~6pt) and/or `KeepTogether`'s own fit-check leaves less
+       slack than the raw "gap between drawings" arithmetic suggests. The additional small trims
+       above were applied to build in real margin rather than sit exactly on the boundary; the
+       3-item sample now renders at **1 page**, with a comfortable, clearly non-cramped band of
+       whitespace still visible between the Note and the footer rule.
+  - **Verified, all via actual renders (PyMuPDF rasterization, not code-reading):**
+    `python -m py_compile po_pdf.py` clean. Re-rendered all three types with the same payloads as
+    the prior sessions: **BULK — 1 page, 238,087 bytes (byte-identical to before this task, i.e.
+    truly untouched)**; **GENERIC — 1 page, 216,294 bytes (byte-identical, untouched)**;
+    **JOB_WORK (3 items) — 1 page** (was 2), visually inspected — the JOB WORKER box now reads
+    JOB WORKER identity + a horizontal rule + the Product/Brand/Quantity line as one coherent
+    panel, "TOTAL" is visible on the item-grid total row, the totals box border is present and
+    reads the same as BULK's, and nothing on the page reads as cramped (row spacing, heading
+    gaps, and the vendor box are all still comfortably legible — the density trims were all
+    sub-2pt-per-row adjustments, not a wholesale squeeze). **JOB_WORK stress case (12 items) —
+    2 pages**, as expected for a genuinely larger item count: page 1 is naturally filled by the
+    12-row grid + totals + address table + COMMERCIAL TERMS (not cramped, not artificially
+    truncated); page 2 holds Taxes/Note/"Thanking you,"/signature block together — a normally
+    populated second page, not an orphaned near-blank one.
+  - **Sample PDFs — could NOT overwrite any of the three canonical files in
+    `business-core/scratch/` this session; all were OS-locked (`PermissionError`/`WinError 32`)
+    on every write attempt, including after multiple retries with backoff** (`IAL_BULK_sample.pdf`,
+    `IAL_JOBWORK_sample.pdf`, and `IAL_GENERIC_sample.pdf` all failed — this is a wider lock than
+    previously flagged: earlier sessions had found `IAL_BULK_sample.pdf` writable and only the
+    other two locked, but this session found ALL THREE locked, presumably because more of the
+    sample PDFs are now open in a viewer). Verified render byte counts instead (reported above).
+    **No `*_NEW.pdf` files were deleted** — per the task's own instruction, only `_NEW` files that
+    are "successfully superseded" should be deleted, and since none of the three canonical writes
+    succeeded this session, the existing `IAL_JOBWORK_sample_NEW.pdf` /
+    `IAL_GENERIC_sample_NEW.pdf` / `IAL_2627_1_sample.pdf` / `IAL_2627_1_sample_NEW.pdf` were left
+    untouched (note: these `_NEW` files are themselves now STALE relative to this session's code
+    changes — they predate the TOTAL-label fix and the one-page density work above). **Follow-up
+    needed:** once whatever process holds these files closes them, this render should be redone
+    and the three canonical filenames overwritten for real — flagged for the orchestrator/user.
+  - No IaC/DB/UI change needed — same route (`POST`/`GET /purchase-orders/{id}/pdf`), same `po`
+    dict shape, presentation-only.
+
+- [x] **JOB_WORK Purchase Order PDF — one-page density follow-up + orphan-page check
+  (2026-08-08, same day as the PO PDF family restyle above):**
+  `lambda/procurement_api/po_pdf.py`, `_render_job_work_po_pdf` only — BULK/GENERIC untouched.
+  A 3-item JOB_WORK sample was rendering 2 pages, with only the Note + signature block
+  spilling onto an otherwise near-empty page 2. Applied every reclaimable-space lever the task
+  listed, all the way to its suggested tightened value:
+  - `_label_value_flow(pairs, st, dw, row_padding=5)` gained an optional `row_padding` param
+    (default `5`, so BULK's own call — which never passes it — is byte-for-byte unaffected);
+    JOB_WORK's COMMERCIAL TERMS call now passes `row_padding=3.5` (was a shared hardcoded `5`).
+  - PRODUCT tinted box padding `TOPPADDING`/`BOTTOMPADDING` 4→3; PRODUCT heading
+    `space_before` 0.4cm→0.28cm, `space_after` 5.5→4.
+  - ORDER DETAILS heading `space_before` 0.4cm→0.28cm (space_after left at 5.5, per the task's
+    list — only `space_before` was in scope for this heading).
+  - Item-grid row `TOPPADDING`/`BOTTOMPADDING` 4→3.
+  - `Spacer` before the totals block 10→6; `Spacer` before TO BE BILLED ON/DELIVERED AT 10→6.
+  - COMMERCIAL TERMS heading `space_before` 0.4cm→0.28cm (space_after left at 5.5); its
+    label:value row padding 5→3.5 (via the new `row_padding` param above).
+  - None of the explicitly off-limits gaps were touched (vendor box padding/leading,
+    `Spacer(1,16)` before the salutation, `Spacer(1,8)` between salutation and intro, the
+    regular-weight intro style, heading centering) — confirmed by re-reading the diff before
+    verifying.
+  - **Result: still 2 pages, not 1.** Measured the exact shortfall with a `KeepTogether.split`
+    trace (temp script, deleted after use): the signature block (already `KeepTogether`-wrapped
+    inside `_signature_flow`, unchanged/shared) needs ~97pt and only ~35pt remains on page 1
+    after the Note — a ~62pt deficit. The full reclaimable-space list above recovers only
+    ~44-55pt total (verified by the same before/after measurement), nowhere near enough to
+    close a 62pt gap. Every item on the task's list was pushed to its stated tightened value
+    (item-grid row padding stopped at 3 as instructed, COMMERCIAL TERMS row padding stopped at
+    3.5, spacers stopped at 6, headings stopped at 0.28cm) — going further would mean either
+    touching the explicitly off-limits gaps or the shared `_note_flow`/`_signature_flow`/
+    totals-table/TO-BE-BILLED-ON-table code paths (all shared with BULK/GENERIC, out of scope
+    for this task). Per the task's own instruction ("stop and report what's left rather than
+    gutting the spacing"), no further tightening was applied — reporting the ~62pt residual gap
+    here rather than over-compressing.
+  - **Overflow-graceful check (verified with real renders, not reasoned about):** considered
+    wrapping Note+Signature in one outer `KeepTogether` at the JOB_WORK call site so the
+    signature could never strand alone on a near-empty trailing page. Tried it, then verified
+    against BOTH a 3-item and a 12-item render: for the 12-item high-item-count stress case,
+    the ORIGINAL independent-append behavior (unchanged from before this task) already lands
+    TO BE BILLED ON/DELIVERED AT + COMMERCIAL TERMS + Note + the full signature block together
+    on page 2 (2 pages total, no orphan — confirmed both via `pypdf` text extraction and a
+    PyMuPDF-rasterized visual check of page 2, which shows a normally-populated second page).
+    Pairing Note+Signature made this WORSE: the larger combined block no longer fit in the room
+    left after COMMERCIAL TERMS either, forcing an unnecessary 3rd page. **The pairing change
+    was reverted** — `_note_flow`/`_signature_flow` are appended independently in
+    `_render_job_work_po_pdf`, exactly as before this task and exactly as BULK/GENERIC do. Net
+    conclusion, per the task's own offered fallback: reportlab's existing handling is already
+    acceptable for the case that matters (many items genuinely not fitting on one page); the
+    residual imperfection is scoped to the near-miss 3-item case only, where page 2 does show
+    just the signature block on an otherwise blank page — an accepted, reported side effect of
+    not fully reaching 1 page for that specific input, not a regression for larger POs.
+  - **Verification:** `python -m py_compile po_pdf.py` clean. Re-rendered
+    `business-core/scratch/IAL_JOBWORK_sample.pdf` with the same 3-item payload as the prior
+    session (po_no `IAL/2627/JW1`, DHANA CROP SCIENCES LIMITED, ACEPHATE 75% SP / DHANASHREE,
+    3 items at 250 GMS POUCH / 500 GMS POUCH / 1 KG BOX, rates 260/255/245, GST 18%,
+    terms/dispatch/transport/note, full addresses, signatory K. Ravi Kumar) — **2 pages**
+    (target was 1, not reached — see the shortfall above), page 2 contains only the signature
+    block. Rendered a 12-item stress case (same header/vendor, 12 synthetic line items cycling
+    through 6 packaging sizes) — **2 pages**, page 2 confirmed (via `pypdf` text extraction and
+    a PyMuPDF rasterization) to contain TO BE BILLED ON/DELIVERED AT, COMMERCIAL TERMS, the
+    Note, and the full signature block — a normally-populated second page, no orphan.
+    Re-rendered BULK (same reference payload as the prior session — po_no `IAL/2627/1`, DHANA
+    CROP SCIENCES LIMITED, ACEPHATE 75% SP, 2500 KGS @ ₹250, GST 18%) — **1 page**, unchanged
+    (`_label_value_flow`'s new `row_padding` param defaults to the original `5`, so BULK's own
+    call site is untouched). Re-rendered GENERIC (subject + body + a 4-column/2-row
+    configurable table) — **1 page**, unchanged (GENERIC's own code paths were not touched by
+    this task at all). Rasterized page 1 of the JOB_WORK sample with PyMuPDF and visually
+    confirmed: the vendor box → PRODUCT box → salutation → intro → ORDER DETAILS region reads
+    cleanly, nothing looks cramped; the item grid, the Taxable/GST/Total box, and the TO BE
+    BILLED ON/DELIVERED AT address table all still look clean and properly enclosed.
+  - **Known limitation — could not overwrite the tracked sample files on disk:**
+    `business-core/scratch/IAL_JOBWORK_sample.pdf` and `IAL_GENERIC_sample.pdf` are both
+    currently locked by a running process on this machine (same class of issue previously
+    flagged for `IAL_2627_1_sample.pdf` — `PermissionError`/`WinError 32` on every write
+    attempt, including after retries). This agent did not attempt to close whatever holds them
+    open — outside this task's scope. The freshly-rendered, verified PDFs were instead written
+    to `business-core/scratch/IAL_JOBWORK_sample_NEW.pdf` and
+    `business-core/scratch/IAL_GENERIC_sample_NEW.pdf` (GENERIC's content is unchanged from the
+    existing locked file — re-rendered only to confirm no regression, not because its code
+    changed). `IAL_BULK_sample.pdf` overwrote cleanly (not locked). **Follow-up needed:** once
+    these files are closed by whatever process holds them, replace `IAL_JOBWORK_sample.pdf` /
+    `IAL_GENERIC_sample.pdf` with their `_NEW` counterparts — flagged for the
+    orchestrator/user rather than silently left unresolved.
+  - No IaC/DB/UI change needed — same route (`POST`/`GET /purchase-orders/{id}/pdf`), same `po`
+    dict shape, presentation-only.
+
+- [x] **PO PDF family — JOB_WORK and GENERIC restyled to match the approved BULK design
+  language; shared helpers generalised, BULK unchanged (2026-08-08):**
+  `lambda/procurement_api/po_pdf.py`. All three PO types now read as one visual family
+  (same centered section headings, same vendor box, same borderless label:value list
+  pattern, same salutation rhythm/intro weight, same BILL TO ADDRESS/SHIP TO ADDRESS
+  treatment) while BULK's own rendered output is provably unchanged.
+  - **Shared helpers.** `_vendor_box_bulk` renamed `_vendor_box_stacked` and is now the one
+    true vendor/supplier box for all three PO types (name bold on its own line, each address
+    line on its own line, `GSTIN:` on its own final line, padding 7/11, leading 11.5). The old
+    comma-joined/inline-GSTIN `_vendor_box` helper had no remaining callers once JOB_WORK's
+    "JOB WORKER" and GENERIC's "VENDOR / SUPPLIER" sections switched to the shared helper —
+    **deleted**. `_bulk_order_details_flow`'s table-building was generalised into a new
+    `_label_value_flow(pairs, st, dw)` (borderless, no shading, fixed-width label column,
+    centered colon column, values left) — `_bulk_order_details_flow` is now a thin wrapper
+    around it and BULK's ORDER DETAILS renders byte-identically; JOB_WORK's COMMERCIAL TERMS
+    now also renders through `_label_value_flow`. Every `_section_label` call in JOB_WORK
+    (JOB WORKER, PRODUCT, ORDER DETAILS, COMMERCIAL TERMS) and GENERIC (VENDOR / SUPPLIER,
+    ORDER DETAILS) switched to `align='center', space_before=0.4*cm, space_after=5.5` (the
+    BULK treatment); `_section_label`'s left-aligned/tight-spacing defaults are no longer
+    reached by any live caller (kept, not removed, per the "dead code" note below). The
+    `'bulkintro'` style was renamed `'intro'` (no longer BULK-only) and BULK's own usage
+    updated to match — regular-weight body text, only the PO number span stays bold/orange.
+  - **JOB_WORK changes:** vendor box → `_vendor_box_stacked`; salutation rhythm matches BULK
+    (`Spacer(1,16)` before "Dear Sir / Madam,", `Spacer(1,8)` before the intro paragraph);
+    intro paragraph switched to the `intro` style with only the PO number bold-orange
+    (dropped the bold-orange "acknowledge this order" treatment), wording unchanged; the
+    item grid (SL./PARTICULARS/QUANTITY/RATE/AMOUNT) stays a table, row
+    TOPPADDING/BOTTOMPADDING raised 2→4; totals block now matches BULK exactly
+    (`Spacer(1,10)` before it, `BOX(0.5,_RULE)` around the right-hand Taxable/GST/Total
+    table, right-cell top/bottom padding 2 with right padding 0, same left-panel/row
+    paddings); "TO BE BILLED ON"/"DELIVERED AT" keep their own labels but gained BULK's
+    treatment (`seclabelc` centered headings, header-row padding 6, a `LINEBELOW` under the
+    header row, address-row padding 3, `Spacer(1,10)` before the table); COMMERCIAL TERMS
+    is now a borderless `label : value` list via `_label_value_flow` (Payment Terms,
+    Dispatch Schedule, Mode of Transport, Taxes — same text as before, em-dash fallback for
+    empty values kept) replacing the old grey-shaded bordered grid; Terms & Conditions
+    dropped — `_build_pdf(flow, [], ...)` unconditionally, `po.get('include_terms')`
+    intentionally ignored (commented in code).
+  - **GENERIC changes:** vendor box → `_vendor_box_stacked`; salutation `Dear Sir,` →
+    `Dear Sir / Madam,`; same `Spacer(1,16)`/`Spacer(1,8)` rhythm around the salutation, with
+    the optional bold `Subject:` line kept above it (comparable `Spacer(1,8)` before, sharing
+    the mandatory pre-salutation `Spacer(1,16)` as its own trailing space); intro paragraph
+    switched to the `intro` style, only the PO number bold-orange (dropped bold-orange
+    "acknowledge this order"), configurable `generic_config.body` text + acknowledgment
+    sentence unchanged otherwise; configurable table stays a table with its full `GRID`, row
+    padding raised 3→4.5; `BILL TO`/`SHIP TO` → `BILL TO ADDRESS`/`SHIP TO ADDRESS` with
+    BULK's exact treatment (centered `seclabelc`, header padding 6, `LINEBELOW`, address
+    padding 3, `Spacer(1,10)` before); Terms & Conditions dropped the same way as JOB_WORK.
+  - **Dead code:** `_TERMS`/`_terms_flow` are kept defined (now genuinely unused — no PO
+    type renders Terms & Conditions any more) with an explanatory comment; `_section_label`'s
+    left-aligned/tight-spacing defaults are likewise kept (only reachable via the now-dead
+    `_terms_flow` call) rather than removed, so the section can be reinstated without
+    re-authoring anything.
+  - **Samples rendered to `business-core/scratch/` (kept):** `IAL_BULK_sample.pdf` (the exact
+    reference payload from the previous task — `IAL/2627/1`, DHANA CROP SCIENCES LIMITED,
+    ACEPHATE 75% SP, 2500 KGS @ ₹250, GST 18%) — **1 page**, confirmed via `pypdf` text
+    extraction that Taxable Value 6,25,000.00 / GST @ 18% 1,12,500.00 / Total Order Value
+    ₹7,37,500.00 all still read correctly, proving the shared-helper refactor didn't regress
+    BULK. `IAL_JOBWORK_sample.pdf` (`IAL/2627/JW1`, 3 realistic items at 250g/500g/1kg pack
+    sizes and different rates) — **2 pages**: page 1 holds everything through COMMERCIAL
+    TERMS; only the Note + signature block spill to page 2 (mostly blank). This is a direct,
+    expected consequence of literally applying BULK's more generous vertical rhythm four
+    times over (centered headings with `space_before`/`space_after` roughly 3-4× the old
+    JOB_WORK defaults) plus the COMMERCIAL TERMS list's row padding tripling (1.5→5) versus
+    the old tight bordered grid — the task explicitly asked not to silently tighten these
+    gaps back down to force a single page, so this was left as rendered and is reported here
+    rather than glossed over. `IAL_GENERIC_sample.pdf` (`IAL/2627/G1`, subject + body +
+    4-column/4-row configurable table) — **1 page**.
+  - **Visual review (PyMuPDF rasterization, all pages):** all three documents read as one
+    family — identical letterhead/title banner/PO box, identical centered green section
+    headings, identical tinted vendor box, identical borderless label:value list styling
+    (BULK's ORDER DETAILS and JOB_WORK's COMMERCIAL TERMS look the same), identical BILL TO
+    ADDRESS/SHIP TO ADDRESS treatment, identical Note/signature block. No clipping or
+    overflow on any page; BULK's and JOB_WORK's totals boxes are both fully enclosed
+    (`BOX` border visible around the Taxable/GST/Total table). Nothing looked visually wrong
+    beyond the expected JOB_WORK page-2 spillover noted above.
+  - **Verification:** `python -m py_compile po_pdf.py handler.py` clean (the now-unused
+    `PageBreak` import was also removed). Throwaway render/verify/rasterize scripts and
+    `__pycache__` were written directly under `lambda/procurement_api/` (this agent's
+    sandbox cannot write to the scratchpad — fenced to `business-core` only), run, then
+    deleted — confirmed via a final directory listing that only the 6 real deliverable files
+    remain (`po_pdf.py`, `handler.py`, `auth.py`, `requirements.txt`, `DejaVuSans.ttf`,
+    `ial-logo.png`).
+  - **Known limitation carried over (not touched by this task):**
+    `business-core/scratch/IAL_2627_1_sample.pdf` and `IAL_2627_1_sample_NEW.pdf` (from the
+    previous task) are still locked by a running process (Acrobat, per the prior entry below)
+    — both delete attempts failed with `PermissionError`/`WinError 32` and were left in
+    place, same as previously flagged.
+  - No IaC/DB/UI change needed — same routes (`POST`/`GET /purchase-orders/{id}/pdf`), same
+    `po` dict shapes, presentation-only.
+
+- [x] **BULK Purchase Order PDF — totals block: outer border added to the right-hand
+  Taxable/GST/Total table (2026-08-08):** `lambda/procurement_api/po_pdf.py`'s
+  `_render_bulk_po_pdf` only — `_render_job_work_po_pdf`/`_render_generic_po_pdf`/`render_po_pdf`
+  untouched (their own `right`/`tot` totals tables are separate local variables built inline in
+  each renderer, not shared code, so they are unaffected). The totals area is a two-cell row: left
+  = the tinted `TOTAL ORDER VALUE IN WORDS` panel (already had its own `BOX`), right = the `right`
+  Table (Taxable Value / GST @ x% / green Total Order Value). The right table previously had NO
+  outer border — only `LINEBELOW` hairlines between rows — so it read as unenclosed next to the
+  boxed left panel.
+  - Added `('BOX', (0, 0), (-1, -1), 0.5, _RULE)` to `right`'s `TableStyle`, alongside the existing
+    `LINEBELOW` hairlines (kept, unchanged) and the green `_GREEN` background + white bold text on
+    the Total Order Value row (kept, unchanged).
+  - The outer `tot` wrapper table's right cell (`(1, 0)`) had `RIGHTPADDING`/`TOPPADDING`/
+    `BOTTOMPADDING` all `0` — with the new border, `RIGHTPADDING` was deliberately LEFT at `0` (not
+    bumped) so the box's right edge stays flush with the content area's right edge, matching the
+    BILL TO/SHIP TO table and the PO title row above, which all span the full `dw` content width —
+    confirmed by a rendered crop showing the two right edges aligned pixel-for-pixel.
+    `TOPPADDING`/`BOTTOMPADDING` on that cell were bumped `0 → 2` so the new box isn't drawn
+    perfectly flush against the row's top/bottom with zero breathing room.
+  - Top-edge check (per the task's explicit ask): the left tinted panel's own `BOX` wraps its
+    outer cell INCLUDING that cell's 5pt `TOPPADDING`, so its border top = the row's top edge. The
+    right box's border top now sits ~2pt below the row's top edge (from the padding bump above) —
+    a small, visually negligible offset confirmed via a zoomed crop (the two box tops read as
+    aligned at normal reading size; not pixel-identical, noted here rather than chasing exact
+    parity by zeroing the padding back out, which would reintroduce the "flush/touching" look the
+    task asked to avoid).
+  - **Verified visually, not just by reasoning** — rendered the client's reference payload (po_no
+    `IAL/2627/1`, DHANA CROP SCIENCES LIMITED, ACEPHATE 75% SP, 2500 KGS @ ₹250, GST 18%, amount
+    625000 / gst_amount 112500 / total_value 737500, same bill_to/ship_to/note/signatory shape as
+    the prior sample) via `render_po_pdf`, rasterized the page (PyMuPDF) and inspected: the totals
+    row now reads as two enclosed panels side by side (tinted box left, ruled+bordered table
+    right); the right box's right edge lines up exactly with the BILL TO/SHIP TO table's right edge
+    below it; the box is not clipped and does not touch the physical page margin (comfortable
+    whitespace beyond the border). `python -m py_compile po_pdf.py` clean. **1 page**, totals still
+    read Taxable Value 6,25,000.00 / GST @ 18% 1,12,500.00 / Total Order Value ₹7,37,500.00
+    (confirmed via `pypdf` text extraction). Re-rendered JOB_WORK (2 items, 2 pages) and GENERIC
+    (2 columns/2 rows, 2 pages) — both unchanged page counts, no regression (their totals tables are
+    untouched, separate code paths).
+  - **Known limitation — could not overwrite the tracked sample file on disk:**
+    `business-core/scratch/IAL_2627_1_sample.pdf` is currently open in a running Adobe Acrobat
+    process on this machine (confirmed via `tasklist` — `Acrobat.exe` + several `AcroCEF.exe`
+    helpers), which holds an OS-level write lock on that exact file (`PermissionError` on every
+    open-for-write attempt, including after multiple waits/retries over ~90 seconds). This agent
+    did not attempt to close Acrobat — killing another running application is outside this task's
+    scope and could disrupt other work on the machine. The freshly-rendered, verified PDF (same
+    payload, with the new box) was instead written to
+    `business-core/scratch/IAL_2627_1_sample_NEW.pdf` in the same directory. **Follow-up needed:**
+    once the PDF is closed in Acrobat, replace `IAL_2627_1_sample.pdf` with
+    `IAL_2627_1_sample_NEW.pdf` (identical content, just a different filename) — flagged for the
+    orchestrator/user rather than silently left unresolved.
+  - No IaC/DB/UI change needed — same route (`POST`/`GET /purchase-orders/{id}/pdf`), same `po`
+    dict shape, presentation-only.
+
+- [x] **BULK Purchase Order PDF — vertical-rhythm / centered-heading follow-up fix
+  (2026-08-08, same day as the layout restructure below):** the user reported the VENDOR/SUPPLIER
+  box → "Dear Sir / Madam," + intro paragraph → ORDER DETAILS region as "clumsy… all these three
+  look to be clamped". `lambda/procurement_api/po_pdf.py`, BULK path only
+  (`_render_bulk_po_pdf`/`_vendor_box_bulk`/`_bulk_order_details_flow`) — `_render_job_work_po_pdf`/
+  `_render_generic_po_pdf`/`render_po_pdf` untouched.
+  - `_section_label(text, st, width, align='left', space_before=0.11*cm, space_after=2.5)` gained
+    three new keyword params, all defaulted to the exact previous hardcoded values — every existing
+    call site (JOB_WORK, GENERIC, the shared `_terms_flow`) is byte-identical. New `seclabelc` style
+    added to `_styles()` (green bold uppercase, `TA_CENTER`) — the existing `seclabel` key is
+    untouched. BULK's `VENDOR / SUPPLIER` and `ORDER DETAILS` calls now pass
+    `align='center', space_before=0.4*cm, space_after=5.5`.
+  - `BILL TO ADDRESS` / `SHIP TO ADDRESS` headings (rendered inside the two-column bordered table,
+    not via `_section_label`) now use the new `seclabelc` style (centered); the header row's own
+    `TOPPADDING`/`BOTTOMPADDING` bumped to 6 (address row stays at 3) plus a `LINEBELOW` (0.5,
+    `_RULE`) under the header row — addresses stay left-aligned. (TableStyle command ordering
+    matters here — the row-0 override is applied AFTER the blanket per-cell padding rule, not
+    before, so it isn't clobbered.)
+  - Vendor box (`_vendor_box_bulk`): `TOPPADDING`/`BOTTOMPADDING` 4→7, `LEFTPADDING`/`RIGHTPADDING`
+    9→11; the stacked address/GSTIN lines now use a local `ParagraphStyle('bulk_vendor_addr',
+    parent=st['body'], leading=11.5)` (was the shared `body` style's ~11.1 leading) — local only,
+    doesn't touch the shared `body` style used elsewhere. `Spacer` before the salutation 11→16pt.
+  - New `Spacer(1, 4)` inserted between "Dear Sir / Madam," and the intro paragraph — **superseded
+    same day, see the "salutation/intro-paragraph weight follow-up" entry below (raised to 8pt, and
+    the intro paragraph itself switched off `bodyb`).**
+  - `_bulk_order_details_flow`'s row `TOPPADDING`/`BOTTOMPADDING` 2.5→5 (label/colon/value column
+    alignment unchanged — labels left, colon centered, values left, one clean vertical column of
+    colons).
+  - `Spacer` before the totals block 4→10pt; `Spacer` before the BILL TO/SHIP TO table 3→10pt.
+  - **One page confirmed** — no gaps needed tightening elsewhere; the note/signature blocks were
+    left untouched.
+  - Verified: `python -m py_compile po_pdf.py handler.py` clean. Rendered the client's exact
+    reference payload (po_no `IAL/2627/1`, DHANA CROP SCIENCES LIMITED, ACEPHATE 75% SP 2500 KGS
+    @ ₹250, GST 18%) via `render_po_pdf` — **1 page**, 238,116 bytes, written to
+    `business-core/scratch/IAL_2627_1_sample.pdf` (kept on disk per the user's request; `scratch/`
+    added to `.gitignore`). `pypdf` text extraction confirmed the label list (Product/Quantity/
+    Price/GST/Terms/Dispatch/Transport), `BILL TO ADDRESS`/`SHIP TO ADDRESS`, and the exact expected
+    figures (Taxable Value 6,25,000.00 · GST @ 18% 1,12,500.00 · Total ₹7,37,500.00 · "Indian
+    Rupees Seven Lakh Thirty Seven Thousand Five Hundred Only.") all present. Re-rendered a 2-item
+    JOB_WORK PO (240,309 bytes, 2 pages — unchanged from before) and a 2-column/2-row GENERIC PO
+    (217,888 bytes, 2 pages — unchanged from before) to prove no regression; a direct style-object
+    check confirmed `st['seclabel'].alignment == TA_LEFT` is still true (the shared default was
+    preserved) while the new `st['seclabelc']` is centered. Throwaway test scripts + `__pycache__`
+    written under `lambda/procurement_api/` (this agent's sandbox cannot reach the scratchpad —
+    fenced to `business-core` only) and deleted after use.
+  - No IaC/DB/UI change needed — same route, same `po` dict shape, presentation-only.
+
+- [x] **BULK Purchase Order PDF — salutation/intro-paragraph weight follow-up fix
+  (2026-08-08, same day as the two entries above):** a visual review of the rendered sample found
+  two remaining problems in the "clamped" region. `lambda/procurement_api/po_pdf.py`, BULK path
+  only (`_render_bulk_po_pdf` + `_styles()`) — `_render_job_work_po_pdf`/`_render_generic_po_pdf`/
+  `render_po_pdf`/the shared `_section_label` defaults untouched.
+  1. **Salutation → intro paragraph gap widened.** `Spacer(1, 4)` (visibly smaller than every
+     neighbouring gap in that region) → `Spacer(1, 8)`.
+  2. **Intro paragraph de-bolded.** The paragraph was rendered entirely in `st['bodyb']` (bold,
+     9.4pt) — the heaviest text block on the page. New style key `bulkintro` added to `_styles()`
+     (regular `_BASE` weight, 9.2pt, leading 12.5, `_BODY` color) — the existing `bodyb` key is
+     untouched (still used by `Dear Sir / Madam,` on this same path, and unchanged for JOB_WORK/
+     GENERIC's own intro paragraphs). The intro `Paragraph(...)` call switched from `st['bodyb']`
+     to `st['bulkintro']`; the PO-number inline `<font name="{_BOLD}" color="#c8641e">` span is
+     unchanged — only the PO number stays bold/orange, everything else in the sentence now renders
+     regular weight.
+  - Verified: `python -m py_compile po_pdf.py` clean. Re-rendered the same reference payload (po_no
+    `IAL/2627/1`, DHANA CROP SCIENCES LIMITED, ACEPHATE 75% SP 2500 KGS @ ₹250, GST 18%) via
+    `render_po_pdf` — **1 page**, 238,122 bytes, overwriting `business-core/scratch/
+    IAL_2627_1_sample.pdf` (kept on disk per the user's request). `pypdf` text extraction
+    reconfirmed the totals (Taxable Value 6,25,000.00 · GST @ 18% 1,12,500.00 · Total
+    ₹7,37,500.00) and the intro sentence text are all present. Re-rendered a 2-item JOB_WORK PO
+    (239,905 bytes, 2 pages — unchanged) and a 2-column/2-row GENERIC PO (217,420 bytes, 2 pages —
+    unchanged) to confirm no regression on the two untouched PO types. Throwaway driver script run
+    inline via `python -` heredoc (nothing written to disk beyond the sample PDF); `__pycache__`
+    under `lambda/procurement_api/` deleted after use.
+  - No IaC/DB/UI change needed — same route, same `po` dict shape, presentation-only.
+
 - [x] **BULK Purchase Order PDF — body restructured to follow a manually-written reference PO
   layout, house chrome/styling unchanged (2026-08-08):** `lambda/procurement_api/po_pdf.py`'s
   `_render_bulk_po_pdf` only — `_render_job_work_po_pdf`/`_render_generic_po_pdf`/`render_po_pdf`
