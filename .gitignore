@@ -30,3 +30,6 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Throwaway local artifacts (sample renders, scratch scripts) — not repo deliverables
+scratch/
