@@ -810,7 +810,7 @@ def _render_job_work_po_pdf(po: dict) -> bytes:
         ('Payment Terms', _esc(po.get('terms')) if po.get('terms') else '&mdash;', False),
         ('Dispatch Schedule', _esc(po.get('dispatch')) if po.get('dispatch') else '&mdash;', False),
         ('Mode of Transport', _esc(po.get('transport')) if po.get('transport') else '&mdash;', False),
-        ('Taxes', f'GST @ {gst_lbl}% extra as applicable; rate quoted is exclusive of GST', False),
+        ('Taxes', f'GST @ {gst_lbl}%', False),
     ]
     flow.append(_label_value_flow(ct_pairs, st, dw, row_padding=3))
 
