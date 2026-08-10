@@ -2704,6 +2704,7 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS branch VARCHAR(100);
 | `monthly_collection` | Scheduled Monthly Collection PDF report (current month) — always fires, no conditions | No |
 | `borrowings_summary_fy` | Scheduled Borrowings Summary (FY) PDF report, plain variant (`include_interest=False`) — always fires, no conditions (added 2026-08-07) | No |
 | `borrowings_summary_fy_interest` | Scheduled Borrowings Summary (FY) PDF report, with-interest variant (`include_interest=True`) — always fires, no conditions (added 2026-08-07) | No |
+| `stock_expiry_report` | Scheduled Stock Expiry PDF report — always fires (incl. zero matching rows); one optional `expires_before_months` condition (3/6/9/12, "All" = none) (added 2026-08-10) | Yes |
 
 ### API endpoints (in `lambda/api/handler.py`) — ALL admin-only
 
@@ -3016,6 +3017,98 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
 ---
 
 ## What Is Built
+
+- [x] **New alert category `stock_expiry_report` — scheduled Stock Expiry PDF report
+  (2026-08-10):** two configurable inputs — **Branch** (reuses the existing first-class
+  `alerts.branch` column; `'ALL'`/`NULL`/`''` = all branches) and **Expires at** (a single
+  `alert_conditions` row, `field='expires_before_months'`, `op='eq'`, `value` in `{3,6,9,12}`;
+  "All" = zero condition rows). Always fires on schedule (like `customer_balances_fy`/
+  `supplier_balances_fy`/`monthly_collection`/`borrowings_summary_fy*`), **including when
+  zero rows match the filters** — deliberately consistent with the other report categories;
+  flagged in case the user prefers suppression on zero matches.
+  - **New shared compute module `stocks_expiry.py`** (`lambda/api/`, byte-identical copy in
+    `lambda/alerts_evaluator/`) — `compute_stocks_expiry(conn, branch=None,
+    expires_before_months=None, brand=None) -> dict` extracted verbatim from the inline SQL
+    that used to live in `handler.py`'s `_handle_stocks_expiry`/`_handle_stocks_expiry_pdf`
+    (`_add_months`/`_packing_display` moved into this module too). `expires_before_months`
+    accepts EITHER a query-param string (`'3'`/`'6'`/…, from `GET /stocks/expiry/pdf`) OR a
+    float (`3.0`/`6.0`/…, from an `alert_conditions.value` — `alerts_eval`/`_load_active_alerts`
+    always store/load condition values as float) — normalised via `int(float(x))` before the
+    `{3,6,9,12}` membership check, so both callers get identical cutoff-date behaviour. Both
+    existing handlers (`_handle_stocks_expiry`, `_handle_stocks_expiry_pdf`) now delegate to
+    this module — **response shapes are unchanged** (verified: `/stocks/expiry` still returns a
+    bare JSON array with the same per-row keys; `/stocks/expiry/pdf` still renders the identical
+    PDF, since the renderer only reads specific dict keys and tolerates the two extra
+    `packing_size`/`packing_configuration` keys now present on every row).
+  - **`alerts_eval.py` (both copies, re-verified byte-identical after edit):** added
+    `FIELD_CATALOG_STOCK_EXPIRY_REPORT` (`fields=[{key: 'expires_before_months', type: 'enum',
+    ops: ['eq'], options: [...]}]`, `branch_scoped: true`) + `FIELD_CATALOGS` entry —
+    `_VALID_CATEGORIES`/`_VALID_FIELDS_BY_CATEGORY` derive from it automatically, no other
+    validation code needed (`validate_alert`'s only category-specific guard is the
+    `balances`-requires-≥1-condition check; this category, like the other unconditional report
+    categories, falls on the zero-conditions-allowed side automatically). The `type: 'enum'` /
+    `options` catalog keys are informational only (same as every other field's `ops` list) —
+    `validate_alert` never reads them, only `_VALID_FIELDS_BY_CATEGORY` (derived from `fields[].key`)
+    and the global `_VALID_OPS` set, so they can't break validation.
+  - **`GET /alerts/fields?category=stock_expiry_report`** — `handler.py`'s
+    `_handle_alerts_fields` now adds a `branch_options` key (`['ALL', <distinct branches>, ...]`,
+    sourced from `SELECT DISTINCT branch FROM snapshot_stock WHERE out_z IS NULL` — the same
+    data the Stock Expiry screen/report reads) ONLY for this category, via a `dict(catalog)`
+    shallow copy so the shared module-level `FIELD_CATALOGS` dict is never mutated. Every other
+    category's response is byte-unchanged.
+  - **`alert_conditions.value` type question:** this repo cannot inspect the live DB schema
+    (IaC is fenced) — resolved by code-level convention instead: every consumer of
+    `alert_conditions.value` in this codebase (`_insert_alert_children`'s
+    `float(cond['value'])` INSERT, `_load_active_alerts`'s `float(value)` SELECT cast) already
+    treats the column as numeric, and `3`/`6`/`9`/`12` round-trip through `float()`/`int(float())`
+    cleanly — no adaptation needed, no deviation to report.
+  - **Copied byte-identical into `alerts_evaluator/`:** `stocks_expiry.py`, `stocks_expiry_pdf.py`
+    (verified via `filecmp.cmp`).
+  - **Evaluator dispatch (`alerts_evaluator/handler.py`):** new
+    `elif category == "stock_expiry_report":` branch (before the trailing aggregate `else`,
+    after the `borrowings_summary_fy*` branch) — reads `alert['branch']` (`None`/`''`/`'ALL'` →
+    no branch filter) and the `expires_before_months` value from `alert['conditions']` (absent →
+    no cutoff, "All"), calls `compute_stocks_expiry(...)`, renders via
+    `render_stocks_expiry_pdf(...)`, sends via `_send_ses_email_with_pdf`. Subject
+    `IRAVI — Stock Expiry Report — {dd Mon yyyy}`; filename
+    `IAL_Stock_Expiry_{dd-Mon-yyyy}.pdf`; HTML body states the active Branch/Expires-at filters
+    (`'All Branches'`/`'All'` when unset). `status='sent'`, `matched_count` = number of rows in
+    the report (always sent, even when 0).
+  - **`POST /alerts/{id}/test`:** added an explicit `elif alert['category'] ==
+    'stock_expiry_report':` branch in `_handle_alerts_test` rather than falling through to the
+    generic `evaluate_aggregate()` path the other unconditional report categories use — that
+    generic path assumes every condition field maps to a sales/sale_returns time-window suffix
+    (`net_sales_*`/`sale_returns_*`); `expires_before_months` doesn't, so `evaluate_aggregate`
+    would see an always-empty metrics dict and could misreport `breached` for a configured
+    (non-"All") Expires-at filter. Instead this branch calls the real
+    `compute_stocks_expiry(...)` with the alert's actual Branch/Expires-at filters and returns
+    `{category: 'stock_expiry_report', matched: true, row_count, branch_filter, cutoff_date}` —
+    `matched` is always `true` (mirrors the "always fires" contract of the other unconditional
+    report categories), `row_count` is the one field that actually varies with the filters.
+  - **Verification:** `python -m py_compile` clean on `handler.py`/`alerts_eval.py`/
+    `stocks_expiry.py`/`stocks_expiry_pdf.py` in both `api/` and `alerts_evaluator/`. Both
+    `alerts_eval.py` copies, both `stocks_expiry.py` copies, and both `stocks_expiry_pdf.py`
+    copies confirmed byte-identical via `filecmp.cmp`. `validate_alert` exercised locally for:
+    (a) branch `'ALL'` + no conditions → accepted; (b) branch `'Guntur C & F'` + one
+    `expires_before_months=6` condition → accepted; (c) an `amount` (balances-only) field for
+    this category → rejected with the expected `ValidationError`. `GET /alerts/fields`'s exact
+    JSON reproduced locally (module-level catalog dict + a stubbed `branch_options` list) and
+    confirmed to match the agreed contract exactly. The evaluator's dispatch logic was exercised
+    end-to-end against a stubbed DB connection (2 synthetic `snapshot_stock` rows, branch `'ALL'`
+    + `expires_before_months=12.0`) — confirmed `branch_filter` normalises `'ALL'`→`None`,
+    `cutoff_date` is set, `row_count=2`, subject/filename strings match, and
+    `render_stocks_expiry_pdf` produced valid `%PDF`-prefixed bytes (~215 KB) with no exception.
+    Driver/verification scripts were written directly under `lambda/api/`/`lambda/alerts_evaluator/`
+    (this agent's sandbox cannot write to the scratchpad — fenced to `business-core` only), run,
+    then deleted along with `__pycache__` afterward.
+  - **No DB migration needed** — `alerts.category` is free-text, no CHECK constraint (per the
+    task brief). **No IaC/Terraform change needed** — `/alerts*` routes, SES permissions, and the
+    reportlab layer already exist for every other alert category.
+  - **UI follow-up (not done here, out of business-core scope):** the AlertBuilder category
+    dropdown (and any alert-category label maps) in `iravi-ui` needs a `stock_expiry_report`
+    entry — Branch (dropdown from `GET /alerts/fields`'s new `branch_options`) + Expires at
+    (dropdown from the field's `options` list, single `eq` condition or none for "All") — so
+    admins can create this alert type from the UI.
 
 - [x] **JOB_WORK Purchase Order PDF — three follow-up fixes: TOTAL label, totals-box
   verification, one-page reached (2026-08-08, same day as the two entries below):**

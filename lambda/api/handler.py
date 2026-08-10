@@ -3145,20 +3145,37 @@ def _insert_alert_children(cur, alert_id: int, conditions: list, recipients: lis
 
 
 def _handle_alerts_fields(event):
-    """GET /alerts/fields?category=<balances|sales|sale_returns> — field catalog (admin-only)."""
+    """GET /alerts/fields?category=<balances|sales|sale_returns|...> — field catalog (admin-only).
+
+    For category='stock_expiry_report' the response also carries a
+    'branch_options' key — ['ALL', <distinct branches>, ...] — sourced from
+    the SAME data the Stock Expiry screen shows (DISTINCT branch over the
+    current, out_z IS NULL, snapshot_stock rows). Every other category's
+    catalog is returned unchanged (no branch_options key)."""
+    params = event.get('queryStringParameters') or {}
+    category = (params.get('category') or 'balances').strip()
+
     conn = _get_db_conn()
     try:
         with conn.cursor() as cur:
             _require_admin(event, cur)
+            catalog = alerts_eval.FIELD_CATALOGS.get(category)
+            if catalog is None:
+                return _response(400, {
+                    'error': f"Unknown category {category!r}. Must be one of: {sorted(alerts_eval.FIELD_CATALOGS)}"
+                })
+            if category == 'stock_expiry_report':
+                cur.execute("""
+                    SELECT DISTINCT branch
+                    FROM snapshot_stock
+                    WHERE out_z IS NULL AND branch IS NOT NULL
+                    ORDER BY branch
+                """)
+                branches = [row[0] for row in cur.fetchall()]
+                catalog = dict(catalog)
+                catalog['branch_options'] = ['ALL'] + branches
     finally:
         conn.close()
-    params = event.get('queryStringParameters') or {}
-    category = (params.get('category') or 'balances').strip()
-    catalog = alerts_eval.FIELD_CATALOGS.get(category)
-    if catalog is None:
-        return _response(400, {
-            'error': f"Unknown category {category!r}. Must be one of: {sorted(alerts_eval.FIELD_CATALOGS)}"
-        })
     return _response(200, catalog)
 
 
@@ -3318,9 +3335,26 @@ def _handle_alerts_test(event, alert_id: int):
 
     balances category:
         Returns {matched: <count>, sample: [<up to 20 customer dicts>]}.
-    sales / sale_returns categories:
+    stock_expiry_report category:
+        Runs the same compute_stocks_expiry() the scheduled evaluator/PDF route
+        uses (real row count against the alert's current Branch/Expires-at
+        filters), returning {category, matched: true, row_count, branch_filter,
+        cutoff_date}. NOT routed through evaluate_aggregate() — that generic
+        path assumes every condition field maps to one of the sales/
+        sale_returns time-window suffixes (net_sales_*/sale_returns_*); an
+        'expires_before_months' condition doesn't, so evaluate_aggregate would
+        always see an empty metrics dict and misreport `breached` for a
+        configured (non-"All") Expires-at filter. Always matched=true, mirroring
+        the "always fires" contract of the other unconditional report categories
+        (customer_balances_fy/supplier_balances_fy/monthly_collection/
+        borrowings_summary_fy*) — only row_count varies with the filters.
+    sales / sale_returns / customer_balances_fy / supplier_balances_fy /
+    monthly_collection / borrowings_summary_fy* categories:
         Returns the aggregate shape:
         {category, matched: <bool>, metrics: {<field>: <float>...}, conditions: [...]}
+        (the unconditional report categories have no fields, so this always
+        comes back matched=true, metrics={}, conditions=[] — same "canned"
+        result the evaluator's unconditional dispatch branches guarantee.)
     """
     conn = _get_db_conn()
     try:
@@ -3342,8 +3376,27 @@ def _handle_alerts_test(event, alert_id: int):
                 today=today,
             )
             result = {'matched': len(matched), 'sample': matched[:20]}
+        elif alert['category'] == 'stock_expiry_report':
+            branch_raw = alert.get('branch')
+            branch_filter = None if not branch_raw or branch_raw == 'ALL' else branch_raw
+            expires_before_months = None
+            for cond in alert['conditions']:
+                if cond['field'] == 'expires_before_months':
+                    expires_before_months = cond['value']
+                    break
+            data_sxp = _stocks_expiry.compute_stocks_expiry(
+                conn, branch=branch_filter, expires_before_months=expires_before_months,
+            )
+            result = {
+                'category':      'stock_expiry_report',
+                'matched':       True,
+                'row_count':     len(data_sxp['rows']),
+                'branch_filter': data_sxp['branch_filter'],
+                'cutoff_date':   data_sxp['cutoff_date'],
+            }
         else:
-            # sales / sale_returns — aggregate shape
+            # sales / sale_returns / customer_balances_fy / supplier_balances_fy /
+            # monthly_collection / borrowings_summary_fy* — aggregate shape
             result = alerts_eval.evaluate_aggregate(conn, alert=alert, today=today)
     finally:
         conn.close()

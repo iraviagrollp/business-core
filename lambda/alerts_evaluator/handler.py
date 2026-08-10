@@ -59,6 +59,8 @@ import monthly_collection
 import monthly_collection_pdf
 import borrowings as _brw
 import borrowings_pdf as _brw_pdf
+import stocks_expiry as _sxp
+import stocks_expiry_pdf as _sxp_pdf
 import pdf_fonts
 
 logger = logging.getLogger()
@@ -705,6 +707,77 @@ def lambda_handler(event, context):
                 logger.info(
                     "Alert id=%s (%s) sent to %d recipients — PDF %s (%d bytes)",
                     alert_id, category, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                )
+
+            elif category == "stock_expiry_report":
+                # ── Stock Expiry report — always fires ─────────────────────────
+                # Unconditional (like customer_balances_fy / supplier_balances_fy /
+                # monthly_collection / borrowings_summary_fy* above): the alert
+                # fires on every scheduled run, even when the "Expires at" filter
+                # is "All" or zero stock rows match the configured filters.
+                # Two configurable inputs: Branch (the first-class alerts.branch
+                # column — None/''/'ALL' = all branches, same convention as
+                # sales/sale_returns) and Expires at (a single
+                # 'expires_before_months' condition, value in {3,6,9,12};
+                # absent = no cutoff, i.e. "All").
+                date_display = today.strftime('%d %b %Y')
+
+                branch_raw = alert.get("branch")
+                branch_filter = None if not branch_raw or branch_raw == "ALL" else branch_raw
+
+                expires_before_months = None
+                for cond in alert["conditions"]:
+                    if cond["field"] == "expires_before_months":
+                        expires_before_months = cond["value"]
+                        break
+
+                data_sxp = _sxp.compute_stocks_expiry(
+                    conn,
+                    branch=branch_filter,
+                    expires_before_months=expires_before_months,
+                )
+                pdf_bytes    = _sxp_pdf.render_stocks_expiry_pdf(data_sxp)
+                pdf_filename = f"IAL_Stock_Expiry_{today.strftime('%d-%b-%Y')}.pdf"
+                subject      = f"IRAVI — Stock Expiry Report — {date_display}"
+
+                branch_display = data_sxp["branch_filter"] or "All Branches"
+                if data_sxp["cutoff_date"]:
+                    cutoff_display = datetime.strptime(
+                        data_sxp["cutoff_date"], "%Y-%m-%d"
+                    ).strftime("%d-%m-%Y")
+                    expires_display = f"Expiring before {cutoff_display}"
+                else:
+                    expires_display = "All"
+
+                html_body = (
+                    '<!DOCTYPE html>'
+                    '<html><head><meta charset="UTF-8"></head>'
+                    '<body style="font-family:Arial,sans-serif;color:#333;'
+                    'max-width:700px;margin:0 auto">'
+                    f'<p style="font-size:15px">Attached is the Stock Expiry Report '
+                    f'for <strong>{date_display}</strong>.</p>'
+                    f'<p style="font-size:13px">Branch: <strong>{_esc(branch_display)}</strong>'
+                    f' &nbsp;|&nbsp; Expires at: <strong>{_esc(expires_display)}</strong></p>'
+                    '<p style="margin-top:20px;font-size:11px;color:#888">'
+                    'This is an automated message from the IRAVI Dashboard. '
+                    'Please do not reply to this email.'
+                    '</p>'
+                    '</body></html>'
+                )
+                _send_ses_email_with_pdf(
+                    subject,
+                    alert["recipients"],
+                    html_body,
+                    pdf_bytes,
+                    pdf_filename,
+                )
+                status        = "sent"
+                matched_count = len(data_sxp["rows"])
+                logger.info(
+                    "Alert id=%s (stock_expiry_report) sent to %d recipients — "
+                    "PDF %s (%d bytes), matched_count=%d",
+                    alert_id, len(alert["recipients"]), pdf_filename, len(pdf_bytes),
+                    matched_count,
                 )
 
             else:
