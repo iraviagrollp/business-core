@@ -10,6 +10,13 @@ customer_balances_fy / supplier_balances_fy / monthly_collection /
 borrowings_summary_fy / borrowings_summary_fy_interest
              — unconditional scheduled-report alerts (no fields; always fire
                on schedule; the evaluator attaches the matching PDF report)
+stock_expiry_report — scheduled Stock Expiry PDF report; two configurable
+             inputs, Branch (the existing first-class alerts.branch column —
+             'ALL'/NULL/'' = all branches) and Expires at (single
+             `expires_before_months` condition, field='expires_before_months',
+             op='eq', value in {3,6,9,12}; "All" = no condition row). Always
+             fires on schedule, even when Expires at = "All" or when zero
+             stock rows match the filters.
 
 Used by:
   - lambda/api/handler.py               (POST /alerts/{id}/test, GET /alerts/fields)
@@ -241,6 +248,39 @@ FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST = {
     "frequencies": ["daily", "weekly", "monthly"],
 }
 
+# stock_expiry_report — scheduled Stock Expiry PDF report. Two configurable
+# inputs: Branch (the existing first-class alerts.branch column — handled the
+# same way as sales/sale_returns' branch_scoped flag, NOT as a condition
+# field) and Expires at (a single enum condition, field='expires_before_months',
+# op='eq' only, value one of 3/6/9/12; "All" = zero condition rows). Always
+# fires on schedule (like customer_balances_fy/supplier_balances_fy/
+# monthly_collection/borrowings_summary_fy*) — zero conditions is valid here
+# too (validate_alert's only zero-conditions guard is for 'balances').
+# 'branch_options' is added dynamically by handler._handle_alerts_fields for
+# this category only (sourced from the same distinct-branch query the Stock
+# Expiry screen's data comes from) — not baked into this static dict, since
+# it needs a live DB query.
+FIELD_CATALOG_STOCK_EXPIRY_REPORT = {
+    "category": "stock_expiry_report",
+    "fields": [
+        {
+            "key": "expires_before_months",
+            "label": "Expires at",
+            "type": "enum",
+            "ops": ["eq"],
+            "options": [
+                {"value": "3", "label": "< 3 Months"},
+                {"value": "6", "label": "< 6 Months"},
+                {"value": "9", "label": "< 9 Months"},
+                {"value": "12", "label": "< 12 Months"},
+            ],
+        },
+    ],
+    "match_types": ["all", "any"],
+    "frequencies": ["daily", "weekly", "monthly"],
+    "branch_scoped": True,
+}
+
 # Master catalog lookup by category
 FIELD_CATALOGS: dict[str, dict] = {
     "balances":             FIELD_CATALOG,
@@ -251,6 +291,7 @@ FIELD_CATALOGS: dict[str, dict] = {
     "monthly_collection":   FIELD_CATALOG_MONTHLY_COLLECTION,
     "borrowings_summary_fy":          FIELD_CATALOG_BORROWINGS_SUMMARY_FY,
     "borrowings_summary_fy_interest": FIELD_CATALOG_BORROWINGS_SUMMARY_FY_INTEREST,
+    "stock_expiry_report":            FIELD_CATALOG_STOCK_EXPIRY_REPORT,
 }
 
 _VALID_CATEGORIES: set[str] = set(FIELD_CATALOGS.keys())
@@ -776,7 +817,8 @@ def validate_alert(body: dict) -> None:
 
     Accepts category in {'balances', 'sales', 'sale_returns', 'customer_balances_fy',
                           'supplier_balances_fy', 'monthly_collection',
-                          'borrowings_summary_fy', 'borrowings_summary_fy_interest'}
+                          'borrowings_summary_fy', 'borrowings_summary_fy_interest',
+                          'stock_expiry_report'}
     (see FIELD_CATALOGS — any category registered there is accepted automatically).
     Validates conditions' field keys against the per-category field catalog.
     branch is optional for all categories; for sales/sale_returns it defaults to
@@ -787,6 +829,14 @@ def validate_alert(body: dict) -> None:
       Zero conditions are accepted (unconditional; always fires on schedule).
       Not branch-scoped — branch is accepted and stored but not used in evaluation.
       Fields list is empty so no condition field validation is ever applied.
+
+    stock_expiry_report:
+      Zero conditions accepted ("Expires at" = All). At most the single
+      'expires_before_months' condition (op='eq', value in {3,6,9,12}) is
+      valid — enforced the same way every other category's field set is
+      (valid_fields derived from FIELD_CATALOGS[category]['fields']).
+      branch_scoped — branch IS used in evaluation (the alerts.branch column,
+      same 'ALL'/None = all branches convention as sales/sale_returns).
     """
     name = (body.get("name") or "").strip()
     if not name:
