@@ -18,6 +18,7 @@ import monthly_collection
 import ledger_statement as _ls
 import supplier_ledger_statement as _sls
 import borrowings as _brw
+import stocks_expiry as _stocks_expiry
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -357,7 +358,10 @@ def _handle_stocks_current():
 def _handle_stocks_expiry():
     """GET /stocks/expiry — un-aggregated snapshot_stock rows (one per distinct
     expiry_date), no rate/valuation. Standard cache-aside, same 24h TTL/key
-    convention as the other /stocks/* endpoints."""
+    convention as the other /stocks/* endpoints. Delegates the SQL/row-shaping
+    to stocks_expiry.compute_stocks_expiry (no filters — matches the pre-refactor
+    behaviour exactly); only the 'rows' key is returned (bare JSON array), same
+    as before."""
     r = _get_redis()
     cached = r.get('iravi:stocks:expiry')
     if cached:
@@ -365,56 +369,13 @@ def _handle_stocks_expiry():
 
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    brand, technical, packing_size, packing_configuration,
-                    available_nos, conversion_factor, available_cases, available_qty,
-                    branch, special_packing_mention, entry_date, expiry_date
-                FROM snapshot_stock
-                WHERE out_z IS NULL
-                ORDER BY expiry_date ASC NULLS LAST, brand, technical, branch
-            """)
-            col_names = [d[0] for d in cur.description]
-            raw_rows = cur.fetchall()
+        result = _stocks_expiry.compute_stocks_expiry(conn)
     finally:
         conn.close()
 
-    expiry_rows = []
-    for raw in raw_rows:
-        row = dict(zip(col_names, raw))
-        packing_size_num = float(row['packing_size'] or 0)
-        packing_config = row['packing_configuration'] or ''
-        expiry_rows.append({
-            'brand': row['brand'],
-            'technical': row['technical'],
-            'packing_size': packing_size_num,
-            'packing_configuration': packing_config,
-            'packing_display': _packing_display(packing_size_num, packing_config),
-            'available_nos': float(row['available_nos'] or 0),
-            'conversion_factor': float(row['conversion_factor'] or 0),
-            'available_cases': float(row['available_cases'] or 0),
-            'available_qty': float(row['available_qty'] or 0),
-            'branch': row['branch'],
-            'special_packing_mention': row['special_packing_mention'],
-            'entry_date': row['entry_date'].isoformat() if row['entry_date'] else None,
-            'expiry_date': row['expiry_date'].isoformat() if row['expiry_date'] else None,
-        })
-
+    expiry_rows = result['rows']
     r.set('iravi:stocks:expiry', json.dumps(expiry_rows), ex=_REDIS_TTL)
     return _response(200, expiry_rows)
-
-
-def _add_months(d, months: int):
-    """Add `months` calendar months to date `d`, clamping the day to the
-    target month's length (e.g. 31-Jan + 1 month -> 28/29-Feb)."""
-    import calendar
-
-    month_index = d.month - 1 + months
-    year = d.year + month_index // 12
-    month = month_index % 12 + 1
-    day = min(d.day, calendar.monthrange(year, month)[1])
-    return d.replace(year=year, month=month, day=day)
 
 
 def _handle_stocks_expiry_pdf(params: dict):
@@ -428,71 +389,25 @@ def _handle_stocks_expiry_pdf(params: dict):
     EXACT match (same convention as /sales/list and /purchases/list — the UI
     populates its dropdown from distinct branch values, so it always sends an
     exact value); absent/empty means no branch filter (all branches).
+
+    Delegates the SQL/row-shaping/cutoff-date computation to
+    stocks_expiry.compute_stocks_expiry — single source of truth shared with
+    GET /stocks/expiry.
     """
     brand_filter = (params.get('brand') or '').strip()
     branch_filter = (params.get('branch') or '').strip()
     months_raw = (params.get('expires_before_months') or '').strip().lower()
 
-    cutoff_date = None
-    if months_raw in ('3', '6', '9', '12'):
-        today = datetime.now(timezone.utc).date()
-        cutoff_date = _add_months(today, int(months_raw))
-    else:
-        months_raw = 'all'
-
     conn = _get_db_conn()
     try:
-        with conn.cursor() as cur:
-            query = """
-                SELECT
-                    brand, technical, packing_size, packing_configuration,
-                    available_nos, conversion_factor, available_cases, available_qty,
-                    branch, special_packing_mention, entry_date, expiry_date
-                FROM snapshot_stock
-                WHERE out_z IS NULL
-            """
-            query_params: list = []
-            if brand_filter:
-                query += " AND brand ILIKE %s"
-                query_params.append(f'%{brand_filter}%')
-            if branch_filter:
-                query += " AND branch = %s"
-                query_params.append(branch_filter)
-            if cutoff_date is not None:
-                query += " AND expiry_date IS NOT NULL AND expiry_date <= %s"
-                query_params.append(cutoff_date)
-            query += " ORDER BY expiry_date ASC NULLS LAST, brand, technical, branch"
-            cur.execute(query, query_params)
-            col_names = [d[0] for d in cur.description]
-            raw_rows = cur.fetchall()
+        payload = _stocks_expiry.compute_stocks_expiry(
+            conn, branch=branch_filter, expires_before_months=months_raw, brand=brand_filter,
+        )
     finally:
         conn.close()
 
-    rows = []
-    for raw in raw_rows:
-        row = dict(zip(col_names, raw))
-        packing_size_num = float(row['packing_size'] or 0)
-        packing_config = row['packing_configuration'] or ''
-        rows.append({
-            'brand': row['brand'],
-            'technical': row['technical'],
-            'packing_display': _packing_display(packing_size_num, packing_config),
-            'available_nos': float(row['available_nos'] or 0),
-            'conversion_factor': float(row['conversion_factor'] or 0),
-            'available_cases': float(row['available_cases'] or 0),
-            'available_qty': float(row['available_qty'] or 0),
-            'branch': row['branch'],
-            'special_packing_mention': row['special_packing_mention'],
-            'entry_date': row['entry_date'].isoformat() if row['entry_date'] else None,
-            'expiry_date': row['expiry_date'].isoformat() if row['expiry_date'] else None,
-        })
-
-    payload = {
-        'rows': rows,
-        'brand_filter': brand_filter or None,
-        'branch_filter': branch_filter or None,
-        'cutoff_date': cutoff_date.isoformat() if cutoff_date else None,
-    }
+    if payload['cutoff_date'] is None:
+        months_raw = 'all'
 
     import stocks_expiry_pdf
     pdf_bytes = stocks_expiry_pdf.render_stocks_expiry_pdf(payload)
