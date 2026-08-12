@@ -10,20 +10,42 @@ compute_interest_segments() is a pure function.
 
 Run: python test_borrowings_interest.py
 
+2026-08-12 model change — INTEREST STARTS THE DAY AFTER AN ENTRY
+----------------------------------------------------------------
+The engine used to charge interest on the entry date itself: an amount
+booked on the 8th accrued for the 8th. It now accrues from the 9th. Three
+engine changes implement it (see borrowings.compute_interest_segments):
+the terminal event moved from `to_date + 1` to `to_date`; carry-forward
+events moved from each month's 1st to its LAST day; and a segment's
+interest is bucketed into the month its accrual DAYS fall in (event date
++ 1) while `month_last_balance` stays keyed on the event's own calendar
+month (closing principal is a month-end fact, not an accrual fact).
+
+Every day-count/interest figure below was restated for this rule. The
+strongest check is `brute_force_monthly_interest` — an independent
+day-by-day oracle sharing no machinery with the engine — which is asserted
+month-for-month against the engine on the reference fixture, on the real
+60-row history, and (in section 6) on the FY totals.
+
 Covers:
-  1. THE REFERENCE TEST — reproduces the worked example in the task brief
-     (account LEVAKA HARANATHA REDDY, rate 12% p.a.) to 2 dp: Balance, Days,
-     Interest for all 16 given rows. (This fixture's entire date range sits
-     inside a single FY — 2025-04-30 to 2026-03-31, all within FY 2025-26 —
-     so it never exercised the old capitalization step at all and needs no
-     change for the new no-capitalization model.)
+  1. THE REFERENCE FIXTURE (account LEVAKA HARANATHA REDDY, 12% p.a.):
+     running balances (unchanged by the 2026-08-12 rule — only the days
+     each balance is charged for moved), hand-derived day counts under the
+     new rule incl. the headline case of an entry dated to_date earning
+     nothing yet, month-end (not month-1st) carry forwards, and a full
+     month-for-month cross-check against the day-by-day oracle. (This
+     fixture's entire date range sits inside a single FY — 2025-04-30 to
+     2026-03-31, all within FY 2025-26 — so it never exercised the old
+     capitalization step at all.)
   2. include_interest OFF byte-identical guard — compute_borrowings_rows is
      untouched by this change (shape/behaviour spot check).
   3. NO-COMPOUNDING MODEL (rewritten 2026-08-06 — was "FY capitalization"):
      a flat single drawdown held across 3 full financial years (chosen to
      all be non-leap-Feb FYs, so each FY is exactly 365 days) at a fixed
-     rate — confirms each FY accrues the SAME interest (no growth / no
-     compounding), confirms `closing_principal` never changes across any FY
+     rate — confirms the two full FYs accrue the SAME interest (no growth /
+     no compounding) while the FIRST FY accrues one day less, because the
+     drawdown day itself no longer earns; confirms `closing_principal`
+     never changes across any FY
      boundary (interest never folded into balance, ever — not just within a
      year), and confirms `_compute_fy_totals`'s `cumulative_interest`/`total`
      arithmetic across all 3 FYs, plus the key regression-pinning check that
@@ -43,8 +65,16 @@ Covers:
      under the no-capitalization model (balance continuous straight through
      the boundary, no jump), then prints a full monthly interest report.
 
-Fixture note (reference test)
-------------------------------
+Fixture note (reference fixture)
+--------------------------------
+NOTE (2026-08-12): the original worked example's Days/Interest column was
+computed under the old accrue-from-the-entry-date rule and is therefore no
+longer the expected output. The fixture itself (the reconstructed
+transaction history described below) is retained unchanged and is still
+useful — the balances it produces are unaffected — but the expectations
+asserted against it are now hand-derived under the new rule and confirmed
+by the independent day-by-day oracle.
+
 The task's worked example is a "selected rows" excerpt of a real account's
 full transaction history, not the complete history itself — several gaps
 between listed rows (e.g. the 09-06-2025 -> 01-10-2025 span, ~4 months) are
@@ -59,17 +89,13 @@ row's own "days" value (so every gap's length is exactly as specified) plus
 two value-carrying filler transactions (2025-08-15 and 2026-03-03) sized so
 the two listed rows on either side of the big untouched span
 (09-06-2025 -> 01-10-2025 -> 04-03-2026) land on their exact reference
-balances. Every one of the 16 reference Balance/Days/Interest figures below
-was independently derived from this fixture BEFORE being checked against the
-engine (see the PR notes) — every single one matches to 2 dp, which is the
-strongest evidence the engine (event ordering, month-boundary insertion,
-365-day simple interest, and the terminal-boundary assumption) is correct.
+balances.
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from datetime import date
+from datetime import date, timedelta
 
 import borrowings
 
@@ -97,6 +123,46 @@ def row(d, voucher, debit=0.0, credit=0.0, name='Journal Entries'):
         'debit': debit,
         'credit': credit,
     }
+
+
+def brute_force_monthly_interest(rows, rate, to_date):
+    """INDEPENDENT day-by-day oracle for the 2026-08-12 accrual rule.
+
+    Deliberately shares NO machinery with the engine — no events, no
+    segments, no month boundaries, no terminal marker. It simply walks every
+    calendar day and charges interest on the balance implied by every
+    transaction dated STRICTLY BEFORE that day, which is the whole of the
+    rule "interest starts the day AFTER an entry": an entry dated the 8th
+    first contributes to the balance charged on the 9th.
+
+    Returns {(year, month): unrounded interest} — directly comparable to
+    compute_interest_segments()'s `monthly_interest`.
+    """
+    monthly = {}
+    first_date = min(r['transaction_date'] for r in rows)
+    day = first_date + timedelta(days=1)
+    while day <= to_date:
+        balance = round(
+            sum(r['credit'] - r['debit'] for r in rows if r['transaction_date'] < day), 2,
+        )
+        key = (day.year, day.month)
+        monthly[key] = monthly.get(key, 0.0) + balance * (rate / 100.0) / 365.0
+        day += timedelta(days=1)
+    return monthly
+
+
+def check_against_oracle(label, rows, rate, to_date):
+    """Assert the engine's per-month buckets AND grand total both equal the
+    day-by-day oracle's, to 2 dp (ignoring buckets that round to zero)."""
+    _segments, monthly, _month_bal, _opening = borrowings.compute_interest_segments(
+        rows, rate=rate, to_date=to_date,
+    )
+    oracle = brute_force_monthly_interest(rows, rate, to_date)
+    nonzero = lambda d: {k: round(v, 2) for k, v in d.items() if round(v, 2)}
+    check(f"{label} — every monthly bucket matches the day-by-day oracle",
+          nonzero(oracle), nonzero(monthly))
+    check(f"{label} — grand total interest matches the day-by-day oracle",
+          round(sum(oracle.values()), 2), round(sum(monthly.values()), 2))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -148,35 +214,82 @@ def r2(x):
     return round(x, 2)
 
 
-REFERENCE = [
-    # (date, voucher_no or '' for carry-forward, balance, days, interest)
-    (date(2025, 4, 30), 'JE2526-60', 4845.0, 1, 1.59),
-    (date(2025, 5, 1), '', 4845.0, 11, 17.52),
-    (date(2025, 5, 12), 'BR2526-1', 104845.0, 6, 206.82),
-    (date(2025, 5, 18), 'BR2526-2', 105844.0, 0, 0.0),
-    (date(2025, 5, 18), 'JE2526-61', 113394.0, 1, 37.28),
-    (date(2025, 5, 19), 'BR2526-3', 513394.0, 0, 0.0),
-    (date(2025, 5, 19), 'BR2526-4', 813394.0, 1, 267.42),
-    (date(2025, 5, 20), 'JE2526-62', 817894.0, 3, 806.69),
-    (date(2025, 5, 29), 'JE2526-70', 885894.0, 2, 582.51),
-    (date(2025, 5, 31), 'JE2526-71', 897640.0, 1, 295.11),
-    (date(2025, 6, 1), '', 897640.0, 3, 885.34),
-    (date(2025, 6, 4), 'BP2526-10', 847640.0, 0, 0.0),
-    (date(2025, 6, 9), 'BR2526-26', 2747640.0, 21, 18970.01),
-    (date(2025, 10, 1), '', 3129735.0, 30, 30868.62),
-    (date(2026, 3, 4), 'BP2526-112', 4701593.0, 27, 41734.69),
-    (date(2026, 3, 31), 'JE2526-87', 4720682.0, 1, 1552.01),
+# Running PRINCIPAL is unaffected by the 2026-08-12 accrual-date change —
+# these are the same balances the original reference table asserted, and they
+# still hold exactly (only the day counts each balance is charged for moved).
+REFERENCE_BALANCES = [
+    (date(2025, 4, 30), 'JE2526-60', 4845.0),
+    (date(2025, 5, 12), 'BR2526-1', 104845.0),
+    (date(2025, 5, 18), 'BR2526-2', 105844.0),
+    (date(2025, 5, 18), 'JE2526-61', 113394.0),
+    (date(2025, 5, 19), 'BR2526-3', 513394.0),
+    (date(2025, 5, 19), 'BR2526-4', 813394.0),
+    (date(2025, 5, 20), 'JE2526-62', 817894.0),
+    (date(2025, 5, 29), 'JE2526-70', 885894.0),
+    (date(2025, 5, 31), 'JE2526-71', 897640.0),
+    (date(2025, 6, 4), 'BP2526-10', 847640.0),
+    (date(2025, 6, 9), 'BR2526-26', 2747640.0),
+    (date(2026, 3, 4), 'BP2526-112', 4701593.0),
+    (date(2026, 3, 31), 'JE2526-87', 4720682.0),
 ]
 
-for d, voucher, exp_balance, exp_days, exp_interest in REFERENCE:
+for d, voucher, exp_balance in REFERENCE_BALANCES:
     seg = by_key.get((d, voucher))
-    label = f"{d.isoformat()} {voucher or '(carry forward)'}"
+    label = f"{d.isoformat()} {voucher}"
     if seg is None:
         check(f"{label} — segment exists", True, False)
         continue
     check(f"{label} — balance", exp_balance, r2(seg['balance']))
-    check(f"{label} — days", exp_days, seg['days'])
-    check(f"{label} — interest", exp_interest, r2(seg['interest']))
+
+# ── DAY COUNTS under the 2026-08-12 rule: interest starts the day AFTER an
+# entry, so a segment beginning on date D covers the days (D, next_event],
+# and carry-forward events sit on each month's LAST day (not its 1st). Each
+# expected value below is hand-derived from the fixture's own dates. ────────
+REFERENCE_DAYS = [
+    # 30-Apr entry -> next event is the 12-May receipt; days = 01..12 May.
+    (date(2025, 4, 30), 'JE2526-60', 12),
+    # 12-May -> 18-May: days = 13..18 May.
+    (date(2025, 5, 12), 'BR2526-1', 6),
+    # Two entries share 18-May: the first closes with a 0-day segment.
+    (date(2025, 5, 18), 'BR2526-2', 0),
+    # 31-May entry -> the next real entry, BP2526-10 on 04-Jun (no carry
+    # forward is inserted at 31-May, a transaction already occupies it):
+    # days = 01..04 June.
+    (date(2025, 5, 31), 'JE2526-71', 4),
+    # 04-Mar-2026 -> 31-Mar-2026: days = 05..31 March.
+    (date(2026, 3, 4), 'BP2526-112', 27),
+    # An entry dated to_date itself earns nothing yet — interest would start
+    # 01-Apr, which is outside the window. THIS is the reported bug.
+    (date(2026, 3, 31), 'JE2526-87', 0),
+]
+
+for d, voucher, exp_days in REFERENCE_DAYS:
+    seg = by_key.get((d, voucher))
+    label = f"{d.isoformat()} {voucher}"
+    if seg is None:
+        check(f"{label} — segment exists", True, False)
+        continue
+    check(f"{label} — days (accrual starts the day after the entry)", exp_days, seg['days'])
+    check(f"{label} — interest == balance * 12% * days/365",
+          r2(seg['balance'] * 0.12 * exp_days / 365.0), r2(seg['interest']))
+
+# Carry-forward events now sit on each month's LAST day, never its 1st.
+check("no carry-forward event is dated the 1st of a month",
+      [], [s['date'].isoformat() for s in segments if s['kind'] == 'boundary' and s['date'].day == 1])
+check("carry-forward events are dated month-end (31-May-2025 present, 01-Jun-2025 absent)",
+      (True, False),
+      ((date(2025, 5, 31), '') in by_key or any(
+          s['date'] == date(2025, 5, 31) for s in segments),
+       (date(2025, 6, 1), '') in by_key))
+
+# April 2025 accrues NOTHING: the account's first entry is dated 30-Apr, so
+# its first interest-bearing day is 01-May.
+check("April 2025 has no interest bucket (first entry dated 30-Apr earns from 01-May)",
+      False, (2025, 4) in monthly_interest)
+
+# The whole fixture, cross-checked month-for-month against the independent
+# day-by-day oracle (a completely separate algorithm — see its docstring).
+check_against_oracle("reference fixture", fixture, 12.0, to_date)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,13 +336,23 @@ fy_totals_3 = borrowings._compute_fy_totals(fy3_monthly, fy3_month_bal)
 check("_compute_fy_totals produced entries for FY 2024-25, 2025-26, 2026-27",
       True, {'2024-25', '2025-26', '2026-27'} <= set(fy_totals_3.keys()))
 
-# Each FULL FY (all three are exactly 365 real days here) accrues the SAME
-# interest — 100000 * 0.10 * 365/365 = 10,000.00 — never growing, since the
-# balance the NEXT FY's interest is computed on is never inflated by the
+# FY 2025-26 and FY 2026-27 are each a full 365 interest-bearing days and
+# accrue exactly 100000 * 0.10 * 365/365 = 10,000.00 — never growing, since
+# the balance the NEXT FY's interest is computed on is never inflated by the
 # PREVIOUS FY's interest.
-for fy_label in ('2024-25', '2025-26', '2026-27'):
+for fy_label in ('2025-26', '2026-27'):
     check(f"FY {fy_label} own interest == 10,000.00 (flat 100,000 @ 10%, 365 days, no compounding)",
           10000.0, fy_totals_3[fy_label]['interest'])
+
+# FY 2024-25 is the one exception, and it is the 2026-08-12 rule in action:
+# the drawdown is dated 01-Apr-2024, and interest starts the day AFTER an
+# entry, so that FY has 364 interest-bearing days (02-Apr-2024 .. 31-Mar-2025)
+# — 100000 * 0.10 * 364/365 = 9,972.60, NOT the 10,000.00 the old
+# accrue-from-the-entry-date engine produced.
+check("FY 2024-25 own interest == 9,972.60 (364 days — the 01-Apr drawdown day itself earns nothing)",
+      9972.60, fy_totals_3['2024-25']['interest'])
+check("FY 2024-25 interest is strictly less than a full year's (the entry day is excluded)",
+      True, fy_totals_3['2024-25']['interest'] < fy_totals_3['2025-26']['interest'])
 
 # closing_principal is IDENTICAL in every FY — 100,000.00, untouched by any
 # amount of accrued interest.
@@ -239,19 +362,19 @@ for fy_label in ('2024-25', '2025-26', '2026-27'):
 
 # cumulative_interest / total arithmetic across all 3 FYs — a running sum,
 # never reset, never rebased on a capitalized balance.
-check("FY 2024-25 cumulative_interest == 10,000.00 (first FY — no earlier interest to add)",
-      10000.0, fy_totals_3['2024-25']['cumulative_interest'])
-check("FY 2025-26 cumulative_interest == 20,000.00 (10,000 + 10,000)",
-      20000.0, fy_totals_3['2025-26']['cumulative_interest'])
-check("FY 2026-27 cumulative_interest == 30,000.00 (10,000 + 10,000 + 10,000)",
-      30000.0, fy_totals_3['2026-27']['cumulative_interest'])
+check("FY 2024-25 cumulative_interest == 9,972.60 (first FY — no earlier interest to add)",
+      9972.60, fy_totals_3['2024-25']['cumulative_interest'])
+check("FY 2025-26 cumulative_interest == 19,972.60 (9,972.60 + 10,000)",
+      19972.60, fy_totals_3['2025-26']['cumulative_interest'])
+check("FY 2026-27 cumulative_interest == 29,972.60 (9,972.60 + 10,000 + 10,000)",
+      29972.60, fy_totals_3['2026-27']['cumulative_interest'])
 
-check("FY 2024-25 total == closing_principal + cumulative_interest (100,000 + 10,000 = 110,000.00)",
-      110000.0, fy_totals_3['2024-25']['total'])
-check("FY 2025-26 total == closing_principal + cumulative_interest (100,000 + 20,000 = 120,000.00)",
-      120000.0, fy_totals_3['2025-26']['total'])
-check("FY 2026-27 total == closing_principal + cumulative_interest (100,000 + 30,000 = 130,000.00)",
-      130000.0, fy_totals_3['2026-27']['total'])
+check("FY 2024-25 total == closing_principal + cumulative_interest (100,000 + 9,972.60 = 109,972.60)",
+      109972.60, fy_totals_3['2024-25']['total'])
+check("FY 2025-26 total == closing_principal + cumulative_interest (100,000 + 19,972.60 = 119,972.60)",
+      119972.60, fy_totals_3['2025-26']['total'])
+check("FY 2026-27 total == closing_principal + cumulative_interest (100,000 + 29,972.60 = 129,972.60)",
+      129972.60, fy_totals_3['2026-27']['total'])
 
 # THE key regression-pinning invariant: the next FY's "Brought Forward" is
 # `closing_principal`, NEVER `total` — explicitly confirm this differs from
@@ -537,7 +660,13 @@ except Exception as exc:                                     # noqa: BLE001
 real_interest_rows = borrowings._interest_line_rows(real_monthly, _REAL_TO_DATE, _ACCOUNT_NAME, real_month_bal)
 
 # --- 2. exactly one interest line item per month across the range -----------
-first_month = (date(2025, 4, 30).year, date(2025, 4, 30).month)
+# The account's first entry is dated 2025-04-30 and interest starts the day
+# AFTER an entry (2026-08-12 rule), so the first interest-bearing day is
+# 2025-05-01 and April 2025 has no bucket at all.
+check("April 2025 accrues nothing (first entry dated 30-Apr earns from 01-May)",
+      False, (2025, 4) in real_monthly)
+
+first_month = (2025, 5)
 last_month = (_REAL_TO_DATE.year, _REAL_TO_DATE.month)
 expected_months = []
 yy, mm = first_month
@@ -545,8 +674,8 @@ while (yy, mm) <= last_month:
     expected_months.append((yy, mm))
     yy, mm = (yy + 1, 1) if mm == 12 else (yy, mm + 1)
 
-check("one monthly interest bucket per calendar month, April 2025 through August 2026 (17 months)",
-      17, len(expected_months))
+check("one monthly interest bucket per calendar month, May 2025 through August 2026 (16 months)",
+      16, len(expected_months))
 check("compute_interest_segments produced exactly one interest bucket per expected month",
       set(expected_months), set(real_monthly.keys()))
 check("_interest_line_rows emitted exactly one row per month",
@@ -629,6 +758,11 @@ sum_of_monthly_buckets = round(sum(round(v, 2) for v in real_monthly.values()), 
 check("total interest reported == sum of the monthly line items",
       sum_of_monthly_buckets, grand_total_interest)
 
+# --- 7. every real month bucket cross-checked against the independent -------
+#        day-by-day oracle (60 real rows, 17 calendar months, a real FY
+#        crossing) — the strongest single check on the 2026-08-12 rule.
+check_against_oracle("real 60-row history", real_fixture, _RATE, _REAL_TO_DATE)
+
 # --- readable report table, printed verbatim for the coordinator/user -------
 # Uses borrowings._compute_fy_totals() (the same single-source-of-truth the
 # renderer reads) for the FY summary figures — closing_principal / interest
@@ -643,8 +777,11 @@ fy2627_months = [(y, m) for (y, m) in expected_months if borrowings._fy_start_ye
 for r in real_interest_rows:
     y, m = map(int, r['transaction_date'].split('-')[:2])
     label = date(y, m, 1).strftime('%b-%y')
-    bal = real_month_bal.get((y, m))
-    print(f"{label:<10} {r['transaction_date']:<12} {bal:>14,.2f} {r['interest']:>14,.2f}")
+    # r['balance'] (not real_month_bal[(y,m)]) — a month can accrue interest
+    # without holding an event of its own (e.g. Aug-2026 here, whose accrual
+    # comes off the 31-Jul carry forward), and the row already carries the
+    # correct carried-forward principal for exactly that case.
+    print(f"{label:<10} {r['transaction_date']:<12} {r['balance']:>14,.2f} {r['interest']:>14,.2f}")
     if (y, m) == (2026, 3):
         fy2526 = real_fy_totals['2025-26']
         print(f"\n--- FY 2025-26 summary ---")
@@ -742,11 +879,22 @@ fy2526_total_amount = real_result['fy_totals']['2025-26']['total']
 # that FY's own interest exactly (nothing earlier to add), which is why the
 # reference figure below is UNCHANGED by the interest-never-carried-forward
 # model change even though `total`'s general formula did change.
-check("fy_totals['2025-26']['total'] matches the CLAUDE.md reference figure (55,77,494.20) — "
-      "unchanged because this is the account's first FY (cumulative_interest == interest here)",
-      5577494.20, fy2526_total_amount)
-check("fy_totals['2025-26']['interest'] matches the CLAUDE.md reference figure (4,14,419.20)",
-      414419.20, real_result['fy_totals']['2025-26']['interest'])
+# Regression pins, RESTATED 2026-08-12 (interest now starts the day after an
+# entry): FY 2025-26's interest fell 4,14,419.20 -> 4,12,721.75 and its total
+# 55,77,494.20 -> 55,75,796.75. Both new figures are independently confirmed
+# by the day-by-day oracle immediately below, not merely by the engine.
+oracle_fy2526_interest = round(sum(
+    v for (y, m), v in brute_force_monthly_interest(real_fixture, _RATE, _REAL_TO_DATE).items()
+    if borrowings._fy_start_year(date(y, m, 1)) == 2025
+), 2)
+check("fy_totals['2025-26']['interest'] == the day-by-day oracle's FY 2025-26 total",
+      oracle_fy2526_interest, real_result['fy_totals']['2025-26']['interest'])
+check("fy_totals['2025-26']['interest'] == 4,12,721.75 (was 4,14,419.20 before the "
+      "2026-08-12 accrue-from-the-next-day fix)",
+      412721.75, real_result['fy_totals']['2025-26']['interest'])
+check("fy_totals['2025-26']['total'] == 55,75,796.75 (was 55,77,494.20) — this is the "
+      "account's first FY, so cumulative_interest == interest here",
+      5575796.75, fy2526_total_amount)
 check("fy_totals['2025-26']['cumulative_interest'] == fy_totals['2025-26']['interest'] (first FY)",
       real_result['fy_totals']['2025-26']['interest'],
       real_result['fy_totals']['2025-26']['cumulative_interest'])
