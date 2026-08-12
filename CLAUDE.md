@@ -1838,6 +1838,94 @@ scratch-related remains in the repo.
 
 ---
 
+## api — Borrowings interest model change: interest STARTS THE DAY AFTER AN ENTRY (2026-08-12)
+
+**Status: complete.** User-reported bug: the interest engine charged interest on the entry date
+itself — an amount booked on 8 August accrued interest for 8 August. Interest must start the
+NEXT day (9 August). Fixed in `lambda/api/borrowings.py` (+ its byte-identical
+`alerts_evaluator/` copy) and `lambda/api/test_borrowings_interest.py`. **Lowers every reported
+interest figure by roughly one day's worth per drawdown** — not a presentation-only change.
+
+**Three coordinated changes in `compute_interest_segments`** (a segment now covers the half-open
+interval `(event_date, next_event_date]` — the days AFTER an event, up to and including the next
+one — instead of `[event_date, next_event_date)`):
+1. **Terminal event moved from `to_date + 1 day` to `to_date`**, and its `sort_rank` raised from
+   `0` to `2` (> a transaction's `1`) so it still sorts LAST when it now shares a date with a
+   real transaction — otherwise the walk (`for i in range(len(events) - 1)`, which treats the
+   final event as the closing marker) would mistake a same-day transaction for the terminal. An
+   entry dated `to_date` therefore closes with a 0-day segment and earns nothing yet, which is
+   exactly the reported bug in its narrowest form. The old "a balance held on to_date earns one
+   day of interest" assumption documented in the module docstring is **gone**.
+2. **Month carry-forward events moved from the 1st of each month to the LAST day of each month**
+   (`_last_day_of_month`, loop now starts at the FIRST transaction's own month rather than the
+   month after it, and skips any boundary date `>= to_date` so the terminal stays the sole event
+   on `to_date`). This is what keeps a segment's accrual days inside ONE calendar month under the
+   new interval: a carry forward dated 31-Aug is what produces September's interest. Without it,
+   only the grand total would be right and every monthly line item — and, worse, every FY total —
+   would be shifted a day across its boundary (1-Apr's interest would land in the *previous* FY).
+3. **Two distinct keyings, which used to be one.** New `_month_key(d)` = month of `d + 1 day`
+   buckets a segment's interest into the month its accrual DAYS fall in; `month_last_balance`
+   stays keyed on the event's own CALENDAR month, because a closing principal is a month-end
+   fact, not an accrual fact (an entry on 31-March belongs to March's closing balance even though
+   its interest only starts in April). Zero-day segments are excluded from `monthly_interest`
+   entirely — they carry no days to attribute and would otherwise invent an empty bucket a month
+   past `to_date`.
+
+**Two consequential follow-on fixes** (both needed because the two keyings can now diverge — a
+month can carry interest without holding any event of its own):
+- `_interest_line_rows` looks up `month_last_balance[(y, m)]` and, when absent, falls back to the
+  latest month closed at or before it. Without this the last month of a window whose own
+  month-end boundary was suppressed (because it fell on/after `to_date`) rendered `balance: null`
+  — it crashed the test's report formatter, and would have blanked the Balance column in the PDF.
+- `_compute_fy_totals`'s `closing_principal` is now an **as-of lookup** (`_principal_asof(fy + 1,
+  3)` — the latest recorded month-closing balance at or before that FY's 31-March close) instead
+  of "that FY's own last `month_last_balance` key". An FY whose final months hold no events at all
+  now correctly reports the principal carried INTO it rather than `0.0`. The FY set is likewise
+  derived from `interest_by_fy` ∪ the FYs of every `month_last_balance` key.
+
+**Verification.** `python -m py_compile` clean on `borrowings.py`, `borrowings_pdf.py`,
+`handler.py`, `test_borrowings_interest.py`, and the `alerts_evaluator/borrowings.py` copy.
+`python test_borrowings_interest.py` → **136/136 assertions pass**.
+- **New independent oracle: `brute_force_monthly_interest(rows, rate, to_date)`** in the test
+  file — a day-by-day calculator sharing NO machinery with the engine (no events, no segments, no
+  boundaries, no terminal): it walks every calendar day and charges the balance implied by every
+  transaction dated STRICTLY BEFORE that day, which is the whole of the new rule. Asserted
+  month-for-month AND on the grand total against the engine for the reference fixture, for the
+  real 60-row LEVAKA HARANATHA REDDY history, and (for the FY 2025-26 figure) in section 6.
+  Separately, **200 randomized transaction histories** (1–12 rows, random dates over ~900 days,
+  random debits/credits, random `to_date` up to 400 days past the last row) were cross-checked
+  against the oracle month-for-month during development — all matched.
+- Restated expectations, each hand-derived under the new rule then confirmed by the oracle:
+  section 1's day counts (the old 16-row Days/Interest reference table was computed under the old
+  rule and is no longer the expected output — the fixture and its BALANCES are retained unchanged,
+  since principal is unaffected); section 3's FY 2024-25 interest `10,000.00 → 9,972.60` (364
+  interest-bearing days: the 01-Apr-2024 drawdown day itself no longer earns — the other two FYs
+  stay exactly `10,000.00`, so the no-compounding invariant is untouched); section 5's month range
+  (April 2025 now accrues NOTHING — the account's first entry is dated 30-Apr — so 16 buckets
+  May-2025..Aug-2026, was 17); section 6's regression pins **FY 2025-26 interest `4,14,419.20 →
+  4,12,721.75`** and **total `55,77,494.20 → 55,75,796.75`**.
+- **Real renders** (no monkeypatching), via a stub DB connection over a 7-row multi-FY fixture:
+  `render_borrowings_interest_pdf` (238,657 bytes), `render_borrowings_pdf` (237,812), and
+  `render_borrowings_summary_fy_pdf` (236,822) all returned valid `%PDF` bytes; `pypdf` text
+  extraction confirmed `Total Principal Amount`, `Total Payable Amount`, `Rate of Interest`,
+  `Brought Forward`, `August Interest` and both FY blocks render, and **every interest row carried
+  a non-null balance** (the `_interest_line_rows` fallback above, exercised for real).
+  Driver script + `__pycache__` written under `lambda/api/` (this agent's sandbox cannot write to
+  the scratchpad — fenced to `business-core` only), run, then deleted.
+- `api/borrowings.py` → `alerts_evaluator/borrowings.py` re-copied; all 5 shared pairs
+  (`borrowings.py`, `borrowings_pdf.py`, `letterhead.py`, `pdf_fonts.py`, `alerts_eval.py`)
+  re-verified byte-identical via `filecmp.cmp(..., shallow=False)`.
+
+**No IaC/DB/UI change required** — pure computation change on the existing `GET /borrowings`,
+`GET /borrowings/pdf`, `GET /borrowings/summary-fy`, and `GET /borrowings/summary-fy/pdf` routes;
+no route, response-shape, or field change of any kind. **Post-deploy: run `POST
+/admin/cache/flush`** — `iravi:borrowings:data:interest:*` and `iravi:borrowings:summary_fy:*`
+hold interest figures computed under the old rule (1h TTL, so they would otherwise self-heal
+within the hour, but a flush makes the change immediate and avoids a user seeing two different
+numbers for the same period).
+
+---
+
 ## api — Borrowings interest model change: interest NEVER carried forward (2026-08-06)
 
 **Status: complete.** User-decided change to the Borrowings interest model: previously, at each
@@ -3765,6 +3853,25 @@ endpoints above are NOT yet per-role authorized — UI-only gating. **Backlog:**
   removes — flag to the `iac`/coordinator if a one-time cleanup DELETE against already-ingested
   Brought Forward rows is wanted, since this agent cannot query production RDS to check).
 
+- [x] **Borrowings interest model change — interest STARTS THE DAY AFTER AN ENTRY (2026-08-12):**
+  see the full "api — Borrowings interest model change: interest STARTS THE DAY AFTER AN ENTRY"
+  section above. User-reported bug: an amount booked on 8 August accrued interest for 8 August;
+  it must start on the 9th. `compute_interest_segments` now covers `(event_date, next_event]`
+  instead of `[event_date, next_event)` — terminal event moved from `to_date + 1` to `to_date`
+  (sort_rank 0 → 2 so it still sorts last when sharing a date with a transaction), month
+  carry-forward events moved from each month's 1st to its LAST day (so each segment's accrual
+  days stay inside one calendar month, keeping monthly line items AND FY totals correctly
+  bucketed), and interest is now keyed on the accrual month (`_month_key` = event date + 1)
+  while `month_last_balance` stays keyed on the event's own calendar month. Follow-on:
+  `_interest_line_rows` falls back to the latest month closed at or before a line's month (a
+  month can accrue without holding an event), and `_compute_fy_totals`'s `closing_principal` is
+  an as-of lookup so an FY with no events in its final months reports the principal carried into
+  it rather than 0. **Every reported interest figure drops by ~one day's worth per drawdown**
+  (real-data pin: FY 2025-26 `4,14,419.20 → 4,12,721.75`). Verified by a new independent
+  day-by-day oracle in the test file (asserted month-for-month on the reference fixture, the real
+  60-row history, and 200 randomized histories) — **136/136 assertions pass** — plus real renders
+  of all three borrowings PDFs. `alerts_evaluator/borrowings.py` re-synced byte-identical.
+  No IaC/DB/UI change; **run `POST /admin/cache/flush` after deploy**.
 - [x] **Borrowings interest model change — interest NEVER carried forward (2026-08-06):** see the
   full "api — Borrowings interest model change: interest NEVER carried forward" section above for
   complete detail. User-decided change: at each FY boundary the FY's accrued interest is no longer

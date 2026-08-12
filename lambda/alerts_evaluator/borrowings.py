@@ -33,12 +33,14 @@ compute_borrowing_rate_map(conn, accounts=None) -> dict[str, float]
 compute_interest_segments(txn_rows, rate, to_date, from_date=None)
     -> (segments, monthly_interest, month_last_balance, opening_balance)
     The low-level, per-EVENT interest-accrual engine — event list,
-    month-boundary carry-forward events, terminal boundary, simple 365-day
+    month-end carry-forward events, terminal boundary, simple 365-day
     interest per segment on PRINCIPAL ONLY. Interest is NEVER capitalized
     into the running balance (2026-08-06 model change) — `balance` moves
     only on transaction deltas, so interest never compounds and each FY's
-    interest is tracked/reported separately (see _compute_fy_totals). See
-    the docstring below for the full algorithm description.
+    interest is tracked/reported separately (see _compute_fy_totals).
+    Interest accrues from the day AFTER an entry (2026-08-12 model change):
+    a balance created on the 8th first earns interest on the 9th. See the
+    docstring below for the full algorithm description.
 
 compute_borrowings_interest(conn, account, from_date, to_date) -> dict
     The GET /borrowings?include_interest=1 (and GET /borrowings/pdf
@@ -110,6 +112,20 @@ def _fy_start_year(d: date) -> int:
 
 def _last_day_of_month(y: int, m: int) -> date:
     return date(y, m, calendar.monthrange(y, m)[1])
+
+
+def _month_key(d: date) -> tuple[int, int]:
+    """The calendar month a segment starting on event date `d` accrues into.
+
+    Interest accrues from the day AFTER the event (2026-08-12 model change),
+    so a segment that starts on the last day of a month accrues entirely
+    into the FOLLOWING month, and a month-end carry-forward event dated
+    31-Aug is what produces September's interest. Every segment lies wholly
+    inside one calendar month (see compute_interest_segments' algorithm
+    notes), so this single key is exact — never an approximation.
+    """
+    eff = d + timedelta(days=1)
+    return (eff.year, eff.month)
 
 
 def _line_item_date(y: int, m: int, to_date: date) -> date:
@@ -218,11 +234,10 @@ def compute_interest_segments(
         voucher_no, transaction_name, debit, credit.
     rate : annual interest rate, percent (0 => no interest; the engine still
         walks every event so balances/segments are always produced).
-    to_date : date — a terminal boundary is appended at to_date + 1 day so a
-        balance held on to_date itself earns one day of interest (this is an
-        explicit assumption of this implementation — see the module/task
-        docs; without it the very last segment would have 0 days and accrue
-        no interest at all).
+    to_date : date — a terminal event is appended AT to_date (2026-08-12: was
+        to_date + 1 day) and sorts after every real event on that date, so
+        the window's last accrual day is to_date itself and an entry made on
+        to_date earns nothing yet — interest starts the day after an entry.
     from_date : optional date — when given, `opening_balance` (4th return
         value) is captured as the running principal immediately before the
         first event whose date is >= from_date (i.e. the balance "brought
@@ -243,13 +258,18 @@ def compute_interest_segments(
         capitalization step anymore). Interest is stored UNROUNDED (full
         float precision) — round only for display.
     monthly_interest : {(year, month): float} — sum of every segment's
-        (unrounded) interest whose event date falls in that (year, month) —
-        i.e. attributed to the segment's START month (a segment never
-        straddles a month boundary, since a boundary event always exists at
-        every month's 1st unless a real transaction already occupies it).
+        (unrounded) interest, attributed to the month its accrual days fall
+        in, i.e. the month of the event date PLUS ONE DAY (see _month_key).
+        A segment never straddles a month boundary: a carry-forward event
+        exists at every month's LAST day unless a real transaction already
+        occupies it, so a segment's days always lie in one calendar month.
+        Zero-day segments (two events on the same date, or an entry made on
+        to_date itself) contribute no bucket at all.
     month_last_balance : {(year, month): float} — the running principal as
-        of the LAST segment starting in that month. Used as the "balance"
-        shown on that month's synthetic interest line item.
+        of the LAST event dated in that CALENDAR month (keyed on the event's
+        own date, NOT the accrual month) — i.e. the closing principal for
+        that month, which is what an FY's closing principal and the interest
+        line item's balance column both need.
     opening_balance : float — see `from_date` above; 0.0 if from_date is
         None or txn_rows is empty.
 
@@ -257,15 +277,22 @@ def compute_interest_segments(
     ---------
     1. Every transaction is an event with delta = credit - debit.
     2. A synthetic month-boundary event (delta 0, 'Month-end carry forward')
-       is inserted on the 1st of every month from the month AFTER the first
-       transaction's month through the month containing to_date — but only
-       when no transaction already exists on that exact date.
+       is inserted on the LAST day of every month from the first
+       transaction's own month through the month containing to_date — but
+       only when that date is strictly before to_date and no transaction
+       already exists on it. (2026-08-12: these sat on the 1st of each month
+       before interest was moved to start the day after an entry; month-END
+       boundaries are what keep each segment's accrual days inside a single
+       calendar month under the new rule.)
     3. Events are sorted by (date, voucher_no); boundary events sort before
        same-day transactions (rank 0 vs 1) — they never actually collide
        with each other given rule 2's exclusion.
-    4. A terminal boundary is appended at to_date + 1 day.
+    4. A terminal event is appended AT to_date, ranked to sort AFTER every
+       real event on that date, so an entry dated to_date closes with a
+       0-day segment and earns no interest yet.
     5. Walking events in order: balance += delta; days = date-gap to the
-       NEXT event; interest_segment = balance * (rate/100) * days/365 —
+       NEXT event — the days AFTER this event, up to and including the next
+       one; interest_segment = balance * (rate/100) * days/365 —
        365-day year, simple interest on PRINCIPAL ONLY. `balance` is NEVER
        adjusted for interest, at any point — no FY-boundary capitalization
        step, no compounding of any kind (2026-08-06 model change: interest
@@ -296,10 +323,13 @@ def compute_interest_segments(
         })
 
     first_date = txn_rows[0]['transaction_date']
-    y, m = _next_month(first_date.year, first_date.month)
+    y, m = first_date.year, first_date.month
     while (y, m) <= (to_date.year, to_date.month):
-        bd = date(y, m, 1)
-        if bd not in txn_dates:
+        bd = _last_day_of_month(y, m)
+        # `bd < to_date` keeps the terminal event the sole event on to_date;
+        # `bd >= first_date` holds by construction (the loop starts in the
+        # first transaction's own month).
+        if bd < to_date and bd not in txn_dates:
             events.append({
                 'kind': 'boundary',
                 'date': bd,
@@ -314,8 +344,12 @@ def compute_interest_segments(
 
     events.append({
         'kind': 'terminal',
-        'date': to_date + timedelta(days=1),
-        'sort_rank': 0,
+        # sort_rank 2 (> a transaction's 1): the terminal now shares to_date
+        # with any transaction booked that day, and must still be the LAST
+        # event so the walk below never treats a real transaction as the
+        # closing marker.
+        'date': to_date,
+        'sort_rank': 2,
         'voucher_no': '',
         'transaction_name': '',
         'debit': 0.0,
@@ -345,9 +379,16 @@ def compute_interest_segments(
         days = (next_date - ev['date']).days
         interest = balance * (rate / 100.0) * days / 365.0
 
-        key = (ev['date'].year, ev['date'].month)
-        monthly_interest[key] = monthly_interest.get(key, 0.0) + interest
-        month_last_balance[key] = balance
+        if days:
+            # Accrual month = the month the segment's DAYS fall in (event
+            # date + 1); a 0-day segment has no days to attribute at all and
+            # would otherwise invent an empty bucket a month past to_date.
+            accrual_key = _month_key(ev['date'])
+            monthly_interest[accrual_key] = monthly_interest.get(accrual_key, 0.0) + interest
+        # Closing principal is a calendar-month fact, keyed on the event's own
+        # date — an entry on 31-March belongs to March's closing balance even
+        # though its interest only starts accruing in April.
+        month_last_balance[(ev['date'].year, ev['date'].month)] = balance
 
         segments.append({
             'kind': ev['kind'],
@@ -429,12 +470,15 @@ def _compute_fy_totals(
     outstanding payable, but it never feeds back into the balance future
     interest is computed on.
 
-    closing_principal : the running principal as of the LAST event in that
-        FY — i.e. month_last_balance's value for that FY's last (year,
-        month) key. Since compute_interest_segments no longer capitalizes
-        interest into `balance` at all, this is simply the principal after
-        every transaction delta up to and including that FY — nothing is
-        ever added to or subtracted from it on account of interest.
+    closing_principal : the running principal as of that FY's 31-March close
+        — the value carried by the latest month_last_balance key at or
+        before (fy + 1, 3). Looked up "as of" rather than "that FY's own
+        last key" (2026-08-12) so an FY whose final months hold no events at
+        all still reports the principal carried into it, instead of 0.
+        Since compute_interest_segments no longer capitalizes interest into
+        `balance` at all, this is simply the principal after every
+        transaction delta up to and including that FY — nothing is ever
+        added to or subtracted from it on account of interest.
     interest : sum of that FY's (unrounded) monthly_interest values, rounded
         to 2dp exactly once here — THAT FY's own interest only.
     cumulative_interest : running sum of `interest` across every FY from the
@@ -453,18 +497,25 @@ def _compute_fy_totals(
         fy = _fy_start_year(date(y, m, 1))
         interest_by_fy[fy] = interest_by_fy.get(fy, 0.0) + amt
 
-    closing_principal_by_fy: dict[int, tuple[tuple[int, int], float]] = {}
-    for (y, m), bal in month_last_balance.items():
-        fy = _fy_start_year(date(y, m, 1))
-        key = (y, m)
-        current = closing_principal_by_fy.get(fy)
-        if current is None or key > current[0]:
-            closing_principal_by_fy[fy] = (key, bal)
+    sorted_month_balances = sorted(month_last_balance.items())
+
+    def _principal_asof(y: int, m: int) -> float:
+        """Principal carried at the end of calendar month (y, m) — the latest
+        recorded month-closing balance at or before it (0.0 before any)."""
+        principal = 0.0
+        for key, bal in sorted_month_balances:
+            if key > (y, m):
+                break
+            principal = bal
+        return principal
+
+    fy_starts = set(interest_by_fy)
+    fy_starts |= {_fy_start_year(date(y, m, 1)) for (y, m) in month_last_balance}
 
     fy_totals: dict[str, dict] = {}
     cumulative_interest = 0.0
-    for fy in sorted(set(interest_by_fy) | set(closing_principal_by_fy)):
-        closing_principal = round(closing_principal_by_fy.get(fy, (None, 0.0))[1], 2)
+    for fy in sorted(fy_starts):
+        closing_principal = round(_principal_asof(fy + 1, 3), 2)
         interest = round(interest_by_fy.get(fy, 0.0), 2)
         cumulative_interest = round(cumulative_interest + interest, 2)
         fy_totals[_fy_key(fy)] = {
@@ -486,11 +537,21 @@ def _interest_line_rows(
     calendar day of that month (or to_date if that month is truncated by the
     window). `balance` is the account's running principal as of that point
     (month_last_balance) when given, else None (multi-account combined mode,
-    where balance is meaningless — see compute_borrowings_interest)."""
+    where balance is meaningless — see compute_borrowings_interest).
+
+    A month can carry interest without holding any event of its own (its
+    accrual is driven by the previous month's closing carry-forward event),
+    so the balance falls back to the latest month closed at or before it."""
+    sorted_month_balances = sorted(month_last_balance.items()) if month_last_balance else []
     rows = []
     for (y, m) in sorted(monthly_interest.keys()):
         line_date = _line_item_date(y, m, to_date)
-        bal = month_last_balance.get((y, m)) if month_last_balance is not None else None
+        bal = None
+        if month_last_balance is not None:
+            for key, month_bal in sorted_month_balances:
+                if key > (y, m):
+                    break
+                bal = month_bal
         rows.append({
             'row_type': 'interest',
             'transaction_date': line_date.isoformat(),
